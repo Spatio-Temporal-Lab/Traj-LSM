@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cinttypes>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 #include "file/file_util.h"
@@ -173,6 +174,18 @@ std::string DescriptorFileName(uint64_t number) {
 
 std::string DescriptorFileName(const std::string& dbname, uint64_t number) {
   return dbname + "/" + DescriptorFileName(number);
+}
+
+std::string ManifestSetFileName(uint64_t number) {
+  assert(number > 0);
+  char buf[100];
+  snprintf(buf, sizeof(buf), "MANIFEST_SET-%06llu",
+           static_cast<unsigned long long>(number));
+  return buf;
+}
+
+std::string ManifestSetFileName(const std::string& dbname, uint64_t number) {
+  return dbname + "/" + ManifestSetFileName(number);
 }
 
 std::string CurrentFileName(const std::string& dbname) {
@@ -430,38 +443,211 @@ IOStatus SetCurrentFile(const WriteOptions& write_options, FileSystem* fs,
                         const std::string& dbname, uint64_t descriptor_number,
                         Temperature temp,
                         FSDirectory* dir_contains_current_file) {
-  // Remove leading "dbname/" and add newline to manifest file name
-  std::string manifest = DescriptorFileName(dbname, descriptor_number);
-  Slice contents = manifest;
-  assert(contents.starts_with(dbname + "/"));
-  contents.remove_prefix(dbname.size() + 1);
-  std::string tmp = TempFileName(dbname, descriptor_number);
+  // Multi-manifest only: CURRENT must always point to a MANIFEST_SET.
+  // Use a single-entry MANIFEST_SET for bootstrap.
+  const std::vector<uint64_t> descriptors = {descriptor_number};
+  const uint64_t generation = 0;
+  return SetCurrentFileToManifestSet(write_options, fs, dbname,
+                                     /*manifest_set_number=*/descriptor_number,
+                                     descriptors, generation, temp,
+                                     dir_contains_current_file,
+                                     /*manifest_time_mins=*/nullptr,
+                                     /*manifest_time_maxs=*/nullptr);
+}
+
+IOStatus SetCurrentFileToManifestSet(
+    const WriteOptions& write_options, FileSystem* fs, const std::string& dbname,
+    uint64_t manifest_set_number, const std::vector<uint64_t>& descriptor_numbers,
+    uint64_t generation, Temperature temp,
+    FSDirectory* dir_contains_current_file,
+    const std::vector<uint64_t>* manifest_time_mins,
+    const std::vector<uint64_t>* manifest_time_maxs,
+    const std::vector<float>* manifest_mbr_x_mins,
+    const std::vector<float>* manifest_mbr_x_maxs,
+    const std::vector<float>* manifest_mbr_y_mins,
+    const std::vector<float>* manifest_mbr_y_maxs,
+    const std::vector<uint64_t>* manifest_master_counts,
+    const std::vector<uint64_t>* manifest_ghost_counts) {
+  if (descriptor_numbers.empty()) {
+    return IOStatus::InvalidArgument("descriptor_numbers is empty");
+  }
+  if (manifest_time_mins != nullptr || manifest_time_maxs != nullptr) {
+    if (manifest_time_mins == nullptr || manifest_time_maxs == nullptr) {
+      return IOStatus::InvalidArgument(
+          "manifest_time_mins and manifest_time_maxs must both be null or both "
+          "non-null");
+    }
+    if (manifest_time_mins->size() != descriptor_numbers.size() ||
+        manifest_time_maxs->size() != descriptor_numbers.size()) {
+      return IOStatus::InvalidArgument(
+          "manifest time bounds size must match descriptor_numbers");
+    }
+  }
+  const bool use_mbr_fields =
+      manifest_mbr_x_mins != nullptr && manifest_mbr_x_maxs != nullptr &&
+      manifest_mbr_y_mins != nullptr && manifest_mbr_y_maxs != nullptr;
+  if (!use_mbr_fields &&
+      (manifest_mbr_x_mins != nullptr || manifest_mbr_x_maxs != nullptr ||
+       manifest_mbr_y_mins != nullptr || manifest_mbr_y_maxs != nullptr)) {
+    return IOStatus::InvalidArgument(
+        "manifest mbr vectors must be all null or all non-null");
+  }
+  if (use_mbr_fields) {
+    if (manifest_mbr_x_mins->size() != descriptor_numbers.size() ||
+        manifest_mbr_x_maxs->size() != descriptor_numbers.size() ||
+        manifest_mbr_y_mins->size() != descriptor_numbers.size() ||
+        manifest_mbr_y_maxs->size() != descriptor_numbers.size()) {
+      return IOStatus::InvalidArgument(
+          "manifest mbr size must match descriptor_numbers");
+    }
+  }
+  const bool use_global_counts =
+      manifest_master_counts != nullptr && manifest_ghost_counts != nullptr;
+  if (!use_global_counts &&
+      (manifest_master_counts != nullptr || manifest_ghost_counts != nullptr)) {
+    return IOStatus::InvalidArgument(
+        "manifest master/ghost vectors must be both null or both non-null");
+  }
+  if (use_global_counts) {
+    if (manifest_master_counts->size() != descriptor_numbers.size() ||
+        manifest_ghost_counts->size() != descriptor_numbers.size()) {
+      return IOStatus::InvalidArgument(
+          "manifest master/ghost size must match descriptor_numbers");
+    }
+  }
+  std::string set_content;
+  set_content.reserve(descriptor_numbers.size() * 40 + 48);
+  set_content.append("version=1\n");
+  if (generation != 0) {
+    set_content.append("generation=");
+    set_content.append(std::to_string(generation));
+    set_content.push_back('\n');
+  }
+  const bool use_entry_lines =
+      manifest_time_mins != nullptr && manifest_time_maxs != nullptr;
+  IOOptions exists_opts;
+  std::vector<uint64_t> filtered_descriptors;
+  std::vector<uint64_t> filtered_tmins;
+  std::vector<uint64_t> filtered_tmaxs;
+  std::vector<float> filtered_x_mins;
+  std::vector<float> filtered_x_maxs;
+  std::vector<float> filtered_y_mins;
+  std::vector<float> filtered_y_maxs;
+  std::vector<uint64_t> filtered_master_counts;
+  std::vector<uint64_t> filtered_ghost_counts;
+  filtered_descriptors.reserve(descriptor_numbers.size());
+  if (use_entry_lines) {
+    filtered_tmins.reserve(descriptor_numbers.size());
+    filtered_tmaxs.reserve(descriptor_numbers.size());
+  }
+  if (use_mbr_fields) {
+    filtered_x_mins.reserve(descriptor_numbers.size());
+    filtered_x_maxs.reserve(descriptor_numbers.size());
+    filtered_y_mins.reserve(descriptor_numbers.size());
+    filtered_y_maxs.reserve(descriptor_numbers.size());
+  }
+  if (use_global_counts) {
+    filtered_master_counts.reserve(descriptor_numbers.size());
+    filtered_ghost_counts.reserve(descriptor_numbers.size());
+  }
+  for (size_t i = 0; i < descriptor_numbers.size(); ++i) {
+    const uint64_t num = descriptor_numbers[i];
+    if (num == 0) {
+      return IOStatus::InvalidArgument("descriptor number must be > 0");
+    }
+    const std::string descriptor_path = DescriptorFileName(dbname, num);
+    IOStatus exists_s = fs->FileExists(descriptor_path, exists_opts, nullptr);
+    if (!exists_s.ok()) {
+      continue;
+    }
+    filtered_descriptors.push_back(num);
+    if (use_entry_lines) {
+      filtered_tmins.push_back((*manifest_time_mins)[i]);
+      filtered_tmaxs.push_back((*manifest_time_maxs)[i]);
+    }
+    if (use_mbr_fields) {
+      filtered_x_mins.push_back((*manifest_mbr_x_mins)[i]);
+      filtered_x_maxs.push_back((*manifest_mbr_x_maxs)[i]);
+      filtered_y_mins.push_back((*manifest_mbr_y_mins)[i]);
+      filtered_y_maxs.push_back((*manifest_mbr_y_maxs)[i]);
+    }
+    if (use_global_counts) {
+      filtered_master_counts.push_back((*manifest_master_counts)[i]);
+      filtered_ghost_counts.push_back((*manifest_ghost_counts)[i]);
+    }
+  }
+  if (filtered_descriptors.empty()) {
+    return IOStatus::NotFound(
+        "all descriptor_numbers are missing; cannot write MANIFEST_SET");
+  }
+  set_content.clear();
+  set_content.reserve(filtered_descriptors.size() * 64 + 64);
+  set_content.append("version=1\n");
+  if (generation != 0) {
+    set_content.append("generation=");
+    set_content.append(std::to_string(generation));
+    set_content.push_back('\n');
+  }
+  for (size_t i = 0; i < filtered_descriptors.size(); ++i) {
+    if (use_entry_lines) {
+      set_content.append("entry=");
+      set_content.append(DescriptorFileName(filtered_descriptors[i]));
+      set_content.append(",tmin=");
+      set_content.append(std::to_string(filtered_tmins[i]));
+      set_content.append(",tmax=");
+      set_content.append(std::to_string(filtered_tmaxs[i]));
+      if (use_mbr_fields) {
+        set_content.append(",xmin=");
+        set_content.append(std::to_string(filtered_x_mins[i]));
+        set_content.append(",xmax=");
+        set_content.append(std::to_string(filtered_x_maxs[i]));
+        set_content.append(",ymin=");
+        set_content.append(std::to_string(filtered_y_mins[i]));
+        set_content.append(",ymax=");
+        set_content.append(std::to_string(filtered_y_maxs[i]));
+      }
+      if (use_global_counts) {
+        set_content.append(",masters=");
+        set_content.append(std::to_string(filtered_master_counts[i]));
+        set_content.append(",ghosts=");
+        set_content.append(std::to_string(filtered_ghost_counts[i]));
+      }
+      set_content.push_back('\n');
+    } else {
+      set_content.append(DescriptorFileName(filtered_descriptors[i]));
+      set_content.push_back('\n');
+    }
+  }
+
   IOOptions opts;
   IOStatus s = PrepareIOFromWriteOptions(write_options, opts);
   FileOptions file_opts;
   file_opts.temperature = temp;
+
+  const std::string set_path = ManifestSetFileName(dbname, manifest_set_number);
+  const std::string tmp_set_path = TempFileName(dbname, manifest_set_number);
   if (s.ok()) {
-    s = WriteStringToFile(fs, contents.ToString() + "\n", tmp, true, opts,
-                          file_opts);
-  }
-  TEST_SYNC_POINT_CALLBACK("SetCurrentFile:BeforeRename", &s);
-  if (s.ok()) {
-    TEST_KILL_RANDOM_WITH_WEIGHT("SetCurrentFile:0", REDUCE_ODDS2);
-    s = fs->RenameFile(tmp, CurrentFileName(dbname), opts, nullptr);
-    TEST_KILL_RANDOM_WITH_WEIGHT("SetCurrentFile:1", REDUCE_ODDS2);
-    TEST_SYNC_POINT_CALLBACK("SetCurrentFile:AfterRename", &s);
+    s = WriteStringToFile(fs, set_content, tmp_set_path, true, opts, file_opts);
   }
   if (s.ok()) {
-    if (dir_contains_current_file != nullptr) {
-      s = dir_contains_current_file->FsyncWithDirOptions(
-          opts, nullptr, DirFsyncOptions(CurrentFileName(dbname)));
+    s = fs->RenameFile(tmp_set_path, set_path, opts, nullptr);
+  }
+  if (s.ok()) {
+    const std::string set_name = ManifestSetFileName(manifest_set_number);
+    const std::string tmp_current = TempFileName(dbname, manifest_set_number + 1);
+    s = WriteStringToFile(fs, set_name + "\n", tmp_current, true, opts, file_opts);
+    if (s.ok()) {
+      s = fs->RenameFile(tmp_current, CurrentFileName(dbname), opts, nullptr);
+    } else {
+      fs->DeleteFile(tmp_current, opts, nullptr).PermitUncheckedError();
     }
-  } else {
-    fs->DeleteFile(tmp, opts, nullptr)
-        .PermitUncheckedError();  // NOTE: PermitUncheckedError is acceptable
-                                  // here as we are already handling an error
-                                  // case, and this is just a best-attempt
-                                  // effort at some cleanup
+  }
+  if (s.ok() && dir_contains_current_file != nullptr) {
+    s = dir_contains_current_file->FsyncWithDirOptions(
+        opts, nullptr, DirFsyncOptions(CurrentFileName(dbname)));
+  }
+  if (!s.ok()) {
+    fs->DeleteFile(tmp_set_path, opts, nullptr).PermitUncheckedError();
   }
   return s;
 }

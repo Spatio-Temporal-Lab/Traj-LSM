@@ -776,8 +776,6 @@ std::string Env::IOActivityToString(IOActivity activity) {
       }
       return "Invalid";
   };
-  assert(false);
-  return "Invalid";
 }
 
 uint64_t Env::GetThreadID() const {

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <optional>
 
 #include "util/coding.h"
 
@@ -11,12 +12,100 @@ namespace ROCKSDB_NAMESPACE {
 
 namespace {
 
+inline uint32_t DecodeFixed32BigEndian(const char* p) {
+  return (static_cast<uint32_t>(static_cast<unsigned char>(p[0])) << 24) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(p[1])) << 16) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(p[2])) << 8) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(p[3])));
+}
+
+inline bool ConsumeFixed32BigEndian(Slice* s, uint32_t* out) {
+  if (s == nullptr || out == nullptr || s->size() < 4) {
+    return false;
+  }
+  *out = DecodeFixed32BigEndian(s->data());
+  s->remove_prefix(4);
+  return true;
+}
+
 int LonLatToGridBit(float lon, float lat) {
   const int cx = static_cast<int>((lon + 180.f) / 360.f * 8.f);
   const int cy = static_cast<int>((lat + 90.f) / 180.f * 8.f);
   const int ix = std::max(0, std::min(7, cx));
   const int iy = std::max(0, std::min(7, cy));
   return iy * 8 + ix;
+}
+
+#pragma pack(push, 1)
+struct SegmentValueHeaderForStMeta {
+  uint32_t t_start = 0;
+  uint32_t t_end = 0;
+  float x_min = 0.f;
+  float y_min = 0.f;
+  float x_max = 0.f;
+  float y_max = 0.f;
+  uint32_t point_count = 0;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(SegmentValueHeaderForStMeta) == 28,
+              "segment value header size");
+
+constexpr uint32_t kSegmentValueMagicV2 = 0x32676553;  // 'Seg2'
+constexpr uint32_t kSegmentValueMagicV3 = 0x33676553;  // 'Seg3'
+
+bool TryDecodeSegmentValueHeader(const Slice& value,
+                                 SegmentValueHeaderForStMeta* out) {
+  if (out == nullptr) {
+    return false;
+  }
+  *out = SegmentValueHeaderForStMeta{};
+  if (value.size() == sizeof(SegmentValueHeaderForStMeta)) {
+    std::memcpy(out, value.data(), sizeof(*out));
+    return true;
+  }
+  if (value.size() < 4 + sizeof(SegmentValueHeaderForStMeta)) {
+    return false;
+  }
+  uint32_t magic = 0;
+  std::memcpy(&magic, value.data(), sizeof(magic));
+  if (magic != kSegmentValueMagicV2 && magic != kSegmentValueMagicV3) {
+    return false;
+  }
+  std::memcpy(out, value.data() + 4, sizeof(*out));
+  return true;
+}
+
+void MergeSpatioTemporalMetaFromSegmentValue(
+    const Slice& value, SpatioTemporalBlockMeta* acc, bool* acc_valid) {
+  if (acc == nullptr || acc_valid == nullptr) {
+    return;
+  }
+  SegmentValueHeaderForStMeta header{};
+  if (!TryDecodeSegmentValueHeader(value, &header)) {
+    return;
+  }
+  const float cx = (header.x_min + header.x_max) * 0.5f;
+  const float cy = (header.y_min + header.y_max) * 0.5f;
+  const uint64_t bit = 1ULL << LonLatToGridBit(cx, cy);
+  if (!*acc_valid) {
+    acc->t_min = header.t_start;
+    acc->t_max = header.t_end;
+    acc->x_min = header.x_min;
+    acc->x_max = header.x_max;
+    acc->y_min = header.y_min;
+    acc->y_max = header.y_max;
+    acc->bitmap = bit;
+    *acc_valid = true;
+  } else {
+    acc->t_min = std::min(acc->t_min, header.t_start);
+    acc->t_max = std::max(acc->t_max, header.t_end);
+    acc->x_min = std::min(acc->x_min, header.x_min);
+    acc->x_max = std::max(acc->x_max, header.x_max);
+    acc->y_min = std::min(acc->y_min, header.y_min);
+    acc->y_max = std::max(acc->y_max, header.y_max);
+    acc->bitmap |= bit;
+  }
 }
 
 }  // namespace
@@ -29,11 +118,17 @@ bool TryDecodeSpatioTemporalUserKeyTime(const Slice& user_key,
   const char* p = user_key.data();
   const unsigned char magic = static_cast<unsigned char>(p[0]);
   if (magic != kSpatioTemporalUserKeyMagic &&
-      magic != kSpatioTemporalSegmentKeyMagic) {
+      magic != kSpatioTemporalSegmentKeyMagic &&
+      magic != kSpatioTemporalSegmentKeyTzidMagic) {
     return false;
   }
+  if (magic == kSpatioTemporalUserKeyMagic) {
+    Slice s(p + 1, user_key.size() - 1);
+    return GetFixed32(&s, t_sec);  // little-endian
+  }
+  // Segment keys encode t_start big-endian for memcmp ordering.
   Slice s(p + 1, user_key.size() - 1);
-  return GetFixed32(&s, t_sec);
+  return ConsumeFixed32BigEndian(&s, t_sec);
 }
 
 bool UserKeySpatioTemporalDisjointFromPruneScan(
@@ -45,7 +140,8 @@ bool UserKeySpatioTemporalDisjointFromPruneScan(
   const char* p = user_key.data();
   const unsigned char magic = static_cast<unsigned char>(p[0]);
   if (magic != kSpatioTemporalUserKeyMagic &&
-      magic != kSpatioTemporalSegmentKeyMagic) {
+      magic != kSpatioTemporalSegmentKeyMagic &&
+      magic != kSpatioTemporalSegmentKeyTzidMagic) {
     return false;
   }
   Slice s(p + 1, user_key.size() - 1);
@@ -65,6 +161,18 @@ bool UserKeySpatioTemporalDisjointFromPruneScan(
     return t_sec > q.t_max || t_sec < q.t_min || x > q.x_max || x < q.x_min ||
            y > q.y_max || y < q.y_min;
   }
+  if (magic == kSpatioTemporalSegmentKeyTzidMagic) {
+    // E7 key no longer guarantees t_end/MBR in-key. Key-level pruning may only
+    // reject records that start after the query window ends.
+    if (user_key.size() < 5) {
+      return false;
+    }
+    uint32_t t_start = 0;
+    if (!ConsumeFixed32BigEndian(&s, &t_start)) {
+      return false;
+    }
+    return t_start > q.t_max;
+  }
 
   // Segment-key layout (minimum length 25 + suffix):
   // [0] magic 0xE6
@@ -78,7 +186,8 @@ bool UserKeySpatioTemporalDisjointFromPruneScan(
     return false;
   }
   uint32_t t_start = 0, t_end = 0;
-  if (!GetFixed32(&s, &t_start) || !GetFixed32(&s, &t_end)) {
+  if (!ConsumeFixed32BigEndian(&s, &t_start) ||
+      !ConsumeFixed32BigEndian(&s, &t_end)) {
     return false;
   }
   uint32_t xmin_bits = 0, ymin_bits = 0, xmax_bits = 0, ymax_bits = 0;
@@ -107,7 +216,8 @@ bool UserKeySpatioTemporalInWindow(const Slice& user_key, uint32_t t_min,
   const char* p = user_key.data();
   const unsigned char magic = static_cast<unsigned char>(p[0]);
   if (magic != kSpatioTemporalUserKeyMagic &&
-      magic != kSpatioTemporalSegmentKeyMagic) {
+      magic != kSpatioTemporalSegmentKeyMagic &&
+      magic != kSpatioTemporalSegmentKeyTzidMagic) {
     return false;
   }
   Slice s(p + 1, user_key.size() - 1);
@@ -130,12 +240,25 @@ bool UserKeySpatioTemporalInWindow(const Slice& user_key, uint32_t t_min,
     }
     return true;
   }
+  if (magic == kSpatioTemporalSegmentKeyTzidMagic) {
+    if (user_key.size() < 5) {
+      return false;
+    }
+    uint32_t t_start = 0;
+    if (!ConsumeFixed32BigEndian(&s, &t_start)) {
+      return false;
+    }
+    // No t_end/MBR in key; keep this conservative and let value verification or
+    // block-level metadata make the final decision.
+    return t_start <= t_max;
+  }
 
   if (user_key.size() < 25) {
     return false;
   }
   uint32_t t_start = 0, t_end = 0;
-  if (!GetFixed32(&s, &t_start) || !GetFixed32(&s, &t_end)) {
+  if (!ConsumeFixed32BigEndian(&s, &t_start) ||
+      !ConsumeFixed32BigEndian(&s, &t_end)) {
     return false;
   }
   uint32_t xmin_bits = 0, ymin_bits = 0, xmax_bits = 0, ymax_bits = 0;
@@ -166,7 +289,8 @@ void MergeSpatioTemporalMetaFromUserKey(const Slice& user_key,
   const char* p = user_key.data();
   const unsigned char magic = static_cast<unsigned char>(p[0]);
   if (magic != kSpatioTemporalUserKeyMagic &&
-      magic != kSpatioTemporalSegmentKeyMagic) {
+      magic != kSpatioTemporalSegmentKeyMagic &&
+      magic != kSpatioTemporalSegmentKeyTzidMagic) {
     return;
   }
   Slice s(p + 1, user_key.size() - 1);
@@ -193,10 +317,16 @@ void MergeSpatioTemporalMetaFromUserKey(const Slice& user_key,
     y_min_v = y_max_v = y;
     bit = 1ULL << LonLatToGridBit(x, y);
   } else {
+    if (magic == kSpatioTemporalSegmentKeyTzidMagic) {
+      // Can't widen MBR/bitmap without explicit spatial bounds. Skip meta merge
+      // for now so existing ST-meta semantics remain sound.
+      return;
+    }
     if (user_key.size() < 25) {
       return;
     }
-    if (!GetFixed32(&s, &t_min_v) || !GetFixed32(&s, &t_max_v)) {
+    if (!ConsumeFixed32BigEndian(&s, &t_min_v) ||
+        !ConsumeFixed32BigEndian(&s, &t_max_v)) {
       return;
     }
     uint32_t xmin_bits = 0, ymin_bits = 0, xmax_bits = 0, ymax_bits = 0;
@@ -231,6 +361,24 @@ void MergeSpatioTemporalMetaFromUserKey(const Slice& user_key,
     acc->y_max = std::max(acc->y_max, y_max_v);
     acc->bitmap |= bit;
   }
+}
+
+void MergeSpatioTemporalMetaFromKeyValue(const Slice& user_key,
+                                         const std::optional<Slice>& value,
+                                         SpatioTemporalBlockMeta* acc,
+                                         bool* acc_valid) {
+  if (acc == nullptr || acc_valid == nullptr) {
+    return;
+  }
+  if (user_key.size() < 1) {
+    return;
+  }
+  const unsigned char magic = static_cast<unsigned char>(user_key.data()[0]);
+  if (magic == kSpatioTemporalSegmentKeyTzidMagic && value.has_value()) {
+    MergeSpatioTemporalMetaFromSegmentValue(value.value(), acc, acc_valid);
+    return;
+  }
+  MergeSpatioTemporalMetaFromUserKey(user_key, acc, acc_valid);
 }
 
 void UnionSpatioTemporalBlockMeta(SpatioTemporalBlockMeta* acc, bool* acc_valid,

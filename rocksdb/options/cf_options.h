@@ -144,6 +144,22 @@ struct MutableCFOptions {
             options.experimental_compaction_event_time_min_keys_per_file),
         experimental_compaction_event_time_max_point_keys(
             options.experimental_compaction_event_time_max_point_keys),
+        experimental_compaction_read_repair_first(
+            options.experimental_compaction_read_repair_first),
+        experimental_compaction_read_repair_min_reads(
+            options.experimental_compaction_read_repair_min_reads),
+        experimental_compaction_read_repair_shape_weight(
+            options.experimental_compaction_read_repair_shape_weight),
+        experimental_compaction_spatial_soft_expansion_ratio(
+            options.experimental_compaction_spatial_soft_expansion_ratio),
+        experimental_compaction_spatial_hard_expansion_ratio(
+            options.experimental_compaction_spatial_hard_expansion_ratio),
+        experimental_compaction_spatial_hard_min_file_size(
+            options.experimental_compaction_spatial_hard_min_file_size),
+        experimental_global_master_ghost(
+            options.experimental_global_master_ghost),
+        experimental_global_verify_ghost(
+            options.experimental_global_verify_ghost),
         disable_auto_compactions(options.disable_auto_compactions),
         table_factory(options.table_factory),
         soft_pending_compaction_bytes_limit(
@@ -235,6 +251,14 @@ struct MutableCFOptions {
         experimental_compaction_event_time_bucket_width(0),
         experimental_compaction_event_time_min_keys_per_file(0),
         experimental_compaction_event_time_max_point_keys(0),
+        experimental_compaction_read_repair_first(false),
+        experimental_compaction_read_repair_min_reads(0),
+        experimental_compaction_read_repair_shape_weight(1.0),
+        experimental_compaction_spatial_soft_expansion_ratio(0.0),
+        experimental_compaction_spatial_hard_expansion_ratio(0.0),
+        experimental_compaction_spatial_hard_min_file_size(0),
+        experimental_global_master_ghost(false),
+        experimental_global_verify_ghost(false),
         disable_auto_compactions(false),
         soft_pending_compaction_bytes_limit(0),
         hard_pending_compaction_bytes_limit(0),
@@ -340,6 +364,14 @@ struct MutableCFOptions {
   uint32_t experimental_compaction_event_time_bucket_width;
   uint32_t experimental_compaction_event_time_min_keys_per_file;
   uint32_t experimental_compaction_event_time_max_point_keys;
+  bool experimental_compaction_read_repair_first;
+  uint64_t experimental_compaction_read_repair_min_reads;
+  double experimental_compaction_read_repair_shape_weight;
+  double experimental_compaction_spatial_soft_expansion_ratio;
+  double experimental_compaction_spatial_hard_expansion_ratio;
+  uint64_t experimental_compaction_spatial_hard_min_file_size;
+  bool experimental_global_master_ghost;
+  bool experimental_global_verify_ghost;
 
   // Compaction related options
   bool disable_auto_compactions;

@@ -1,5 +1,7 @@
 # Local datasets, DBs, and experiment outputs (often multi-GB)
 /data/
+/db_ingest/
+/Result/
 
 # Build trees
 **/build/

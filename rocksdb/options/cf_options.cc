@@ -707,6 +707,44 @@ static std::unordered_map<std::string, OptionTypeInfo>
                    experimental_compaction_event_time_max_point_keys),
           OptionType::kUInt32T, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"experimental_compaction_read_repair_first",
+         {offsetof(struct MutableCFOptions,
+                   experimental_compaction_read_repair_first),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"experimental_compaction_read_repair_min_reads",
+         {offsetof(struct MutableCFOptions,
+                   experimental_compaction_read_repair_min_reads),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"experimental_compaction_read_repair_shape_weight",
+         {offsetof(struct MutableCFOptions,
+                   experimental_compaction_read_repair_shape_weight),
+          OptionType::kDouble, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"experimental_compaction_spatial_soft_expansion_ratio",
+         {offsetof(struct MutableCFOptions,
+                   experimental_compaction_spatial_soft_expansion_ratio),
+          OptionType::kDouble, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"experimental_compaction_spatial_hard_expansion_ratio",
+         {offsetof(struct MutableCFOptions,
+                   experimental_compaction_spatial_hard_expansion_ratio),
+          OptionType::kDouble, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"experimental_compaction_spatial_hard_min_file_size",
+         {offsetof(struct MutableCFOptions,
+                   experimental_compaction_spatial_hard_min_file_size),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"experimental_global_master_ghost",
+         {offsetof(struct MutableCFOptions, experimental_global_master_ghost),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"experimental_global_verify_ghost",
+         {offsetof(struct MutableCFOptions, experimental_global_verify_ghost),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         {"memtable_protection_bytes_per_key",
          {offsetof(struct MutableCFOptions, memtable_protection_bytes_per_key),
           OptionType::kUInt32T, OptionVerificationType::kNormal,
@@ -1323,6 +1361,28 @@ void MutableCFOptions::Dump(Logger* log) const {
   ROCKS_LOG_INFO(
       log, " experimental_compaction_event_time_max_point_keys: %" PRIu32,
       experimental_compaction_event_time_max_point_keys);
+  ROCKS_LOG_INFO(
+      log, " experimental_compaction_read_repair_first: %d",
+      static_cast<int>(experimental_compaction_read_repair_first));
+  ROCKS_LOG_INFO(
+      log, " experimental_compaction_read_repair_min_reads: %" PRIu64,
+      experimental_compaction_read_repair_min_reads);
+  ROCKS_LOG_INFO(
+      log, " experimental_compaction_read_repair_shape_weight: %f",
+      experimental_compaction_read_repair_shape_weight);
+  ROCKS_LOG_INFO(
+      log, " experimental_compaction_spatial_soft_expansion_ratio: %f",
+      experimental_compaction_spatial_soft_expansion_ratio);
+  ROCKS_LOG_INFO(
+      log, " experimental_compaction_spatial_hard_expansion_ratio: %f",
+      experimental_compaction_spatial_hard_expansion_ratio);
+  ROCKS_LOG_INFO(
+      log, " experimental_compaction_spatial_hard_min_file_size: %" PRIu64,
+      experimental_compaction_spatial_hard_min_file_size);
+  ROCKS_LOG_INFO(log, " experimental_global_master_ghost: %d",
+                 static_cast<int>(experimental_global_master_ghost));
+  ROCKS_LOG_INFO(log, " experimental_global_verify_ghost: %d",
+                 static_cast<int>(experimental_global_verify_ghost));
   ROCKS_LOG_INFO(log, "         bottommost_file_compaction_delay: %" PRIu32,
                  bottommost_file_compaction_delay);
   ROCKS_LOG_INFO(log, "                   uncache_aggressiveness: %" PRIu32,

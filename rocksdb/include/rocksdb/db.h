@@ -366,6 +366,15 @@ class DB {
                                    const std::string& name,
                                    std::vector<std::string>* column_families);
 
+  // Query-time helper for multi-manifest (MANIFEST_SET) DBs: list column
+  // families by scanning only the MANIFEST shards whose [tmin,tmax] overlap the
+  // query time window. This is NOT a recovery optimization and must not be
+  // used on the DB::Open() path.
+  static Status ListColumnFamiliesByTimeRange(
+      const DBOptions& db_options, const std::string& name,
+      std::vector<std::string>* column_families, uint64_t query_t_min,
+      uint64_t query_t_max);
+
   // Abstract class ctor
   DB() {}
   // No copying allowed

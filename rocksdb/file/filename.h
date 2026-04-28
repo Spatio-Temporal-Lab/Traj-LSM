@@ -88,6 +88,11 @@ std::string DescriptorFileName(const std::string& dbname, uint64_t number);
 
 std::string DescriptorFileName(uint64_t number);
 
+// Return the name of manifest-set file for the db named by "dbname".
+// Format: MANIFEST_SET-[number]
+std::string ManifestSetFileName(const std::string& dbname, uint64_t number);
+std::string ManifestSetFileName(uint64_t number);
+
 extern const std::string kCurrentFileName;  // = "CURRENT"
 
 // Return the name of the current file.  This file contains the name
@@ -176,6 +181,22 @@ IOStatus SetCurrentFile(const WriteOptions& write_options, FileSystem* fs,
                         const std::string& dbname, uint64_t descriptor_number,
                         Temperature temp,
                         FSDirectory* dir_contains_current_file);
+
+// Write MANIFEST_SET file listing descriptor files in replay order and make
+// CURRENT point to that MANIFEST_SET file.
+IOStatus SetCurrentFileToManifestSet(
+    const WriteOptions& write_options, FileSystem* fs, const std::string& dbname,
+    uint64_t manifest_set_number, const std::vector<uint64_t>& descriptor_numbers,
+    uint64_t generation,
+    Temperature temp, FSDirectory* dir_contains_current_file,
+    const std::vector<uint64_t>* manifest_time_mins = nullptr,
+    const std::vector<uint64_t>* manifest_time_maxs = nullptr,
+    const std::vector<float>* manifest_mbr_x_mins = nullptr,
+    const std::vector<float>* manifest_mbr_x_maxs = nullptr,
+    const std::vector<float>* manifest_mbr_y_mins = nullptr,
+    const std::vector<float>* manifest_mbr_y_maxs = nullptr,
+    const std::vector<uint64_t>* manifest_master_counts = nullptr,
+    const std::vector<uint64_t>* manifest_ghost_counts = nullptr);
 
 // Make the IDENTITY file for the db
 Status SetIdentityFile(const WriteOptions& write_options, Env* env,

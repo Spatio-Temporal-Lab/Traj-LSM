@@ -15,6 +15,7 @@
 #include <rocksdb/table.h>
 
 #include "segment_value_codec.hpp"
+#include "segment_value_global.hpp"
 #include "st_segment_key.hpp"
 #include "st_user_key.hpp"
 #include "trajectory_kv.hpp"
@@ -39,7 +40,9 @@ using trajkv::SplitCsvLine;
 
 static rocksdb::Options MakeStMetaOptions(
     bool disable_auto_compactions, int write_buffer_mb,
-    const StCompactionTimeSplitOptions& time_split = {}) {
+    const StCompactionTimeSplitOptions& time_split = {},
+    bool experimental_global_master_ghost = false,
+    bool experimental_global_verify_ghost = false) {
   rocksdb::Options options;
   options.create_if_missing = true;
   options.disable_auto_compactions = disable_auto_compactions;
@@ -56,6 +59,8 @@ static rocksdb::Options MakeStMetaOptions(
     options.experimental_compaction_event_time_max_point_keys =
         time_split.max_st_keys_per_file;
   }
+  options.experimental_global_master_ghost = experimental_global_master_ghost;
+  options.experimental_global_verify_ghost = experimental_global_verify_ghost;
   rocksdb::BlockBasedTableOptions table_options;
   table_options.experimental_spatio_temporal_meta_in_index_value = true;
   options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table_options));
@@ -67,12 +72,27 @@ static rocksdb::Status MaybeCompactEntireKeyRange(rocksdb::DB* db) {
   return db->CompactRange(cro, nullptr, nullptr);
 }
 
+static std::string EncodeSegmentValueForGlobalMode(
+    const segval::SegmentValueHeader& head,
+    const std::vector<segval::SegmentPoint>& points,
+    bool experimental_global_master_ghost) {
+  if (experimental_global_master_ghost) {
+    return segval::EncodeSegmentValueV3(head, points, /*is_ghost=*/false,
+                                        /*master_key=*/"");
+  }
+  return segval::EncodeSegmentValueV2(head, points);
+}
+
 static int RunSynthetic(const std::string& db_path, bool disable_auto_compactions,
                         int write_buffer_mb,
                         const StCompactionTimeSplitOptions& time_split,
-                        bool compact_after_ingest) {
+                        bool compact_after_ingest,
+                        bool experimental_global_master_ghost,
+                        bool experimental_global_verify_ghost) {
   rocksdb::Options options =
-      MakeStMetaOptions(disable_auto_compactions, write_buffer_mb, time_split);
+      MakeStMetaOptions(disable_auto_compactions, write_buffer_mb, time_split,
+                        experimental_global_master_ghost,
+                        experimental_global_verify_ghost);
   std::unique_ptr<rocksdb::DB> db;
   rocksdb::Status st = rocksdb::DB::Open(options, db_path, &db);
   if (!st.ok()) {
@@ -128,7 +148,9 @@ static int RunCsv(const std::string& csv_path, const std::string& db_path,
                   int64_t max_points, bool disable_auto_compactions,
                   int write_buffer_mb,
                   const StCompactionTimeSplitOptions& time_split,
-                  bool compact_after_ingest) {
+                  bool compact_after_ingest,
+                  bool experimental_global_master_ghost,
+                  bool experimental_global_verify_ghost) {
   std::ifstream in(csv_path);
   if (!in) {
     std::cerr << "Cannot open CSV: " << csv_path << "\n";
@@ -136,7 +158,9 @@ static int RunCsv(const std::string& csv_path, const std::string& db_path,
   }
 
   rocksdb::Options options =
-      MakeStMetaOptions(disable_auto_compactions, write_buffer_mb, time_split);
+      MakeStMetaOptions(disable_auto_compactions, write_buffer_mb, time_split,
+                        experimental_global_master_ghost,
+                        experimental_global_verify_ghost);
   std::unique_ptr<rocksdb::DB> db;
   rocksdb::Status st = rocksdb::DB::Open(options, db_path, &db);
   if (!st.ok()) {
@@ -242,7 +266,9 @@ static int RunCsvStUserKey(const std::string& csv_path, const std::string& db_pa
                            int64_t max_points, bool disable_auto_compactions,
                            int write_buffer_mb,
                            const StCompactionTimeSplitOptions& time_split,
-                           bool compact_after_ingest) {
+                           bool compact_after_ingest,
+                           bool experimental_global_master_ghost,
+                           bool experimental_global_verify_ghost) {
   std::ifstream in(csv_path);
   if (!in) {
     std::cerr << "Cannot open CSV: " << csv_path << "\n";
@@ -250,7 +276,9 @@ static int RunCsvStUserKey(const std::string& csv_path, const std::string& db_pa
   }
 
   rocksdb::Options options =
-      MakeStMetaOptions(disable_auto_compactions, write_buffer_mb, time_split);
+      MakeStMetaOptions(disable_auto_compactions, write_buffer_mb, time_split,
+                        experimental_global_master_ghost,
+                        experimental_global_verify_ghost);
   std::unique_ptr<rocksdb::DB> db;
   rocksdb::Status st = rocksdb::DB::Open(options, db_path, &db);
   if (!st.ok()) {
@@ -365,7 +393,9 @@ static int RunSegmentMetaCsvStKey(const std::string& csv_path,
                                   bool disable_auto_compactions,
                                   int write_buffer_mb,
                                   const StCompactionTimeSplitOptions& time_split,
-                                  bool compact_after_ingest) {
+                                  bool compact_after_ingest,
+                                  bool experimental_global_master_ghost,
+                                  bool experimental_global_verify_ghost) {
   std::unordered_map<std::string, std::vector<segval::SegmentPoint>> by_segment;
   if (!segval::LoadSegmentPointsCsv(points_csv_path, &by_segment)) {
     return 1;
@@ -376,7 +406,9 @@ static int RunSegmentMetaCsvStKey(const std::string& csv_path,
     return 1;
   }
   rocksdb::Options options =
-      MakeStMetaOptions(disable_auto_compactions, write_buffer_mb, time_split);
+      MakeStMetaOptions(disable_auto_compactions, write_buffer_mb, time_split,
+                        experimental_global_master_ghost,
+                        experimental_global_verify_ghost);
   std::unique_ptr<rocksdb::DB> db;
   rocksdb::Status st = rocksdb::DB::Open(options, db_path, &db);
   if (!st.ok()) {
@@ -436,10 +468,11 @@ static int RunSegmentMetaCsvStKey(const std::string& csv_path,
     head.x_max = x_max;
     head.y_max = y_max;
     head.point_count = point_count;
-    const std::string encoded =
-        segval::EncodeSegmentValueV2(head, pit->second);
+    const std::string encoded = EncodeSegmentValueForGlobalMode(
+        head, pit->second, experimental_global_master_ghost);
     if (encoded.empty()) {
-      std::cerr << "EncodeSegmentValueV2 failed for segment_id=" << segment_id
+      std::cerr << "EncodeSegmentValueForGlobalMode failed for segment_id="
+                << segment_id
                 << "\n";
       return 1;
     }
@@ -509,11 +542,15 @@ static int RunSegmentMetaCsvStKey(const std::string& csv_path,
       std::cerr << "Get failed: " << st.ToString() << "\n";
       return 2;
     }
-    segval::DecodedSegmentValue got{};
-    if (!segval::DecodeSegmentValue(got_blob, &got) || got.is_legacy) {
+    segval::MaterializedSegmentValue got_materialized{};
+    if (!segval::DecodeAndMaterializeSegmentValue(
+            db.get(), rocksdb::ReadOptions(), rocksdb::Slice(got_blob),
+            &got_materialized) ||
+        got_materialized.decoded.is_legacy) {
       std::cerr << "Expected V2 segment value at row " << checked << "\n";
       return 2;
     }
+    const segval::DecodedSegmentValue& got = got_materialized.decoded;
     if (got.header.t_start != t_start || got.header.t_end != t_end ||
         got.header.point_count != point_count) {
       std::cerr << "Header mismatch at segment row " << checked << "\n";
@@ -553,6 +590,8 @@ int main(int argc, char** argv) {
   int write_buffer_mb = 0;
   StCompactionTimeSplitOptions time_split{};
   bool compact_after_ingest = false;
+  bool experimental_global_master_ghost = false;
+  bool experimental_global_verify_ghost = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -585,6 +624,10 @@ int main(int argc, char** argv) {
           static_cast<uint32_t>(std::stoul(argv[++i]));
     } else if (a == "--compact-after-ingest") {
       compact_after_ingest = true;
+    } else if (a == "--experimental-global-master-ghost") {
+      experimental_global_master_ghost = true;
+    } else if (a == "--experimental-global-verify-ghost") {
+      experimental_global_verify_ghost = true;
     } else if (a == "--st-keys") {
       st_keys = true;
     } else if (a == "--st-segment-keys") {
@@ -621,7 +664,11 @@ int main(int argc, char** argv) {
              "  --st-compaction-max-st-keys K\n"
              "      Cut after K ST keys in one output file (0 = off).\n"
              "  --compact-after-ingest\n"
-             "      Run CompactRange on the default CF after flush (applies time-split on compaction).\n";
+             "      Run CompactRange on the default CF after flush (applies time-split on compaction).\n"
+             "  --experimental-global-master-ghost\n"
+             "      Enable Global Master/Ghost manifest semantics in CF options.\n"
+             "  --experimental-global-verify-ghost\n"
+             "      Enable Global ghost consistency fail-fast checks.\n";
       return 0;
     }
   }
@@ -654,21 +701,34 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  if (experimental_global_verify_ghost && !experimental_global_master_ghost) {
+    std::cerr << "--experimental-global-verify-ghost requires --experimental-global-master-ghost\n";
+    return 1;
+  }
+
   if (csv_path.empty() && segment_meta_csv_path.empty()) {
     return RunSynthetic(db_path, disable_auto_compactions, write_buffer_mb,
-                       time_split, compact_after_ingest);
+                        time_split, compact_after_ingest,
+                        experimental_global_master_ghost,
+                        experimental_global_verify_ghost);
   }
   if (st_segment_keys) {
     return RunSegmentMetaCsvStKey(segment_meta_csv_path, segment_points_csv_path,
                                   db_path, max_points, flush_every,
                                   disable_auto_compactions, write_buffer_mb,
-                                  time_split, compact_after_ingest);
+                                  time_split, compact_after_ingest,
+                                  experimental_global_master_ghost,
+                                  experimental_global_verify_ghost);
   }
   if (st_keys) {
     return RunCsvStUserKey(csv_path, db_path, max_points,
                            disable_auto_compactions, write_buffer_mb,
-                           time_split, compact_after_ingest);
+                           time_split, compact_after_ingest,
+                           experimental_global_master_ghost,
+                           experimental_global_verify_ghost);
   }
   return RunCsv(csv_path, db_path, max_points, disable_auto_compactions,
-                write_buffer_mb, time_split, compact_after_ingest);
+                write_buffer_mb, time_split, compact_after_ingest,
+                experimental_global_master_ghost,
+                experimental_global_verify_ghost);
 }

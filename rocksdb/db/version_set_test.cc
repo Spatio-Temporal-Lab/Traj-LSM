@@ -1508,6 +1508,74 @@ class VersionSetTest : public VersionSetTestBase, public testing::Test {
   VersionSetTest() : VersionSetTestBase("version_set_test") {}
 };
 
+TEST_F(VersionSetTest, GetCurrentManifestPathsFilteredByTimeRange) {
+  const uint64_t manifest_set_number = 100;
+  const std::string manifest_set_name = ManifestSetFileName(manifest_set_number);
+  const std::string manifest_set_path =
+      ManifestSetFileName(dbname_, manifest_set_number);
+  const std::string manifest_set_content =
+      "version=1\n"
+      "entry=MANIFEST-000001,tmin=100,tmax=199\n"
+      "MANIFEST-000002\n"
+      "entry=MANIFEST-000003,tmin=300,tmax=399\n";
+
+  ASSERT_OK(WriteStringToFile(env_, manifest_set_content, manifest_set_path));
+  ASSERT_OK(
+      WriteStringToFile(env_, manifest_set_name + "\n", CurrentFileName(dbname_)));
+
+  std::vector<std::string> filtered_paths;
+  std::vector<uint64_t> filtered_numbers;
+  std::vector<uint64_t> filtered_mins;
+  std::vector<uint64_t> filtered_maxs;
+  uint64_t generation = 0;
+  ASSERT_OK(GetCurrentManifestPathsFilteredByTimeRange(
+      dbname_, fs_.get(), /*is_retry=*/false, /*query_t_min=*/150,
+      /*query_t_max=*/250, &filtered_paths, &filtered_numbers, &generation,
+      &filtered_mins, &filtered_maxs));
+
+  ASSERT_EQ(generation, 0);
+  ASSERT_EQ(filtered_numbers.size(), 2U);
+  ASSERT_EQ(filtered_numbers[0], 1U);
+  ASSERT_EQ(filtered_numbers[1], 2U);  // Unknown-range shard is always kept.
+  ASSERT_EQ(filtered_mins.size(), 2U);
+  ASSERT_EQ(filtered_mins[0], 100U);
+  ASSERT_EQ(filtered_maxs[0], 199U);
+}
+
+TEST_F(VersionSetTest, LoadCurrentManifestShardsByTimeRangeCached) {
+  const uint64_t manifest_set_number = 101;
+  const std::string manifest_set_name = ManifestSetFileName(manifest_set_number);
+  const std::string manifest_set_path =
+      ManifestSetFileName(dbname_, manifest_set_number);
+  const std::string manifest_set_content =
+      "version=1\n"
+      "entry=MANIFEST-000011,tmin=100,tmax=199\n"
+      "MANIFEST-000012\n"
+      "entry=MANIFEST-000013,tmin=300,tmax=399\n";
+  ASSERT_OK(WriteStringToFile(env_, manifest_set_content, manifest_set_path));
+  ASSERT_OK(
+      WriteStringToFile(env_, manifest_set_name + "\n", CurrentFileName(dbname_)));
+
+  ASSERT_OK(WriteStringToFile(env_, "m11\n", DescriptorFileName(dbname_, 11)));
+  ASSERT_OK(WriteStringToFile(env_, "m12\n", DescriptorFileName(dbname_, 12)));
+  ASSERT_OK(WriteStringToFile(env_, "m13\n", DescriptorFileName(dbname_, 13)));
+
+  std::vector<std::string> filtered_paths;
+  std::vector<std::string> filtered_contents;
+  uint64_t generation = 0;
+  ASSERT_OK(LoadCurrentManifestShardsByTimeRangeCached(
+      dbname_, fs_.get(), /*is_retry=*/false, /*query_t_min=*/350,
+      /*query_t_max=*/360, &filtered_paths, &filtered_contents, &generation));
+
+  ASSERT_EQ(generation, 0);
+  ASSERT_EQ(filtered_paths.size(), 2U);
+  ASSERT_EQ(filtered_contents.size(), 2U);
+  ASSERT_NE(filtered_paths[0].find("MANIFEST-000012"), std::string::npos);
+  ASSERT_NE(filtered_paths[1].find("MANIFEST-000013"), std::string::npos);
+  ASSERT_EQ(filtered_contents[0], "m12\n");
+  ASSERT_EQ(filtered_contents[1], "m13\n");
+}
+
 TEST_F(VersionSetTest, SameColumnFamilyGroupCommit) {
   NewDB();
   const int kGroupSize = 5;

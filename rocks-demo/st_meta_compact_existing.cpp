@@ -26,6 +26,10 @@ namespace {
 rocksdb::Options BenchCompatibleOpenOptions() {
   rocksdb::Options o;
   o.create_if_missing = false;
+  // Ensure INFO-level diagnostics from compaction (e.g. ST_EVENT_SPLIT) are
+  // visible in LOG. This tool is interactive/debug-oriented rather than perf
+  // sensitive.
+  o.info_log_level = rocksdb::InfoLogLevel::INFO_LEVEL;
   rocksdb::BlockBasedTableOptions tb;
   tb.experimental_spatio_temporal_meta_in_index_value = true;
   tb.block_cache = rocksdb::NewLRUCache(8ULL * 1048576);
@@ -64,8 +68,12 @@ void ProbeUserKeys(rocksdb::DB* db, size_t sample_limit = 4096) {
     const uint8_t magic = static_cast<uint8_t>(k.data()[0]);
     if (magic == 0xE6 && k.size() >= 5) {
       ++e6;
-      uint32_t t = 0;
-      std::memcpy(&t, k.data() + 1, sizeof(uint32_t));
+      const unsigned char* p =
+          reinterpret_cast<const unsigned char*>(k.data() + 1);
+      const uint32_t t = (static_cast<uint32_t>(p[0]) << 24) |
+                         (static_cast<uint32_t>(p[1]) << 16) |
+                         (static_cast<uint32_t>(p[2]) << 8) |
+                         (static_cast<uint32_t>(p[3]));
       if (!have_t) {
         first_t = t;
         have_t = true;
@@ -86,6 +94,28 @@ void ProbeUserKeys(rocksdb::DB* db, size_t sample_limit = 4096) {
   std::cout << "\n";
 }
 
+void ReportStCompactionOptions(rocksdb::DB* db, const char* label) {
+  if (db == nullptr) {
+    return;
+  }
+  const rocksdb::Options o = db->GetOptions();
+  std::cout << label
+            << " st_event_time_split="
+            << static_cast<int>(o.experimental_compaction_event_time_split)
+            << " bucket_width=" << o.experimental_compaction_event_time_bucket_width
+            << " min_keys_per_file="
+            << o.experimental_compaction_event_time_min_keys_per_file
+            << " max_span=" << o.experimental_compaction_event_time_max_span
+            << " max_point_keys="
+            << o.experimental_compaction_event_time_max_point_keys
+            << " spatial_soft_ratio="
+            << o.experimental_compaction_spatial_soft_expansion_ratio
+            << " spatial_hard_ratio="
+            << o.experimental_compaction_spatial_hard_expansion_ratio
+            << " spatial_hard_min_file_size="
+            << o.experimental_compaction_spatial_hard_min_file_size << "\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -95,6 +125,12 @@ int main(int argc, char** argv) {
   bool st_time_split_enable = false;
   uint32_t st_bucket_sec = 0;
   uint32_t st_min_keys_per_file = 0;
+  double st_spatial_soft_ratio = 0.0;
+  double st_spatial_hard_ratio = 0.0;
+  uint64_t st_spatial_hard_min_file_size = 0;
+  bool read_repair_first = false;
+  uint64_t read_repair_min_reads = 0;
+  double read_repair_shape_weight = 1.0;
 
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
@@ -139,6 +175,62 @@ int main(int argc, char** argv) {
       dry_run = true;
       continue;
     }
+    if (std::strcmp(argv[i], "--st-spatial-soft-ratio") == 0 && i + 1 < argc) {
+      char* e = nullptr;
+      const double v = std::strtod(argv[++i], &e);
+      if (e == argv[i] || *e != '\0' || v < 0.0) {
+        std::cerr << "Invalid --st-spatial-soft-ratio (>=0)\n";
+        return 1;
+      }
+      st_spatial_soft_ratio = v;
+      continue;
+    }
+    if (std::strcmp(argv[i], "--st-spatial-hard-ratio") == 0 && i + 1 < argc) {
+      char* e = nullptr;
+      const double v = std::strtod(argv[++i], &e);
+      if (e == argv[i] || *e != '\0' || v < 0.0) {
+        std::cerr << "Invalid --st-spatial-hard-ratio (>=0)\n";
+        return 1;
+      }
+      st_spatial_hard_ratio = v;
+      continue;
+    }
+    if (std::strcmp(argv[i], "--st-spatial-hard-min-file-mb") == 0 &&
+        i + 1 < argc) {
+      char* e = nullptr;
+      const unsigned long long v = std::strtoull(argv[++i], &e, 10);
+      if (e == argv[i] || *e != '\0' || v > 1024ull * 1024ull) {
+        std::cerr << "Invalid --st-spatial-hard-min-file-mb\n";
+        return 1;
+      }
+      st_spatial_hard_min_file_size = static_cast<uint64_t>(v) * 1048576ull;
+      continue;
+    }
+    if (std::strcmp(argv[i], "--read-repair-first") == 0) {
+      read_repair_first = true;
+      continue;
+    }
+    if (std::strcmp(argv[i], "--read-repair-min-reads") == 0 && i + 1 < argc) {
+      char* e = nullptr;
+      const unsigned long long v = std::strtoull(argv[++i], &e, 10);
+      if (e == argv[i] || *e != '\0') {
+        std::cerr << "Invalid --read-repair-min-reads\n";
+        return 1;
+      }
+      read_repair_min_reads = static_cast<uint64_t>(v);
+      continue;
+    }
+    if (std::strcmp(argv[i], "--read-repair-shape-weight") == 0 &&
+        i + 1 < argc) {
+      char* e = nullptr;
+      const double v = std::strtod(argv[++i], &e);
+      if (e == argv[i] || *e != '\0' || v < 0.0) {
+        std::cerr << "Invalid --read-repair-shape-weight (>=0)\n";
+        return 1;
+      }
+      read_repair_shape_weight = v;
+      continue;
+    }
     if (std::strcmp(argv[i], "-h") == 0 ||
         std::strcmp(argv[i], "--help") == 0) {
       std::cout
@@ -152,6 +244,12 @@ int main(int argc, char** argv) {
              "  --st-time-split      enable ST event-time split during compaction\n"
              "  --st-bucket-sec W    split when floor(t_sec/W) changes (segment keys use t_start)\n"
              "  --st-min-keys K      require at least K ST keys in output before splitting on bucket change\n"
+             "  --st-spatial-soft-ratio R  soft split trigger on MBR expansion ratio (>=0)\n"
+             "  --st-spatial-hard-ratio R  hard split trigger on MBR expansion ratio (>=0)\n"
+             "  --st-spatial-hard-min-file-mb M  hard split only if file size >= M MiB\n"
+             "  --read-repair-first  enable read-repair-first file pick ordering\n"
+             "  --read-repair-min-reads N  minimum sampled reads before read-repair scoring applies\n"
+             "  --read-repair-shape-weight W  shape penalty weight for read-repair score\n"
              "  --dry-run            print live files only; no SetOptions/CompactRange\n";
       return 0;
     }
@@ -174,9 +272,7 @@ int main(int argc, char** argv) {
 
   ReportFiles(db.get(), "BEFORE");
   ProbeUserKeys(db.get());
-  if (dry_run) {
-    return 0;
-  }
+  ReportStCompactionOptions(db.get(), "BEFORE_OPTS");
 
   const uint64_t base_bytes =
       static_cast<uint64_t>(target_file_mb) * 1048576ull;
@@ -193,6 +289,25 @@ int main(int argc, char** argv) {
           std::to_string(st_min_keys_per_file);
     }
   }
+  if (st_spatial_soft_ratio > 0.0) {
+    cf_opts["experimental_compaction_spatial_soft_expansion_ratio"] =
+        std::to_string(st_spatial_soft_ratio);
+  }
+  if (st_spatial_hard_ratio > 0.0) {
+    cf_opts["experimental_compaction_spatial_hard_expansion_ratio"] =
+        std::to_string(st_spatial_hard_ratio);
+  }
+  if (st_spatial_hard_min_file_size > 0) {
+    cf_opts["experimental_compaction_spatial_hard_min_file_size"] =
+        std::to_string(st_spatial_hard_min_file_size);
+  }
+  if (read_repair_first) {
+    cf_opts["experimental_compaction_read_repair_first"] = "true";
+    cf_opts["experimental_compaction_read_repair_min_reads"] =
+        std::to_string(read_repair_min_reads);
+    cf_opts["experimental_compaction_read_repair_shape_weight"] =
+        std::to_string(read_repair_shape_weight);
+  }
   s = db->SetOptions(cf_opts);
   if (!s.ok()) {
     std::cerr << "SetOptions warning: " << s.ToString()
@@ -201,18 +316,24 @@ int main(int argc, char** argv) {
     std::cout << "SetOptions target_file_size_base=" << base_bytes << " ok\n";
   }
 
-  // Reopen to ensure subsequent manual compaction picks up latest mutable CF
-  // options on all paths.
-  db.reset();
-  s = rocksdb::DB::Open(opt, db_path, &db);
-  if (!s.ok()) {
-    std::cerr << "DB::Open(after SetOptions): " << s.ToString() << "\n";
-    return 1;
+  // NOTE: `DB::Open` does not automatically load mutable CF options from the
+  // OPTIONS file. Reopening here would therefore drop the SetOptions() changes
+  // and make the compaction behave as if event-time split was disabled.
+  ReportStCompactionOptions(db.get(), "AFTER_SETOPTIONS_OPTS");
+  if (dry_run) {
+    // In dry-run mode we intentionally avoid CompactRange, but we still apply
+    // SetOptions so callers can verify the effective mutable options without
+    // rewriting SSTs.
+    return 0;
   }
-  ReportFiles(db.get(), "REOPEN");
-  ProbeUserKeys(db.get());
 
   rocksdb::CompactRangeOptions cro;
+  // This DB is already fully in the bottommost level (common for offline-built
+  // trajectory DBs). Without forcing bottommost-level compaction, CompactRange
+  // can become a no-op and won't rewrite SSTs (thus no chance to apply
+  // event-time split / target_file_size_base).
+  cro.bottommost_level_compaction =
+      rocksdb::BottommostLevelCompaction::kForce;
   std::cout << "CompactRange (full keyspace, may take a long time)...\n";
   std::cout.flush();
   s = db->CompactRange(cro, nullptr, nullptr);

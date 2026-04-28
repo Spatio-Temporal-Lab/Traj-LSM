@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
@@ -22,12 +23,21 @@ namespace ROCKSDB_NAMESPACE {
 
 constexpr unsigned char kSpatioTemporalUserKeyMagic = 0xE5;
 constexpr unsigned char kSpatioTemporalSegmentKeyMagic = 0xE6;
+constexpr unsigned char kSpatioTemporalSegmentKeyTzidMagic = 0xE7;
 
 // Merges one user key into per-data-block accumulator (same semantics as
 // widening t/MBR and OR-ing a coarse 8x8 world-grid bit in bitmap).
 void MergeSpatioTemporalMetaFromUserKey(const Slice& user_key,
                                         SpatioTemporalBlockMeta* acc,
                                         bool* acc_valid);
+
+// Same as above, but allows segment-style keys (especially E7) to source
+// t_end/MBR/bitmap from the value header when the user key no longer carries
+// enough pruning metadata.
+void MergeSpatioTemporalMetaFromKeyValue(const Slice& user_key,
+                                         const std::optional<Slice>& value,
+                                         SpatioTemporalBlockMeta* acc,
+                                         bool* acc_valid);
 
 // Decodes Event Time `t_sec` from a spatio-temporal user key (magic 0xE5).
 // Returns false if the key is too short or not an ST user key.

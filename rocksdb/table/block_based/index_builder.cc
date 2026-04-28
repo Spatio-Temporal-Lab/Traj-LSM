@@ -141,7 +141,7 @@ void ShortenedIndexBuilder::UpdateIndexSizeEstimate() {
 }
 
 void ShortenedIndexBuilder::MergeInternalKeyIntoBlockStMeta(
-    const Slice& internal_key) {
+    const Slice& internal_key, const std::optional<Slice>& value) {
   if (!attach_st_meta_in_index_value_) {
     return;
   }
@@ -149,8 +149,9 @@ void ShortenedIndexBuilder::MergeInternalKeyIntoBlockStMeta(
   if (!ParseInternalKey(internal_key, &parsed, /*log_err_key=*/false).ok()) {
     return;
   }
-  MergeSpatioTemporalMetaFromUserKey(parsed.user_key, &block_st_meta_accumulator_,
-                                    &block_st_meta_accumulator_valid_);
+  MergeSpatioTemporalMetaFromKeyValue(parsed.user_key, value,
+                                      &block_st_meta_accumulator_,
+                                      &block_st_meta_accumulator_valid_);
 }
 
 void ShortenedIndexBuilder::AccumulateFileSpatioTemporalMetaForManifest(

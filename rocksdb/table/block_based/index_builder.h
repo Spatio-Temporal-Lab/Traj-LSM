@@ -268,11 +268,11 @@ class ShortenedIndexBuilder : public IndexBuilder {
   }
 
   void OnKeyAdded(const Slice& key,
-                  const std::optional<Slice>& /*value*/) override {
+                  const std::optional<Slice>& value) override {
     if (include_first_key_ && current_block_first_internal_key_.empty()) {
       current_block_first_internal_key_.assign(key.data(), key.size());
     }
-    MergeInternalKeyIntoBlockStMeta(key);
+    MergeInternalKeyIntoBlockStMeta(key, value);
   }
 
   Slice GetSeparatorWithSeq(const Slice& last_key_in_current_block,
@@ -507,7 +507,8 @@ class ShortenedIndexBuilder : public IndexBuilder {
   // Per-data-block ST summary from keys only. MergeInternalKeyIntoBlockStMeta is
   // called from OnKeyAdded; FinalizeBlockStMetaForDataBlock runs at each index
   // entry (AddIndexEntry / PrepareIndexEntry) and resets the accumulator.
-  void MergeInternalKeyIntoBlockStMeta(const Slice& internal_key);
+  void MergeInternalKeyIntoBlockStMeta(const Slice& internal_key,
+                                       const std::optional<Slice>& value);
   SpatioTemporalBlockMeta FinalizeBlockStMetaForDataBlock(
       const Slice& last_key_in_current_block,
       const Slice* first_key_in_next_block);

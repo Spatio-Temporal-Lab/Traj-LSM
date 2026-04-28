@@ -82,6 +82,8 @@ const std::string LDBCommand::ARG_IGNORE_UNKNOWN_OPTIONS =
 const std::string LDBCommand::ARG_FROM = "from";
 const std::string LDBCommand::ARG_TO = "to";
 const std::string LDBCommand::ARG_MAX_KEYS = "max_keys";
+const std::string LDBCommand::ARG_QUERY_T_MIN = "query_t_min";
+const std::string LDBCommand::ARG_QUERY_T_MAX = "query_t_max";
 const std::string LDBCommand::ARG_BLOOM_BITS = "bloom_bits";
 const std::string LDBCommand::ARG_FIX_PREFIX_LEN = "fix_prefix_len";
 const std::string LDBCommand::ARG_COMPRESSION_TYPE = "compression_type";
@@ -714,6 +716,8 @@ std::vector<std::string> LDBCommand::BuildCmdLineOptions(
   std::vector<std::string> ret = {ARG_ENV_URI,
                                   ARG_FS_URI,
                                   ARG_DB,
+                                  ARG_QUERY_T_MIN,
+                                  ARG_QUERY_T_MAX,
                                   ARG_SECONDARY_PATH,
                                   ARG_LEADER_PATH,
                                   ARG_BLOOM_BITS,
@@ -1265,7 +1269,37 @@ void LDBCommand::PrepareOptions() {
       // case, the option overrides from the CLI argument/specific subcommand
       // apply to all column families.
       std::vector<std::string> cf_list;
-      Status st = DB::ListColumnFamilies(options_, db_path_, &cf_list);
+      Status st;
+      auto it_min = option_map_.find(ARG_QUERY_T_MIN);
+      auto it_max = option_map_.find(ARG_QUERY_T_MAX);
+      if (it_min != option_map_.end() || it_max != option_map_.end()) {
+        if (it_min == option_map_.end() || it_max == option_map_.end()) {
+          exec_state_ = LDBCommandExecuteResult::Failed(
+              "Both --" + ARG_QUERY_T_MIN + " and --" + ARG_QUERY_T_MAX +
+              " must be specified together");
+          return;
+        }
+        char* end = nullptr;
+        uint64_t tmin = std::strtoull(it_min->second.c_str(), &end, 10);
+        if (it_min->second.empty() || end == it_min->second.c_str() ||
+            *end != '\0') {
+          exec_state_ = LDBCommandExecuteResult::Failed(
+              "Bad --" + ARG_QUERY_T_MIN + ": " + it_min->second);
+          return;
+        }
+        end = nullptr;
+        uint64_t tmax = std::strtoull(it_max->second.c_str(), &end, 10);
+        if (it_max->second.empty() || end == it_max->second.c_str() ||
+            *end != '\0') {
+          exec_state_ = LDBCommandExecuteResult::Failed(
+              "Bad --" + ARG_QUERY_T_MAX + ": " + it_max->second);
+          return;
+        }
+        st = DB::ListColumnFamiliesByTimeRange(options_, db_path_, &cf_list,
+                                               tmin, tmax);
+      } else {
+        st = DB::ListColumnFamilies(options_, db_path_, &cf_list);
+      }
       // It is possible the DB doesn't exist yet, for "create if not
       // existing" case. The failure is ignored here. We rely on DB::Open()
       // to give us the correct error message for problem with opening

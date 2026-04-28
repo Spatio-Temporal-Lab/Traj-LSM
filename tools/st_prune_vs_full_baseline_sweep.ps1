@@ -24,6 +24,7 @@ param(
   [string]$WindowsCsv = "",
   [string]$OutTsv = "",
   [string]$PruneMode = "sst_manifest",
+  [switch]$ManifestLinearFileSkip,
   [ValidateSet("window", "all_cf")]
   [string]$FullScanMode = "window",
   [switch]$VerifyKVResults,
@@ -211,6 +212,9 @@ function Invoke-BenchPair {
   if ($PruneMode -eq "manifest" -or $PruneMode -eq "manifest_timebucket_rtree" -or
       $VirtualMerge.IsPresent -or $VirtualMergeAuto.IsPresent) {
     $args += @("--time-bucket-count", "$TimeBucketCount", "--rtree-leaf-size", "$RTreeLeafSize")
+    if ($PruneMode -eq "manifest" -and $ManifestLinearFileSkip.IsPresent) {
+      $args += "--manifest-linear-file-skip"
+    }
   }
   if ($PruneMode -eq "sst_manifest") {
     $args += @("--sst-manifest-key-level", "$SstManifestKeyLevel")
@@ -235,11 +239,21 @@ function Invoke-BenchPair {
   if ($IteratorRepeat -gt 1) {
     $args += @("--iterator-repeat", "$IteratorRepeat")
   }
-  # Optional: fork full+prune KV verify while using Vanilla wall as *ratio* baseline.
-  # Vanilla path uses --no-full-scan, so verify must run as a separate bench invocation on fork DB.
+# Optional: fork full+prune KV verify while using Vanilla wall as *ratio* baseline.
+# Vanilla path uses --no-full-scan, so verify must run as a separate bench invocation on fork DB.
+# Note: st_meta_read_bench verify is now point-truth based:
+#   - 0xE5: point in window
+#   - 0xE6: decode value points and test ∃point∈window
+# It reports FAIL when segment values are legacy/no-points or decode fails.
   $kv_verify_correct = ""
   $kv_verify_full = ""
   $kv_verify_prune = ""
+  $kv_verify_full_decode_failed = ""
+  $kv_verify_prune_decode_failed = ""
+  $kv_verify_full_legacy_segment_value = ""
+  $kv_verify_prune_legacy_segment_value = ""
+  $kv_verify_full_unsupported_key = ""
+  $kv_verify_prune_unsupported_key = ""
   if ($VerifyKVResults.IsPresent -and $VanillaAsBaseline.IsPresent) {
     $vargs = [System.Collections.Generic.List[string]]::new()
     foreach ($a in $args) {
@@ -249,7 +263,18 @@ function Invoke-BenchPair {
     $vargs.Add("--verify-kv-results")
     Write-Host "  (fork full+prune --verify-kv-results for KV self-check vs Vanilla baseline row)" -ForegroundColor DarkGray
     $rawV = & $Bench ($vargs.ToArray()) 2>&1 | Out-String
-    if ($rawV -match 'verify_kv_results correctness=(OK|FAIL) full_inwindow_kv=(\d+) prune_inwindow_kv=(\d+)') {
+    if ($rawV -match 'verify_kv_results correctness=(OK|FAIL) full_inwindow_kv=(\d+) prune_inwindow_kv=(\d+)\s+full_decode_failed=(\d+)\s+prune_decode_failed=(\d+)\s+full_legacy_segment_value=(\d+)\s+prune_legacy_segment_value=(\d+)\s+full_unsupported_key=(\d+)\s+prune_unsupported_key=(\d+)') {
+      $kv_verify_correct = $Matches[1]
+      $kv_verify_full = $Matches[2]
+      $kv_verify_prune = $Matches[3]
+      $kv_verify_full_decode_failed = $Matches[4]
+      $kv_verify_prune_decode_failed = $Matches[5]
+      $kv_verify_full_legacy_segment_value = $Matches[6]
+      $kv_verify_prune_legacy_segment_value = $Matches[7]
+      $kv_verify_full_unsupported_key = $Matches[8]
+      $kv_verify_prune_unsupported_key = $Matches[9]
+    } elseif ($rawV -match 'verify_kv_results correctness=(OK|FAIL) full_inwindow_kv=(\d+) prune_inwindow_kv=(\d+)') {
+      # Backward compatibility with older bench output.
       $kv_verify_correct = $Matches[1]
       $kv_verify_full = $Matches[2]
       $kv_verify_prune = $Matches[3]
@@ -336,7 +361,21 @@ function Invoke-BenchPair {
   }
 
   $kv_correct = ""; $kv_full = ""; $kv_prune = ""
-  if ($raw -match 'verify_kv_results correctness=(OK|FAIL) full_inwindow_kv=(\d+) prune_inwindow_kv=(\d+)') {
+  $kv_full_decode_failed = ""; $kv_prune_decode_failed = ""
+  $kv_full_legacy_segment_value = ""; $kv_prune_legacy_segment_value = ""
+  $kv_full_unsupported_key = ""; $kv_prune_unsupported_key = ""
+  if ($raw -match 'verify_kv_results correctness=(OK|FAIL) full_inwindow_kv=(\d+) prune_inwindow_kv=(\d+)\s+full_decode_failed=(\d+)\s+prune_decode_failed=(\d+)\s+full_legacy_segment_value=(\d+)\s+prune_legacy_segment_value=(\d+)\s+full_unsupported_key=(\d+)\s+prune_unsupported_key=(\d+)') {
+    $kv_correct = $Matches[1]
+    $kv_full = $Matches[2]
+    $kv_prune = $Matches[3]
+    $kv_full_decode_failed = $Matches[4]
+    $kv_prune_decode_failed = $Matches[5]
+    $kv_full_legacy_segment_value = $Matches[6]
+    $kv_prune_legacy_segment_value = $Matches[7]
+    $kv_full_unsupported_key = $Matches[8]
+    $kv_prune_unsupported_key = $Matches[9]
+  } elseif ($raw -match 'verify_kv_results correctness=(OK|FAIL) full_inwindow_kv=(\d+) prune_inwindow_kv=(\d+)') {
+    # Backward compatibility with older bench output.
     $kv_correct = $Matches[1]
     $kv_full = $Matches[2]
     $kv_prune = $Matches[3]
@@ -345,6 +384,12 @@ function Invoke-BenchPair {
     $kv_correct = $kv_verify_correct
     $kv_full = $kv_verify_full
     $kv_prune = $kv_verify_prune
+    $kv_full_decode_failed = $kv_verify_full_decode_failed
+    $kv_prune_decode_failed = $kv_verify_prune_decode_failed
+    $kv_full_legacy_segment_value = $kv_verify_full_legacy_segment_value
+    $kv_prune_legacy_segment_value = $kv_verify_prune_legacy_segment_value
+    $kv_full_unsupported_key = $kv_verify_full_unsupported_key
+    $kv_prune_unsupported_key = $kv_verify_prune_unsupported_key
   }
   if ($fk -ne "" -and $fb -ne "" -and $pb -ne "") {
     try {
@@ -365,6 +410,12 @@ function Invoke-BenchPair {
     pk = $pk; pk_in_window = $pkinw; pbr = $pbr; pb = $pb; pw = $pw
     ratio_bytes = $rb; ratio_block_read = $rbr; ratio_wall = $rw; key_sel = $ks
     kv_correct = $kv_correct; kv_full_inwindow_kv = $kv_full; kv_prune_inwindow_kv = $kv_prune
+    kv_full_decode_failed = $kv_full_decode_failed
+    kv_prune_decode_failed = $kv_prune_decode_failed
+    kv_full_legacy_segment_value = $kv_full_legacy_segment_value
+    kv_prune_legacy_segment_value = $kv_prune_legacy_segment_value
+    kv_full_unsupported_key = $kv_full_unsupported_key
+    kv_prune_unsupported_key = $kv_prune_unsupported_key
     prune_file_skipped = $pskip
     prune_file_considered = $pconsider
     prune_file_missing_meta = $pmissing
@@ -449,10 +500,10 @@ for ($di = 0; $di -lt $RocksDbPaths.Count; $di++) {
   }
 }
 
-$header = "db`tlabel`tregime`tfull_keys`tfull_keys_scanned_total`tfull_block_read`tfull_bytes_read`tfull_wall_us`tvanilla_wall_us`tvanilla_keys`tvanilla_keys_scanned_total`tvanilla_block_read`tprune_keys`tprune_keys_in_window`tprune_block_read`tprune_bytes_read`tprune_wall_us`tratio_bytes`tratio_block_read`tratio_wall`tkey_selectivity`tprune_file_skipped`tprune_file_considered`tprune_file_missing_meta`tprune_file_range_del_blocked`tprune_file_time_disjoint`tprune_file_space_disjoint`tprune_block_index_examined`tprune_block_index_skipped_st_disjoint`tprune_block_index_stop_missing_meta`tprune_key_examined`tprune_key_skipped_disjoint`tkv_correct`tkv_full_inwindow_kv`tkv_prune_inwindow_kv`terror"
+$header = "db`tlabel`tregime`tfull_keys`tfull_keys_scanned_total`tfull_block_read`tfull_bytes_read`tfull_wall_us`tvanilla_wall_us`tvanilla_keys`tvanilla_keys_scanned_total`tvanilla_block_read`tprune_keys`tprune_keys_in_window`tprune_block_read`tprune_bytes_read`tprune_wall_us`tratio_bytes`tratio_block_read`tratio_wall`tkey_selectivity`tprune_file_skipped`tprune_file_considered`tprune_file_missing_meta`tprune_file_range_del_blocked`tprune_file_time_disjoint`tprune_file_space_disjoint`tprune_block_index_examined`tprune_block_index_skipped_st_disjoint`tprune_block_index_stop_missing_meta`tprune_key_examined`tprune_key_skipped_disjoint`tkv_correct`tkv_full_inwindow_kv`tkv_prune_inwindow_kv`tkv_full_decode_failed`tkv_prune_decode_failed`tkv_full_legacy_segment_value`tkv_prune_legacy_segment_value`tkv_full_unsupported_key`tkv_prune_unsupported_key`terror"
 $lines = @($header)
 foreach ($o in $all) {
-  $lines += "$($o.db)`t$($o.label)`t$($o.regime)`t$($o.fk)`t$($o.fst)`t$($o.fbr)`t$($o.fb)`t$($o.fw)`t$($o.vanilla_wall_us)`t$($o.vanilla_keys)`t$($o.vanilla_keys_scanned_total)`t$($o.vanilla_block_read)`t$($o.pk)`t$($o.pk_in_window)`t$($o.pbr)`t$($o.pb)`t$($o.pw)`t$($o.ratio_bytes)`t$($o.ratio_block_read)`t$($o.ratio_wall)`t$($o.key_sel)`t$($o.prune_file_skipped)`t$($o.prune_file_considered)`t$($o.prune_file_missing_meta)`t$($o.prune_file_range_del_blocked)`t$($o.prune_file_time_disjoint)`t$($o.prune_file_space_disjoint)`t$($o.prune_block_index_examined)`t$($o.prune_block_index_skipped_st_disjoint)`t$($o.prune_block_index_stop_missing_meta)`t$($o.prune_key_examined)`t$($o.prune_key_skipped_disjoint)`t$($o.kv_correct)`t$($o.kv_full_inwindow_kv)`t$($o.kv_prune_inwindow_kv)`t$($o.error)"
+  $lines += "$($o.db)`t$($o.label)`t$($o.regime)`t$($o.fk)`t$($o.fst)`t$($o.fbr)`t$($o.fb)`t$($o.fw)`t$($o.vanilla_wall_us)`t$($o.vanilla_keys)`t$($o.vanilla_keys_scanned_total)`t$($o.vanilla_block_read)`t$($o.pk)`t$($o.pk_in_window)`t$($o.pbr)`t$($o.pb)`t$($o.pw)`t$($o.ratio_bytes)`t$($o.ratio_block_read)`t$($o.ratio_wall)`t$($o.key_sel)`t$($o.prune_file_skipped)`t$($o.prune_file_considered)`t$($o.prune_file_missing_meta)`t$($o.prune_file_range_del_blocked)`t$($o.prune_file_time_disjoint)`t$($o.prune_file_space_disjoint)`t$($o.prune_block_index_examined)`t$($o.prune_block_index_skipped_st_disjoint)`t$($o.prune_block_index_stop_missing_meta)`t$($o.prune_key_examined)`t$($o.prune_key_skipped_disjoint)`t$($o.kv_correct)`t$($o.kv_full_inwindow_kv)`t$($o.kv_prune_inwindow_kv)`t$($o.kv_full_decode_failed)`t$($o.kv_prune_decode_failed)`t$($o.kv_full_legacy_segment_value)`t$($o.kv_prune_legacy_segment_value)`t$($o.kv_full_unsupported_key)`t$($o.kv_prune_unsupported_key)`t$($o.error)"
 }
 $text = $lines -join "`n"
 Write-Host ""

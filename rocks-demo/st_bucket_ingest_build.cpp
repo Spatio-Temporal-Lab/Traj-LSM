@@ -40,10 +40,14 @@ static std::vector<std::string> SplitAuto(const std::string& line) {
 }
 
 rocksdb::Options MakeDbOptions(bool create_if_missing,
-                               bool disable_auto_compactions) {
+                               bool disable_auto_compactions,
+                               bool experimental_global_master_ghost,
+                               bool experimental_global_verify_ghost) {
   rocksdb::Options o;
   o.create_if_missing = create_if_missing;
   o.disable_auto_compactions = disable_auto_compactions;
+  o.experimental_global_master_ghost = experimental_global_master_ghost;
+  o.experimental_global_verify_ghost = experimental_global_verify_ghost;
   rocksdb::BlockBasedTableOptions tb;
   tb.experimental_spatio_temporal_meta_in_index_value = true;
   o.table_factory.reset(rocksdb::NewBlockBasedTableFactory(tb));
@@ -55,6 +59,17 @@ struct Kv {
   std::string val;
 };
 
+std::string EncodeSegmentValueForGlobalMode(
+    const segval::SegmentValueHeader& head,
+    const std::vector<segval::SegmentPoint>& points,
+    bool experimental_global_master_ghost) {
+  if (experimental_global_master_ghost) {
+    return segval::EncodeSegmentValueV3(head, points, /*is_ghost=*/false,
+                                        /*master_key=*/"");
+  }
+  return segval::EncodeSegmentValueV2(head, points);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -65,6 +80,8 @@ int main(int argc, char** argv) {
   uint32_t bucket_sec = 86400;
   bool reset_out_dir = false;
   bool reset_target_db = false;
+  bool experimental_global_master_ghost = false;
+  bool experimental_global_verify_ghost = false;
   int64_t max_rows = -1;
 
   for (int i = 1; i < argc; ++i) {
@@ -85,6 +102,10 @@ int main(int argc, char** argv) {
       reset_out_dir = true;
     } else if (a == "--reset-target-db") {
       reset_target_db = true;
+    } else if (a == "--experimental-global-master-ghost") {
+      experimental_global_master_ghost = true;
+    } else if (a == "--experimental-global-verify-ghost") {
+      experimental_global_verify_ghost = true;
     } else if (a == "-h" || a == "--help") {
       std::cout
           << "st_bucket_ingest_build\n"
@@ -95,7 +116,9 @@ int main(int argc, char** argv) {
              "  [--bucket-sec 86400]\n"
              "  [--max-rows -1]\n"
              "  [--reset-out-sst-dir]\n"
-             "  [--reset-target-db]\n";
+             "  [--reset-target-db]\n"
+             "  [--experimental-global-master-ghost]\n"
+             "  [--experimental-global-verify-ghost]\n";
       return 0;
     } else {
       std::cerr << "Unknown arg: " << a << "\n";
@@ -111,6 +134,11 @@ int main(int argc, char** argv) {
   }
   if (bucket_sec == 0) {
     std::cerr << "--bucket-sec must be > 0\n";
+    return 1;
+  }
+  if (experimental_global_verify_ghost && !experimental_global_master_ghost) {
+    std::cerr << "--experimental-global-verify-ghost requires "
+                 "--experimental-global-master-ghost\n";
     return 1;
   }
 
@@ -172,7 +200,8 @@ int main(int argc, char** argv) {
                 << point_count << " points=" << pit->second.size() << "\n";
       return 1;
     }
-    const uint32_t b = t_start / bucket_sec;
+    const uint32_t b0 = t_start / bucket_sec;
+    const uint32_t b1 = t_end / bucket_sec;
 
     segval::SegmentValueHeader head{};
     head.t_start = t_start;
@@ -184,14 +213,32 @@ int main(int argc, char** argv) {
     head.point_count = point_count;
 
     Kv kv;
-    kv.key = StSegmentKey(t_start, t_end, x_min, y_min, x_max, y_max, id++);
-    kv.val = segval::EncodeSegmentValueV2(head, pit->second);
+    const uint64_t master_id = id++;
+    kv.key = StSegmentKey(t_start, t_end, x_min, y_min, x_max, y_max, master_id);
+    kv.val = EncodeSegmentValueForGlobalMode(
+        head, pit->second, experimental_global_master_ghost);
     if (kv.val.empty()) {
-      std::cerr << "EncodeSegmentValueV2 failed for segment_id=" << segment_id
+      std::cerr << "EncodeSegmentValueForGlobalMode failed for segment_id="
+                << segment_id
                 << "\n";
       return 1;
     }
-    bucket_kvs[b].push_back(std::move(kv));
+    const std::string master_key = kv.key;
+    bucket_kvs[b0].push_back(std::move(kv));
+    if (experimental_global_master_ghost && b1 > b0) {
+      for (uint32_t ghost_bucket = b0 + 1; ghost_bucket <= b1; ++ghost_bucket) {
+        Kv ghost_kv;
+        ghost_kv.key = StSegmentGhostKey(t_start, t_end, x_min, y_min, x_max,
+                                         y_max, master_id, ghost_bucket);
+        ghost_kv.val = segval::EncodeGhostSegmentValueV3(head, master_key);
+        if (ghost_kv.val.empty()) {
+          std::cerr << "EncodeGhostSegmentValueV3 failed for segment_id="
+                    << segment_id << " ghost_bucket=" << ghost_bucket << "\n";
+          return 1;
+        }
+        bucket_kvs[ghost_bucket].push_back(std::move(ghost_kv));
+      }
+    }
     ++rows;
   }
   in.close();
@@ -211,7 +258,9 @@ int main(int argc, char** argv) {
   // Write directly into target DB by bucket and flush once per bucket.
   // This follows the same metadata path as normal Put+Flush workloads, ensuring
   // file-level st_file_meta is materialized in VersionEdit.
-  rocksdb::Options stage_opts = MakeDbOptions(true, true);
+  rocksdb::Options stage_opts =
+      MakeDbOptions(true, true, experimental_global_master_ghost,
+                    experimental_global_verify_ghost);
   std::unique_ptr<rocksdb::DB> stage_db;
   rocksdb::Status s = rocksdb::DB::Open(stage_opts, target_db, &stage_db);
   if (!s.ok()) {
@@ -220,6 +269,8 @@ int main(int argc, char** argv) {
   }
 
   uint64_t total_entries = 0;
+  uint64_t total_masters = 0;
+  uint64_t total_ghosts = 0;
   for (uint32_t b : buckets) {
     auto& vec = bucket_kvs[b];
     std::sort(vec.begin(), vec.end(),
@@ -239,10 +290,24 @@ int main(int argc, char** argv) {
       return 1;
     }
     total_entries += static_cast<uint64_t>(vec.size());
+    if (experimental_global_master_ghost) {
+      for (const auto& kv : vec) {
+        segval::DecodedSegmentValue decoded{};
+        if (segval::DecodeSegmentValue(kv.val, &decoded) && decoded.is_ghost) {
+          ++total_ghosts;
+        } else {
+          ++total_masters;
+        }
+      }
+    } else {
+      total_masters += static_cast<uint64_t>(vec.size());
+    }
     std::cout << "Bucket " << b << " flushed entries=" << vec.size() << "\n";
   }
   stage_db.reset();
-  rocksdb::Options db_opts = MakeDbOptions(false, true);
+  rocksdb::Options db_opts =
+      MakeDbOptions(false, true, experimental_global_master_ghost,
+                    experimental_global_verify_ghost);
   std::unique_ptr<rocksdb::DB> db;
   s = rocksdb::DB::Open(db_opts, target_db, &db);
   if (!s.ok()) {
@@ -254,7 +319,9 @@ int main(int argc, char** argv) {
   std::cout << "DONE buckets=" << buckets.size() << " rows=" << rows
             << " built_sst=" << buckets.size()
             << " ingested_live_sst=" << live.size()
-            << " total_entries=" << total_entries << "\n";
+            << " total_entries=" << total_entries
+            << " masters=" << total_masters
+            << " ghosts=" << total_ghosts << "\n";
   return 0;
 }
 

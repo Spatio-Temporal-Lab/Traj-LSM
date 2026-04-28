@@ -394,6 +394,53 @@ struct AdvancedColumnFamilyOptions {
   // If non-zero, cut before adding another ST key when the file already holds
   // this many ST point keys.
   uint32_t experimental_compaction_event_time_max_point_keys = 0;
+  // If true, compaction file pick order prefers files with higher read-sampled
+  // pressure and worse ST MBR compactness (approximate read-repair first).
+  bool experimental_compaction_read_repair_first = false;
+  // Minimum sampled reads for a file to participate in read-repair-first
+  // scoring. Files below this threshold fall back to near-zero priority.
+  uint64_t experimental_compaction_read_repair_min_reads = 0;
+  // Weight multiplier for ST shape penalty (perimeter^2 / area).
+  // Effective score ~= sampled_reads * (1 + weight * shape_penalty).
+  double experimental_compaction_read_repair_shape_weight = 1.0;
+  // If > 0, evaluates spatial MBR expansion before adding the next ST key.
+  // Let old_area be current output-file MBR area and new_area be area after
+  // including the next ST key. If
+  //   (new_area - old_area) / max(old_area, tiny_eps)
+  // exceeds this threshold, mark a soft spatial split signal.
+  // The split is allowed only when enough ST keys are already present
+  // (`experimental_compaction_event_time_min_keys_per_file`).
+  // 0 = disable.
+  double experimental_compaction_spatial_soft_expansion_ratio = 0.0;
+  // Hard spatial split threshold. Same ratio definition as above.
+  // If exceeded and current output file size >=
+  // `experimental_compaction_spatial_hard_min_file_size`, cut immediately.
+  // 0 = disable.
+  double experimental_compaction_spatial_hard_expansion_ratio = 0.0;
+  // Minimum output SST size (bytes) required before allowing hard spatial
+  // split. Prevents pathological over-splitting of very small files.
+  // 0 = no minimum guard.
+  uint64_t experimental_compaction_spatial_hard_min_file_size = 0;
+  // [experimental]
+  // Enable Global manifest semantics for trajectory segment indexing:
+  // master records live in their start-time shard, and other shards may carry
+  // ghost references (Master_Key + copied meta) instead of duplicating values.
+  // This option only toggles Global-manifest behavior; Local (block/file) prune
+  // remains controlled by existing ST options.
+  //
+  // Default: false
+  //
+  // Dynamically changeable through SetOptions() API
+  bool experimental_global_master_ghost = false;
+  // [experimental]
+  // If true, enforce ghost metadata consistency checks against the single
+  // MasterMeta source during write path. Mismatch triggers fail-fast instead of
+  // silently accepting inconsistent ghost copies.
+  //
+  // Default: false
+  //
+  // Dynamically changeable through SetOptions() API
+  bool experimental_global_verify_ghost = false;
 
   // existing_value - pointer to previous value (from both memtable and sst).
   //                  nullptr if key doesn't exist

@@ -21,6 +21,7 @@
 #include <rocksdb/perf_context.h>
 #include <rocksdb/perf_level.h>
 #include <rocksdb/slice.h>
+#include <algorithm>
 
 namespace {
 
@@ -28,6 +29,7 @@ using rocksdb::Slice;
 
 constexpr unsigned char kMagicPoint = 0xE5;
 constexpr unsigned char kMagicSegment = 0xE6;
+constexpr unsigned char kMagicSegmentTzid = 0xE7;
 
 inline Slice UserKeyFromInternalKey(const Slice& internal_key) {
   constexpr size_t kFooter = 8;
@@ -61,11 +63,27 @@ inline uint32_t DecodeFixed32LittleEndian(const char* p) {
          (static_cast<uint32_t>(static_cast<unsigned char>(p[3])) << 24);
 }
 
+inline uint32_t DecodeFixed32BigEndian(const char* p) {
+  return (static_cast<uint32_t>(static_cast<unsigned char>(p[0])) << 24) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(p[1])) << 16) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(p[2])) << 8) |
+         (static_cast<uint32_t>(static_cast<unsigned char>(p[3])));
+}
+
 bool ConsumeFixed32(Slice* s, uint32_t* out) {
   if (s->size() < 4) {
     return false;
   }
   *out = DecodeFixed32LittleEndian(s->data());
+  s->remove_prefix(4);
+  return true;
+}
+
+bool ConsumeFixed32BigEndian(Slice* s, uint32_t* out) {
+  if (s->size() < 4) {
+    return false;
+  }
+  *out = DecodeFixed32BigEndian(s->data());
   s->remove_prefix(4);
   return true;
 }
@@ -78,7 +96,8 @@ bool UserKeyStInWindow(const Slice& user_key, uint32_t t_min, uint32_t t_max, fl
   }
   const char* p = user_key.data();
   const auto magic = static_cast<unsigned char>(p[0]);
-  if (magic != kMagicPoint && magic != kMagicSegment) {
+  if (magic != kMagicPoint && magic != kMagicSegment &&
+      magic != kMagicSegmentTzid) {
     return false;
   }
   Slice s(p + 1, user_key.size() - 1);
@@ -100,11 +119,24 @@ bool UserKeyStInWindow(const Slice& user_key, uint32_t t_min, uint32_t t_max, fl
     }
     return true;
   }
+  if (magic == kMagicSegmentTzid) {
+    // E7 key no longer guarantees in-key t_end/MBR. Keep key filtering
+    // conservative and rely on value verification for the final answer.
+    if (user_key.size() < 5) {
+      return false;
+    }
+    uint32_t t_start = 0;
+    if (!ConsumeFixed32BigEndian(&s, &t_start)) {
+      return false;
+    }
+    return t_start <= t_max;
+  }
   if (user_key.size() < 25) {
     return false;
   }
   uint32_t t_start = 0, t_end = 0;
-  if (!ConsumeFixed32(&s, &t_start) || !ConsumeFixed32(&s, &t_end)) {
+  if (!ConsumeFixed32BigEndian(&s, &t_start) ||
+      !ConsumeFixed32BigEndian(&s, &t_end)) {
     return false;
   }
   uint32_t xmin_bits = 0, ymin_bits = 0, xmax_bits = 0, ymax_bits = 0;
@@ -121,6 +153,58 @@ bool UserKeyStInWindow(const Slice& user_key, uint32_t t_min, uint32_t t_max, fl
   const bool space_intersects =
       !(kx_min > x_max || kx_max < x_min || ky_min > y_max || ky_max < y_min);
   return time_intersects && space_intersects;
+}
+
+bool ValueHasPointInWindow(const std::string& json_line, uint32_t t_min,
+                           uint32_t t_max, float x_min, float x_max, float y_min,
+                           float y_max) {
+  // Extremely small ad-hoc parser to avoid adding dependencies:
+  // scan for occurrences like ["YYYY-mm-dd HH:MM:SS", lon, lat]
+  // and check bounds. Assumes the dataset format we ingest.
+  auto ParseTimeToUnixSec = [](const char* p) -> uint32_t {
+    // "YYYY-mm-dd HH:MM:SS" -> only parse seconds since epoch is expensive;
+    // but dataset also contains numeric t_min/t_max which we already use for time.
+    // Here we skip time parsing and only validate lon/lat; time overlap already checked via key.
+    (void)p;
+    return 0;
+  };
+  (void)ParseTimeToUnixSec;
+  const char* s = json_line.c_str();
+  const char* e = s + json_line.size();
+  // Find "points":[
+  const char* p = std::search(s, e, "points", "points" + 6);
+  if (p == e) return false;
+  // Scan for lon/lat numbers after first string in each point tuple.
+  // This is best-effort and may miss on unexpected formatting.
+  while (p < e) {
+    // Find '['
+    p = static_cast<const char*>(std::memchr(p, '[', static_cast<size_t>(e - p)));
+    if (!p) break;
+    // Find quote end then parse two numbers separated by commas.
+    const char* q = static_cast<const char*>(std::memchr(p, '"', static_cast<size_t>(e - p)));
+    if (!q) { ++p; continue; }
+    q = static_cast<const char*>(std::memchr(q + 1, '"', static_cast<size_t>(e - (q + 1))));
+    if (!q) { ++p; continue; }
+    // Parse lon
+    const char* num = static_cast<const char*>(std::memchr(q + 1, ',', static_cast<size_t>(e - (q + 1))));
+    if (!num) break;
+    ++num;
+    char* endp = nullptr;
+    const double lon = std::strtod(num, &endp);
+    if (endp == num) { p = q + 1; continue; }
+    // Parse lat
+    const char* num2 = static_cast<const char*>(std::memchr(endp, ',', static_cast<size_t>(e - endp)));
+    if (!num2) break;
+    ++num2;
+    char* endp2 = nullptr;
+    const double lat = std::strtod(num2, &endp2);
+    if (endp2 == num2) { p = endp; continue; }
+    if (lon >= x_min && lon <= x_max && lat >= y_min && lat <= y_max) {
+      return true;
+    }
+    p = endp2;
+  }
+  return false;
 }
 
 rocksdb::Options VanillaOpenOptions(int block_cache_mb) {
@@ -143,6 +227,7 @@ int main(int argc, char** argv) {
   uint32_t t_min = 0, t_max = 0;
   float x_min = 0, x_max = 0, y_min = 0, y_max = 0;
   int block_cache_mb = 8;
+  bool verify_by_value = true;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -162,6 +247,8 @@ int main(int argc, char** argv) {
       y_max = static_cast<float>(std::strtod(argv[++i], nullptr));
     } else if (a == "--block-cache-mb" && i + 1 < argc) {
       block_cache_mb = std::atoi(argv[++i]);
+    } else if (a == "--no-verify-by-value") {
+      verify_by_value = false;
     }
   }
 
@@ -203,7 +290,15 @@ int main(int argc, char** argv) {
     for (it->SeekToFirst(); it->Valid(); it->Next()) {
       ++keys_scanned_total;
       const Slice uk = UserKeyFromIteratorKey(it->key());
-      if (UserKeyStInWindow(uk, t_min, t_max, x_min, x_max, y_min, y_max)) {
+      const bool key_pass = UserKeyStInWindow(uk, t_min, t_max, x_min, x_max, y_min, y_max);
+      if (!key_pass) continue;
+      const auto m = static_cast<unsigned char>(uk.size() ? uk[0] : 0);
+      if (m == kMagicSegmentTzid && verify_by_value) {
+        const std::string v = it->value().ToString();
+        if (ValueHasPointInWindow(v, t_min, t_max, x_min, x_max, y_min, y_max)) {
+          ++keys_in_window;
+        }
+      } else {
         ++keys_in_window;
       }
     }

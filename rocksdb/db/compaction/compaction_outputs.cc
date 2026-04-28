@@ -237,10 +237,22 @@ uint64_t CompactionOutputs::GetCurrentKeyGrandparentOverlappedBytes(
   return overlapped_bytes;
 }
 
+double CompactionOutputs::ComputeSpatialArea(const SpatioTemporalBlockMeta& m) {
+  const double w = std::max(0.0, static_cast<double>(m.x_max) -
+                                     static_cast<double>(m.x_min));
+  const double h = std::max(0.0, static_cast<double>(m.y_max) -
+                                     static_cast<double>(m.y_min));
+  return w * h;
+}
+
 bool CompactionOutputs::ShouldStopBeforeEventTime(
     const CompactionIterator& c_iter) {
   const auto& mopt = compaction_->mutable_cf_options();
-  if (!mopt.experimental_compaction_event_time_split) {
+  const bool time_split_enabled = mopt.experimental_compaction_event_time_split;
+  const bool spatial_split_enabled =
+      mopt.experimental_compaction_spatial_soft_expansion_ratio > 0.0 ||
+      mopt.experimental_compaction_spatial_hard_expansion_ratio > 0.0;
+  if (!time_split_enabled && !spatial_split_enabled) {
     return false;
   }
   if (c_iter.IsDeleteRangeSentinelKey()) {
@@ -261,7 +273,7 @@ bool CompactionOutputs::ShouldStopBeforeEventTime(
   const uint32_t min_keys =
       mopt.experimental_compaction_event_time_min_keys_per_file;
   const uint32_t max_keys = mopt.experimental_compaction_event_time_max_point_keys;
-  if (bucket_w > 0) {
+  if (time_split_enabled && bucket_w > 0) {
     const uint32_t b = t / bucket_w;
     if (b != st_event_last_bucket_) {
       ROCKS_LOG_INFO(
@@ -286,15 +298,53 @@ bool CompactionOutputs::ShouldStopBeforeEventTime(
           st_event_last_bucket_, b, st_event_st_keys_in_output_, min_keys);
     }
   }
-  if (max_span > 0) {
+  if (time_split_enabled && max_span > 0) {
     const uint32_t new_min = std::min(st_event_out_min_t_, t);
     const uint32_t new_max = std::max(st_event_out_max_t_, t);
     if (new_max - new_min > max_span) {
       return true;
     }
   }
-  if (max_keys > 0 && st_event_st_keys_in_output_ >= max_keys) {
+  if (time_split_enabled && max_keys > 0 &&
+      st_event_st_keys_in_output_ >= max_keys) {
     return true;
+  }
+  if (spatial_split_enabled && st_event_out_spatial_valid_) {
+    SpatioTemporalBlockMeta merged = st_event_out_spatial_;
+    bool merged_valid = st_event_out_spatial_valid_;
+    MergeSpatioTemporalMetaFromUserKey(c_iter.user_key(), &merged, &merged_valid);
+    if (merged_valid) {
+      constexpr double kEps = 1e-12;
+      const double old_area = ComputeSpatialArea(st_event_out_spatial_);
+      const double new_area = ComputeSpatialArea(merged);
+      const double expansion = (new_area - old_area) / std::max(old_area, kEps);
+      if (mopt.experimental_compaction_spatial_hard_expansion_ratio > 0.0 &&
+          expansion >=
+              mopt.experimental_compaction_spatial_hard_expansion_ratio &&
+          current_output_file_size_ >=
+              mopt.experimental_compaction_spatial_hard_min_file_size) {
+        ROCKS_LOG_INFO(
+            compaction_->immutable_options().info_log,
+            "ST_EVENT_SPLIT hard_spatial_cut expansion=%f old_area=%f new_area=%f"
+            " file_size=%" PRIu64 " min_file_size=%" PRIu64,
+            expansion, old_area, new_area, current_output_file_size_,
+            mopt.experimental_compaction_spatial_hard_min_file_size);
+        return true;
+      }
+      if (mopt.experimental_compaction_spatial_soft_expansion_ratio > 0.0 &&
+          expansion >=
+              mopt.experimental_compaction_spatial_soft_expansion_ratio) {
+        if (min_keys == 0 || st_event_st_keys_in_output_ >= min_keys) {
+          ROCKS_LOG_INFO(
+              compaction_->immutable_options().info_log,
+              "ST_EVENT_SPLIT soft_spatial_cut expansion=%f old_area=%f"
+              " new_area=%f st_keys_in_output=%" PRIu32 " min_keys=%" PRIu32,
+              expansion, old_area, new_area, st_event_st_keys_in_output_,
+              min_keys);
+          return true;
+        }
+      }
+    }
   }
   return false;
 }
@@ -469,6 +519,8 @@ Status CompactionOutputs::AddToOutput(
     st_event_out_max_t_ = 0;
     st_event_st_keys_in_output_ = 0;
     st_event_last_bucket_ = 0;
+    st_event_out_spatial_valid_ = false;
+    st_event_out_spatial_ = {};
   }
 
   // Open output file if necessary
@@ -522,7 +574,9 @@ Status CompactionOutputs::AddToOutput(
   }
 
   const auto& mopt = compaction_->mutable_cf_options();
-  if (mopt.experimental_compaction_event_time_split) {
+  if (mopt.experimental_compaction_event_time_split ||
+      mopt.experimental_compaction_spatial_soft_expansion_ratio > 0.0 ||
+      mopt.experimental_compaction_spatial_hard_expansion_ratio > 0.0) {
     uint32_t t = 0;
     if (TryDecodeSpatioTemporalUserKeyTime(c_iter.user_key(), &t)) {
       if (!st_event_diag_logged_first_decode_) {
@@ -553,6 +607,8 @@ Status CompactionOutputs::AddToOutput(
         }
         st_event_st_keys_in_output_++;
       }
+      MergeSpatioTemporalMetaFromUserKey(c_iter.user_key(), &st_event_out_spatial_,
+                                         &st_event_out_spatial_valid_);
     } else if (!st_event_diag_logged_decode_fail_) {
       const Slice uk = c_iter.user_key();
       if (!uk.empty()) {

@@ -39,8 +39,8 @@
 | **真值** | 段 **S** 命中查询窗 **W** 当且仅当 **∃ 点 p∈S，p∈W**；返回 **整条段**。 |
 | **假阳性** | **MBR(S)∩W**（或段 key 中 t/x/y 包围盒与 **W** 相交）但 **S 中无点在 W 内** → **错误**，不记入「正确返回」。 |
 | **点键库 `0xE5`** | `UserKeySpatioTemporalInWindow` 即点是否在窗内，与真值一致。 |
-| **段键库 `0xE6`** | 同函数当前为 **时间相交 ∧ 空间 MBR 相交**，**宽于**真值；用它计的 `full_keys` 与 **`-VerifyKVResults`（full≈prune 同谓词）** 只证明 **剪枝实现与全表扫描在该谓词上一致**，**不证明**点级真值。 |
-| **后续工程** | 段库主结论需 **值域精判**（解码 value 点列并检验 ∃∈W）、或 **点级 KV 金标准**、或等价离线校验；直至落地，TSV/HTML 须 **标注口径**，避免把 MBR 指标当严格正确。 |
+| **段键库 `0xE6`** | 同函数当前为 **时间相交 ∧ 空间 MBR 相交**，**宽于**真值；因此 `full_keys` / `prune_scan keys` 等仍是 **MBR 候选口径**。`-VerifyKVResults` 已升级为 **点级真值对拍**（解码 value 点列检验 **`∃点∈W`**），不再是“同谓词自洽”校验。 |
+| **落地约束** | 严格点级 Verify 依赖段 value 可解码为点列（V2）。若遇到 **legacy 28B 段头** 或解码失败，`verify_kv_results` 会 **FAIL** 并提示重建段库；TSV/HTML 仍须标注 MBR 候选列与点级真值列的口径差异。 |
 
 **`Record.md` 与论文**：凡涉及「窗内命中数 / 正确性」，应写明采用的是 **点级** 还是 **当前 bench 段谓词（MBR）**，二者不可混称。
 
@@ -259,9 +259,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\Project\tools\st_manifest
 
 ### 8.5 与基准工具的关系
 
-- **`st_meta_read_bench`**（`rocks-demo`）在 **同一 `ReadOptions`** 下交替跑 **full scan** 与 **prune scan**，输出 **wall / bytes / prune 统计**，用于验证 **8.2–8.4** 及 **8.3** 的 **IO/剪枝行为** 与 **实现自洽**（full 与 prune 在相同 **`UserKeySpatioTemporalInWindow`** 规则下的窗内键集合）。  
-- **段键 `0xE6`**：窗判定与 **§1.0a** 所述一致，为 **MBR∩窗**，**不等于**「∃ 点在窗内」的真值；论文与对外结论须以 **§1.0a / `EXPERIMENTS_AND_SCRIPTS.md` §0.1a** 为准。  
-- **`-VerifyKVResults`**：只验证 full 与 prune 在上述谓词下 **哈希一致**，**不验证**点级真值。  
+- **`st_meta_read_bench`**（`rocks-demo`）在 **同一 `ReadOptions`** 下交替跑 **full scan** 与 **prune scan**，输出 **wall / bytes / prune 统计**，用于验证 **8.2–8.4** 及 **8.3** 的 **IO/剪枝行为**。  
+- **段键 `0xE6`**：`full_keys` / `prune_scan keys` 的窗口口径仍是 **MBR∩窗候选**，不等于「∃ 点在窗内」；论文与对外结论须以 **§1.0a / `EXPERIMENTS_AND_SCRIPTS.md` §0.1a** 的点级真值为准。  
+- **`-VerifyKVResults`**：现按点级真值对拍（`0xE5` 点判定；`0xE6` 解码 value 点列检验 `∃点∈W`）。若存在 legacy 段 value / 解码失败会 `FAIL` 并提示重建 V2 段库。  
 - 无锡多 SST 上 **三模式**（`manifest` / `sst` / `sst_manifest`）成套 TSV 由 **`tools/st_prune_vs_full_baseline_sweep.ps1`** 与 **`run_wuxi_segment_ablation_1_164_776.ps1`** 驱动，**不是** vanilla RocksDB 对照。
 
 ---

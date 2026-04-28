@@ -42,9 +42,10 @@
 **与当前 `st_meta_read_bench` 的关系（必须知情）**
 
 - 对 **点键 `0xE5`**：`UserKeySpatioTemporalInWindow` 即 **点是否在窗内**，与上述真值一致。
-- 对 **段键 `0xE6`**：同一函数在 `rocksdb/table/st_meta_user_key.cc` 中实现为 **段时间区间 ∩ 窗** 且 **段空间 MBR ∩ 查询矩形**（轴对齐相交）。这是 **必要条件不充分**：会产生 **MBR 相交但无点在窗内** 的假阳性。此类键计入的 `full_keys` / `prune_scan keys`、以及 **`-VerifyKVResults`**（比较 full 与 prune 在该谓词下是否一致）**只保证剪枝实现自洽**，**不保证**符合上面的 **点级真值**。
+- 对 **段键 `0xE6`**：同一函数在 `rocksdb/table/st_meta_user_key.cc` 中实现为 **段时间区间 ∩ 窗** 且 **段空间 MBR ∩ 查询矩形**（轴对齐相交）。这是 **必要条件不充分**：会产生 **MBR 相交但无点在窗内** 的假阳性。此类键计入的 `full_keys` / `prune_scan keys` 仍是 **MBR 候选口径**。  
+- **`-VerifyKVResults`（已升级）**：`st_meta_read_bench` 现按 **点级真值** 对拍 full 与 prune（`0xE5` 直接点判定；`0xE6` 解码 value 点列检验 **`∃点∈W`**）。若遇到 **legacy 段 value（仅 28B 头）** 或 value 解码失败，严格校验会 **FAIL** 并提示重建 V2 段库；因此可用于判断「是否满足点级真值口径」。
 - **Value 形态（工程现状）**：`st_meta_smoke --st-segment-keys` 与 `st_bucket_ingest_build` 在 **`--segment-points-csv`** 下将每段 **全部采样点**（`unix_s, lon, lat`）写入 **V2 value**（见 `rocks-demo/segment_value_codec.hpp`）。**旧库** 可能仍为仅 28 字节的段头；重建段库后 value 才含点列，便于后续 bench 做 **值域 ∃点∈窗** 精判。  
-- **正式实验与论文主数字**：在段库上应以 **点级命中** 为金标准；在 bench 尚未升级为 **值域精判（解码 value 中的点列并检验 ∃点∈W）** 或 **点级 KV 金标准** 之前，现有 TSV 中基于 **仅 user key（MBR）** 的列须 **标注为候选/MBR 口径** 或 **不得单独作为主结论**。实现严格指标与 `VerifyKVResults` 扩展为 **点级真值验证** 为后续工程项（见 `AGENT_HANDOFF.md` §1.0a）。
+- **正式实验与论文主数字**：段库主结论仍以 **点级命中** 为金标准。尽管 `-VerifyKVResults` 已升级为点级真值对拍，现有 TSV 里的 `full_keys` / `prune_scan keys` 等列仍可能是 **MBR 候选口径**，对外表述需显式区分「候选」与「点级真值正确返回」。
 
 ### 0.2 基线（Baseline）：原生 RocksDB — 与 fork 内 full（F0）区分
 
@@ -61,7 +62,7 @@
 - **推荐操作**：
   1. 使用 **`tools/st_validity_experiment_windows_wuxi_stratified12_n4m4w4.csv`**（**4 窄 + 4 中 + 4 宽**；在 **1-SST** 上经 `validate_wuxi_windows_csv.py` 校验 **`full_keys ≥ 50`**）。**切换正式窗 CSV 后**须 **重跑** **`tools/cache_wuxi_vanilla_wall_baseline.ps1`**，否则 `wuxi_vanilla_wall_cache.json` 与当前窗几何不一致会导致 Vanilla 列 miss。Legacy：`random12_cov_s42`。  
   2. 汇总时关注 `summarize_wuxi_ablation_three_modes.py` 按 `full_keys` 分档；  
-  3. **`-VerifyKVResults`**：保证 **full 与 prune 在同一套 `UserKeySpatioTemporalInWindow` 规则下输出一致**，**不等于** §0.1a 的点级真值已满足；段库上主结论须另有点级验证或升级后的列。  
+  3. **`-VerifyKVResults`**：现用于 **点级真值** 对拍（`0xE6` 需 value 点列可解码）；若输出 `correctness=OK`，表示 full/prune 在点级口径下一致。若存在 legacy 段 value / 解码失败会 `FAIL`，需重建 V2 段库。  
 - **禁止**：使用未验证的 **`random12_s42` 均匀随机窗** 作为正式表的主数字（易出现空窗）；若需对比，须注明「未验证窗」且单独讨论。
 
 ### 0.4 本 fork「模型 / 存储与读路径」已做的改进（核对清单）
@@ -184,7 +185,7 @@ python tools/generate_random_query_windows_wuxi.py ...
 ### 2.4 汇总与严谨性
 
 - **汇总**：`python tools/summarize_wuxi_ablation_three_modes.py`（`--pooled`、`--pooled-by-db` 等）  
-- **KV / 剪枝自洽（默认开启）**：`run_wuxi_segment_ablation_1_164_776.ps1` **默认**向 `st_prune_vs_full_baseline_sweep.ps1` 传入 `-VerifyKVResults`，bench 对 **fork** 跑 **`--verify-kv-results`**（full 与 prune 在 **bench 内置谓词** 下窗内 KV 集合一致）。**仅加速迭代**时用 `-SkipVerifyKVResults`。**Vanilla 基线**（`-VanillaAsBaseline`）行上 ratio 仍用 Vanilla wall，KV 对拍由 sweep **额外**对同一 fork 再跑一轮 full+prune+verify 填入 `kv_correct`（见 `st_prune_vs_full_baseline_sweep.ps1` 注释）。  
+- **KV / 剪枝自洽（默认开启）**：`run_wuxi_segment_ablation_1_164_776.ps1` **默认**向 `st_prune_vs_full_baseline_sweep.ps1` 传入 `-VerifyKVResults`，bench 对 **fork** 跑 **`--verify-kv-results`**（按点级真值对拍 full/prune）。**仅加速迭代**时用 `-SkipVerifyKVResults`。**Vanilla 基线**（`-VanillaAsBaseline`）行上 ratio 仍用 Vanilla wall，KV 对拍由 sweep **额外**对同一 fork 再跑一轮 full+prune+verify 填入 `kv_correct`（见 `st_prune_vs_full_baseline_sweep.ps1` 注释）。  
 - **Global「病理」诊断**：多 SST 库各文件 **`st_file_bounds`** 与查询窗的相交比例、xy 相关量等 → `python tools/wuxi_sst_file_mbr_pathology_report.py --db <...> --windows-csv ...`（依赖 `rocksdb/build/tools/st_meta_sst_diag.exe`）。**读数注意**：（1）输出里的 **xy「面积」为 Δx·Δy**，无锡段键一般为 **经纬度（度）** → 数值单位为 **deg²**，**不是 km²**，更不能直接当「占无锡市百分比」；（2）若 **`sst_glob_count` 只有 1**，则目录**并非**多 SST 桶布局（与文件夹名 `736sst` 无关），该单个文件的文件级 MBR 是 **整文件键的外包矩形**，必然极大，Global **无法**在文件间做跳过。脚本 JSON 会带 **`layout_warning`** / **`xy_extent_product_units`**。  
 - **点级真值**：主结论应以 **§0.1a** 为准；在实现 **值域精判或点级金标准列** 之前，勿将仅 MBR 口径的指标当作「严格正确」对外表述。
 

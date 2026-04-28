@@ -1363,6 +1363,12 @@ class VersionSet {
   // column_families.
   static Status ListColumnFamilies(std::vector<std::string>* column_families,
                                    const std::string& dbname, FileSystem* fs);
+  // Query-time helper: prefilter MANIFEST shards by [query_t_min, query_t_max]
+  // before scanning to list column families. Recover path must still use full
+  // replay and should not call this helper.
+  static Status ListColumnFamiliesByTimeRange(
+      std::vector<std::string>* column_families, const std::string& dbname,
+      FileSystem* fs, uint64_t query_t_min, uint64_t query_t_max);
   static Status ListColumnFamiliesFromManifest(
       const std::string& manifest_path, FileSystem* fs,
       std::vector<std::string>* column_families);
@@ -1753,6 +1759,9 @@ class VersionSet {
   uint64_t options_file_number_;
   uint64_t options_file_size_;
   uint64_t pending_manifest_file_number_;
+  // Manifest-set protocol state (for generation + commit_seq metadata).
+  // generation == 0 means legacy/single-manifest mode.
+  uint64_t manifest_set_generation_;
   // The last seq visible to reads. It normally indicates the last sequence in
   // the memtable but when using two write queues it could also indicate the
   // last sequence in the WAL visible to reads.

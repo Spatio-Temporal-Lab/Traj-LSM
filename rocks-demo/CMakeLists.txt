@@ -201,6 +201,7 @@ option(VANILLA_STANDIN_LINK_FORK_LIB
 set(_vanilla_lib "")
 set(_vanilla_inc "")
 set(_vanilla_stand_in FALSE)
+set(_vanilla_extra_libs "")
 if(EXISTS "${VANILLA_ROCKSDB_LIB}")
   set(_vanilla_lib "${VANILLA_ROCKSDB_LIB}")
   set(_vanilla_inc "${VANILLA_ROCKSDB_ROOT}/include")
@@ -216,17 +217,36 @@ elseif(VANILLA_STANDIN_LINK_FORK_LIB AND EXISTS "${ROCKSDB_LIB}")
     "This is NOT upstream facebook/rocksdb — use only for offline pipeline / until clone works.")
 endif()
 
+# If vanilla rocksdb.lib was built with Snappy, pull in Snappy import lib.
+set(_snappy_shim_lib "D:/Snappy.Library/lib/native/retail/amd64/snappy.lib")
+set(_snappy_vcpkg_lib "${PROJECT_ROOT}/vcpkg/installed/x64-windows/lib/snappy.lib")
+if(EXISTS "${_snappy_shim_lib}")
+  list(APPEND _vanilla_extra_libs "${_snappy_shim_lib}")
+elseif(EXISTS "${_snappy_vcpkg_lib}")
+  list(APPEND _vanilla_extra_libs "${_snappy_vcpkg_lib}")
+endif()
+
 if(_vanilla_lib)
   add_executable(st_segment_window_scan_vanilla st_segment_window_scan_vanilla.cpp)
   target_include_directories(st_segment_window_scan_vanilla PRIVATE "${_vanilla_inc}")
   target_link_libraries(st_segment_window_scan_vanilla PRIVATE
     "${_vanilla_lib}"
+    ${_vanilla_extra_libs}
     shlwapi
     rpcrt4)
   if(_vanilla_stand_in)
     target_compile_definitions(st_segment_window_scan_vanilla PRIVATE VANILLA_BENCH_LINKED_FORK_LIB=1)
   endif()
   message(STATUS "rocks-demo: st_segment_window_scan_vanilla -> ${_vanilla_lib}")
+
+  add_executable(st_vanilla_table_props st_vanilla_table_props.cpp)
+  target_include_directories(st_vanilla_table_props PRIVATE "${_vanilla_inc}")
+  target_link_libraries(st_vanilla_table_props PRIVATE
+    "${_vanilla_lib}"
+    ${_vanilla_extra_libs}
+    shlwapi
+    rpcrt4)
+  message(STATUS "rocks-demo: st_vanilla_table_props -> ${_vanilla_lib}")
 else()
   message(STATUS
     "rocks-demo: no upstream rocksdb_vanilla lib (and VANILLA_STANDIN_LINK_FORK_LIB=OFF) — st_segment_window_scan_vanilla skipped. "
@@ -253,6 +273,7 @@ if(EXISTS "${VANILLA_ROCKSDB_LIB}" OR EXISTS "${VANILLA_ROCKSDB_LIB_VS}")
   target_include_directories(st_vanilla_kv_stream_ingest PRIVATE "${VANILLA_ROCKSDB_ROOT}/include")
   target_link_libraries(st_vanilla_kv_stream_ingest PRIVATE
     "${_VANILLA_INGEST_LIB}"
+    ${_vanilla_extra_libs}
     shlwapi
     rpcrt4)
   message(STATUS "rocks-demo: st_vanilla_kv_stream_ingest -> ${_VANILLA_INGEST_LIB}")

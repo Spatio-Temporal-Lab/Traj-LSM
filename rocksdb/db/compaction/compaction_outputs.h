@@ -247,6 +247,7 @@ class CompactionOutputs {
   // Experimental: cut SST before `c_iter` when ST user-key Event Time rules
   // trigger (see ColumnFamilyOptions::experimental_compaction_event_time_*).
   bool ShouldStopBeforeEventTime(const CompactionIterator& c_iter);
+  static double ComputeSpatialArea(const SpatioTemporalBlockMeta& m);
 
   void Cleanup() {
     if (builder_ != nullptr) {
@@ -408,6 +409,8 @@ class CompactionOutputs {
   uint32_t st_event_out_max_t_ = 0;
   uint32_t st_event_st_keys_in_output_ = 0;
   uint32_t st_event_last_bucket_ = 0;
+  bool st_event_out_spatial_valid_ = false;
+  SpatioTemporalBlockMeta st_event_out_spatial_ = {};
   // One-shot diagnostics for event-time split debugging.
   bool st_event_diag_logged_first_decode_ = false;
   bool st_event_diag_logged_decode_fail_ = false;

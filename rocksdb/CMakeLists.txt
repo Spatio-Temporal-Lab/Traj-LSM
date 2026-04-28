@@ -381,6 +381,13 @@ if(FAIL_ON_WARNINGS)
   endif()
 endif()
 
+# MSVC warning C4819 ("file contains characters that cannot be represented in
+# the current code page") is environment/codepage dependent and can spuriously
+# fail builds under /WX. We treat it as non-fatal to keep builds reliable.
+if(MSVC)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4819")
+endif()
+
 option(WITH_ASAN "build with ASAN" OFF)
 if(WITH_ASAN)
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")

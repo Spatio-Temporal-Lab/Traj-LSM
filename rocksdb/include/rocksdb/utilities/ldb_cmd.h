@@ -52,6 +52,10 @@ class LDBCommand {
   static const std::string ARG_FROM;
   static const std::string ARG_TO;
   static const std::string ARG_MAX_KEYS;
+  // Multi-manifest query-time helper args: prefilter MANIFEST_SET shards by
+  // [query_t_min, query_t_max] when listing column families.
+  static const std::string ARG_QUERY_T_MIN;
+  static const std::string ARG_QUERY_T_MAX;
   static const std::string ARG_BLOOM_BITS;
   static const std::string ARG_FIX_PREFIX_LEN;
   static const std::string ARG_COMPRESSION_TYPE;

@@ -58,6 +58,20 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
           options.experimental_compaction_event_time_min_keys_per_file),
       experimental_compaction_event_time_max_point_keys(
           options.experimental_compaction_event_time_max_point_keys),
+      experimental_compaction_read_repair_first(
+          options.experimental_compaction_read_repair_first),
+      experimental_compaction_read_repair_min_reads(
+          options.experimental_compaction_read_repair_min_reads),
+      experimental_compaction_read_repair_shape_weight(
+          options.experimental_compaction_read_repair_shape_weight),
+      experimental_compaction_spatial_soft_expansion_ratio(
+          options.experimental_compaction_spatial_soft_expansion_ratio),
+      experimental_compaction_spatial_hard_expansion_ratio(
+          options.experimental_compaction_spatial_hard_expansion_ratio),
+      experimental_compaction_spatial_hard_min_file_size(
+          options.experimental_compaction_spatial_hard_min_file_size),
+      experimental_global_master_ghost(options.experimental_global_master_ghost),
+      experimental_global_verify_ghost(options.experimental_global_verify_ghost),
       inplace_callback(options.inplace_callback),
       memtable_prefix_bloom_size_ratio(
           options.memtable_prefix_bloom_size_ratio),
@@ -484,6 +498,10 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
   }
   ROCKS_LOG_HEADER(log, "        Options.experimental_mempurge_threshold: %f",
                    experimental_mempurge_threshold);
+  ROCKS_LOG_HEADER(log, "      Options.experimental_global_master_ghost: %d",
+                   static_cast<int>(experimental_global_master_ghost));
+  ROCKS_LOG_HEADER(log, "      Options.experimental_global_verify_ghost: %d",
+                   static_cast<int>(experimental_global_verify_ghost));
   ROCKS_LOG_HEADER(log, "           Options.memtable_max_range_deletions: %d",
                    memtable_max_range_deletions);
   ROCKS_LOG_HEADER(log, "                 Options.cf_allow_ingest_behind: %s",

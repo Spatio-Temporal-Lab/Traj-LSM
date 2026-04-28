@@ -1,3 +1,86 @@
+## 2026-04-14 — `OFF/ON vs Vanilla` 首次尝试失败（`vanilla_as_baseline_unavailable`）
+
+| 项 | 内容 |
+|----|------|
+| **实验目的** | 在不拆 Global/Local 的前提下，直接比较 `verify_wuxi_segment_natural_compact_off` 与 `..._on` 相对 Vanilla 分母的倍率（`-VanillaAsBaseline`）。 |
+| **实验结果** | 产物：`data/experiments/natural_off_on_vs_vanilla.tsv`。24 行（OFF 12 + ON 12）全部 `error=vanilla_as_baseline_unavailable`，`vanilla_wall_us` 为空。 |
+| **是否达到预期** | **否**。本次未拿到 Vanilla 分母。 |
+| **为什么** | `st_prune_vs_full_baseline_sweep.ps1` 在 `-VanillaAsBaseline` 下要求每行必须得到 `vanilla_wall_us`（来自 Vanilla cache 命中或 `st_segment_window_scan_vanilla.exe` 现场跑）。当前两库对应的 Vanilla 路径/缓存键未命中（或 Vanilla exe 未成功返回），导致整表不可用。 |
+| **下一步** | 1) 明确可打开的 Vanilla DB 路径；2) 传 `-VanillaWallDbPathsCsv`（与 OFF/ON 两库位置一一对齐，必要时可传同一路径两次）；3) 或先重建覆盖当前窗表的 Vanilla cache，再重跑 `-VanillaAsBaseline`。 |
+
+## 2026-04-28 — JSONL ingest 批次继续：`none+b4096` / `snappy+b65536` / `unsplit+snappy+b65536`
+
+| 项 | 内容 |
+|----|------|
+| **实验目的** | 按“先把实验批次跑齐，再统一验证”的节奏，补一组可复现 ingest 结果，覆盖压缩与 split policy 两个维度，为后续对比与验证做输入准备。 |
+| **实验结果** | 运行 `tools/ingest_jsonl_and_summarize.ps1` 三次：1) `p80_120 + none + b4096 + RunTag=20260428_e8_none_b4096`；2) `p80_120 + snappy + b65536 + RunTag=20260428_e8_snappy_b65536`；3) `unsplit + snappy + b65536 + RunTag=20260428_e8_unsplit_snappy_b65536`。结果目录分别在 `Result/vanilla_jsonl_ingest/...`，每组都产出 `summary.json/table_props.json/table_props.tsv/ingest_stdout.txt`。关键数字：① `p80_120 none b4096` 写入 `374097` keys，`sst_count=26`，`sst_total_bytes=1,937,362,354`；② `p80_120 snappy b65536` 写入 `374097` keys，`sst_count=7`，`sst_total_bytes=359,991,426`；③ `unsplit snappy b65536` 写入 `75,571` keys，`sst_count=7`，`sst_total_bytes=386,540,372`。 |
+| **是否达到预期** | **是（阶段目标）**：实验批次已继续推进并成功落盘，可直接进入下一轮统一验证/汇总。 |
+| **为什么** | 同一脚本统一了构建、灌入、表属性导出与 summary 打包，便于后续做同口径比较；当前阶段重点是先把样本批次跑完。 |
+| **下一步** | 继续补齐你计划中的剩余参数组合（若有），然后再一次性做验证与对比汇总（读取各 run 的 `summary.json`/`table_props.json`）。 |
+
+## 2026-04-14 — 自然输入 A/B：`compact OFF` vs `compact ON`（同一 fork，非 736/776 预分桶）
+
+| 项 | 内容 |
+|----|------|
+| **实验目的** | 按 A 方案验证 compaction 设计本身：不依赖 `736/776` 预分桶，使用自然输入建基库后复制两份，在同一 fork 内做 **OFF（常规 compact）** vs **ON（`--st-time-split` + ST spatial/read-repair 参数）**，比较三模式 `manifest/sst/sst_manifest`。 |
+| **库与规模** | `BASE=verify_wuxi_segment_natural_base`（`*.sst=8`），`OFF=..._compact_off`（`*.sst=15`），`ON=..._compact_on`（`*.sst=74`）。 |
+| **输出 TSV** | `data/experiments/natural_off_vs_on_manifest.tsv`、`natural_off_vs_on_sst.tsv`、`natural_off_vs_on_sst_manifest.tsv`。 |
+| **聚合结果（12 窗中位）** | **manifest**：OFF `med_ratio_wall=0.9949`，ON `1.0489`（ON 更慢）；**sst**：OFF `0.0218`，ON `0.0183`（ON 更快）；**sst_manifest**：OFF `0.0050`，ON `0.00335`（ON 明显更快）。对应 `med_prune_wall_us`：sst `6029.9 -> 5412.5`，sst_manifest `1382.4 -> 1090.8`（OFF->ON）。`med_full_wall_us`：`~274k/276k -> ~311k`（ON full 变慢）。 |
+| **是否达到预期** | **部分达到（偏正向）**：若目标是提升 ST 剪枝路径（Local/L+G）收益，ON 优于 OFF；若目标是提升 full 或 manifest-only，则本批 ON 不占优。 |
+| **为什么** | ON 将库拆成更多 SST（15→74），提高了时空可分离与候选过滤机会，利好 `sst`/`sst_manifest` 的 prune；但更多文件也增加 full 基础开销，且 manifest-only 在本批设置下接近“按文件扫描即可覆盖”，未体现优势。 |
+| **下一步** | 1) 用同批 TSV 画 OFF/ON 三模式柱图（`med_ratio_wall` + `med_prune_wall_us`）；2) 对代表窗跑 `st_meta_sst_diag` 比较 file/block disjoint 分布，补机制证据；3) 若要对外给单一结论，需先明确优化目标是 **prune 查询** 还是 **full 基线**。 |
+
+## 2026-04-14 — Compaction 前后质量验证（二）：`manifest only` + `sst only` + 三维雷达指标
+
+| 项 | 内容 |
+|----|------|
+| **实验目的** | 按“先看整体性能，再分解质量维度”的口径，补齐 compaction 前后双库对照：`manifest only`（文件级质量）与 `sst only`（块/键级质量），并与既有 `sst_manifest` 一起形成三维指标（文件级 / 块级 / 时延）。 |
+| **实验结果（新增 TSV）** | 1) `data/experiments/wuxi_bucket3600_pre_vs_be_manifest.tsv`；2) `data/experiments/wuxi_bucket3600_pre_vs_be_sst.tsv`。先前已跑：`..._sst_manifest.tsv`。均为双库同窗（12 窗）对照：`verify_wuxi_segment_bucket3600_sst` vs `verify_wuxi_segment_bucket3600_sst_be`。 |
+| **雷达式指标（12 窗聚合）** | **manifest only**：前库 `med_ratio_wall=0.01195`、`file_skip_ratio=0.9843`；后库 `med_ratio_wall=0.9669`、`ratio_bytes=1.0`、`ratio_block=1.0`。**sst only**：前库 `med_ratio_wall=0.0118`、`med_ratio_block=0.0343`、`block_skip_ratio=0.9923`；后库 `med_ratio_wall=0.0167`、`med_ratio_block=0.4628`、`block_skip_ratio=0.9923`。**sst_manifest**：前库 `med_ratio_wall=0.00225`（最好），后库 `med_ratio_wall=0.0166`。同时 full 中位壁钟前后约 `~607ms -> ~280ms`（full 变快）。 |
+| **是否达到预期** | **部分达到**。Compaction 明显降低了 full 路径成本，但“质量”上文件级与块级剪枝收益形态发生重排：后库 `manifest` 几乎失效（在本批窗与配置下），`sst` 仍有效但相对 full 的比例收益收窄。 |
+| **为什么** | 你的判断与数据一致：SST 从 736 合并到 76 后，单文件覆盖范围扩大，文件级 MBR 更易与查询窗相交，`Global` 可跳过空间显著缩小；块级仍能高比例判 disjoint（`block_skip_ratio` 仍 ~0.992），但因 full 本身已更便宜，ratio 口径下优势不再像前库那么“极端”。 |
+| **下一步** | 对代表窗做 `st_meta_sst_diag --window` 前后库并排（窄/中/宽各 1），把“文件级相交增多、块级仍可跳过”补成可视化证据；最终报告建议同时给 **绝对时延** 与 **ratio**，避免只看一个口径。 |
+
+## 2026-04-14 — Compaction 质量验证（`bucket3600_sst` 前后双库对照，`sst_manifest`）
+
+| 项 | 内容 |
+|----|------|
+| **实验目的** | 按 Method 的 Compaction 口径验证“质量变化”而非仅文件数：对比 **compaction 前** `verify_wuxi_segment_bucket3600_sst`（736 SST）与 **compaction 后** `verify_wuxi_segment_bucket3600_sst_be`（76 SST）在同一 12 窗、同一 bench 参数下的 full/prune 行为。 |
+| **实验结果** | 对照 TSV：`data/experiments/wuxi_bucket3600_pre_vs_be_sst_manifest.tsv`（`-PruneMode sst_manifest -TimeBucketCount 736 -VirtualMerge -VirtualMergeAuto`）。聚合（12 窗均值/中位数）显示：**前库** `prune_file_skipped` 均值 **724.4**（`considered=736`），`ratio_block_read` 中位 **0.0343**，`ratio_wall` 中位 **0.00225**；**后库** `prune_file_skipped=0`、`prune_file_considered=0`，`ratio_block_read` 中位 **0.46275**，`ratio_wall` 中位 **0.0166**。同时 **full** 成本明显下降：`full_block_read` **1472 → 228**，`full_wall_us` 中位 **607150.5 → 279629.5**。 |
+| **是否达到预期** | **部分达到**。Compaction 显著降低了 full 路径开销（SST 数与读放大下降），但在当前参数组合下 manifest 文件级统计从“可大量跳过”变为“未记录/未触发”，并伴随 prune/full 比值上升，说明“可剪枝质量”发生了结构性变化。 |
+| **为什么** | Compaction 重写了 SST 边界与层级布局：一方面减少了 full 打开与遍历成本；另一方面改变了文件级 disjoint 触发条件与观测计数（该批后库行 `prune_file_*` 为 0，需通过 `manifest` only + diag 再确认是机制退化还是模式路径差异）。 |
+| **下一步** | 1) 对前/后库分别跑 `-PruneMode manifest`（同窗）确认文件级跳过是否真实退化；2) 用 `st_meta_sst_diag --window` 对至少 3 个代表窗（窄/中/宽）做 file-level disjoint 对照；3) 再补 `sst` 模式，拆分“文件级变化”与“块/键级变化”贡献。 |
+
+## 2026-04-14 — 无锡 `bucket3600_sst_be`：`sst_manifest` 12 窗 sweep（修正参数后）
+
+| 项 | 内容 |
+|----|------|
+| **实验目的** | 修复 `st_prune_vs_full_baseline_sweep.ps1` 调用参数后（从错误的 `-Db/-BenchExe` 改为 `-RocksDbPaths/-Bench`），在无锡第三档库 `verify_wuxi_segment_bucket3600_sst_be` 上按 stratified12 窗表重跑 `sst_manifest`，验证 full+prune 与 KV 对拍是否正常。 |
+| **实验结果** | 命令成功执行并写出 `data/experiments/wuxi_bucket3600_be_sst_manifest.tsv`，12 窗均完成；`kv_correct` 全部为 **OK (12/12)**，`kv_full_inwindow_kv == kv_prune_inwindow_kv`。`full_keys_scanned_total` 各窗一致为 **81768**；`full_block_read=228`。`prune_keys_in_window` 与 full 窗内键一致（如窄窗 `54/60/51/77`，中窗 `73/137/122/104`，宽窗 `1197/1658/1117/2033`）。`ratio_bytes` 约 **0.0015–0.0275**，`ratio_block_read` 约 **0.0658–0.3509**，`ratio_wall` 约 **0.0019–0.0320**。文件级统计稳定：`prune_file_considered=76`，`prune_file_skipped=72~74`，`prune_file_time_disjoint=72~74`，`prune_file_space_disjoint=0`。 |
+| **是否达到预期** | **是**。此前 `db_missing` 问题消失，当前 sweep 已按目标库与目标窗表跑通，且 prune 与 full 在 bench 口径下结果一致。 |
+| **为什么** | 根因是脚本参数名不匹配导致回落默认库 `verify_pkdd_st`（不存在）；改为正确参数后脚本读取到目标 DB。当前结果中 `time_disjoint` 高、`space_disjoint=0`，说明该批窗主要通过时间维触发文件级过滤；同时 `sst_manifest` 叠加了块级/键级过滤，使 `bytes/wall` 相对 full 显著下降。 |
+| **下一步** | 1) 继续同库跑 `manifest` 与 `sst` 两个模式，产出三份 TSV；2) 运行 `tools/summarize_wuxi_ablation_three_modes.py --pooled` 做三模式汇总；3) 若要与主报告口径严格对齐，补充 `-TimeBucketCount 736 -VirtualMerge -VirtualMergeAuto` 再跑一轮并与本次 TSV 对比。 |
+
+## 2026-04-16 — Manifest 分片 preflight：dangling 引用修复与护栏
+
+| 项 | 内容 |
+|----|------|
+| **验证目的** | 在 `verify_wuxi_segment_bucket3600_sst` 上推进 Manifest 分片闭环的 Phase D：`MANIFEST_SET` 索引自洽、桶宽一致性、并阻断“MANIFEST_SET 引用缺失 MANIFEST”导致 DB 无法打开的问题。 |
+| **现象** | `MANIFEST_SET-*` 里会出现历史 `entry=MANIFEST-xxxxxx,...`，但对应 `MANIFEST-xxxxxx` 在目录里缺失，导致 `DB::Open` 直接失败；`CURRENT` 会持续滚动到新的 `MANIFEST_SET-`，但仍可能带入缺失历史引用。 |
+| **处理** | 1) `tools/manifest_sharding_preflight.ps1` 增强：打印 `[DIAG]` 每条 entry 的存在性与范围；支持 `-RepairMissingHistorical` 自动重写当前 `MANIFEST_SET`，删除缺失历史引用并备份 `*.bak`；修复了 `bucket_width` 正则匹配问题，并用 `AFTER_SETOPTIONS_OPTS` 校验 `st_event_time_split/bucket_width`。2) `rocks-demo/st_meta_compact_existing.cpp` 调整：`--dry-run` 也执行 `SetOptions` 并打印 `AFTER_SETOPTIONS_OPTS`，便于脚本校验。3) `rocksdb/db/version_set.cc` 增加护栏：当读取 `CURRENT/MANIFEST_SET` 失败时，禁止删除任何 manifest（避免误删仍被引用的 MANIFEST）。 |
+| **验证结果** | 运行命令：`powershell -NoProfile -ExecutionPolicy Bypass -File D:\Project\tools\manifest_sharding_preflight.ps1 -DbPath D:\Project\data\verify_wuxi_segment_bucket3600_sst -ExpectedBucketWidthSec 3600 -CompactExe D:\Project\rocks-demo\build\st_meta_compact_existing.exe -RepairMissingHistorical`；输出 `AFTER_SETOPTIONS_OPTS st_event_time_split=1 bucket_width=3600 ...`，最终 `[PREFLIGHT PASS]`。 |
+| **是否达到预期** | **部分达到**：preflight 已能稳定验证并给出可执行修复；但“为何 `CURRENT` 滚动时仍会产生缺失历史引用”仍需继续收敛到写入/清理策略的最终一致性（目标是不依赖 repair 也能长期自洽）。 |
+
+## 2026-04-28 — generated_trajs 数据：MANIFEST_SET 多 entry smoke + 单窗 read_bench correctness
+
+| 项 | 内容 |
+|----|------|
+| **实验目的** | 用仓库自带 `generated_trajs_segments_p80_120.jsonl` 快速构造 ST 点键（`0xE5`）输入，验证（1）Manifest 分片写入能生成 **多 entry** 的 `MANIFEST_SET-*`；（2）在该库上跑一次 `st_meta_read_bench` 做 full vs prune 的 correctness 对拍与基础剪枝统计。 |
+| **实验结果** | 1) 生成 CSV：`python tools/generated_jsonl_to_segments_csv.py --in-jsonl data/generated_trajs_segments_p80_120.jsonl --out-dir data/processed/generated --max-segments 5000 --max-points-per-segment 200`（产物：`data/processed/generated/segments_points.csv`、`segments_meta.csv`）。2) Manifest smoke 成功：`tools/manifest_set_natural_multi_entry_smoke.ps1` 输出根目录 `data/experiments/manifest_set_natural_multi_entry_20260428_092834/`，捕获 `MANIFEST_SET-000005 entry_count=2`（见 `summary.tsv` 与 `success_manifest_set.txt`）。3) 建库：`st_meta_smoke.exe --db data/verify_generated_traj_st_e5 --csv data/processed/generated/segments_points.csv --st-keys --max-points 200000 --compact-after-ingest`。4) 单窗读基准：`st_meta_read_bench.exe --db data/verify_generated_traj_st_e5 --prune-mode sst_manifest --verify-kv-results`，该窗下 `full_inwindow_kv=0 prune_inwindow_kv=0 correctness=OK`；`full: bytes_read=12413720 block_read_count=3 wall_us=59851`，`prune: bytes_read=146302 block_read_count=1 wall_us=352`，`block_index_examined=2987 index_skipped_st_disjoint=2987`。 |
+| **是否达到预期** | **是（用于 smoke 验证）**：Manifest 分片 smoke 立即抓到多 entry 的 `MANIFEST_SET`；read_bench 的 full/prune 对拍为 OK，且能观察到明显的 block-index 级跳过。 |
+| **为什么** | 该数据链路走 `0xE5` 点键，key 内含 `t/x/y`，因此块级 ST meta 与块索引剪枝可以稳定触发；Manifest 分片 smoke 通过 `ROCKSDB_EXPERIMENTAL_MANIFEST_SET_WRITE=1` 等环境变量驱动生成 `MANIFEST_SET-*`，在一次尝试内即可形成多 entry。 |
+| **下一步** | 1) 选一个 **非空窗**（`full_inwindow_kv>0`）再跑一次 read_bench，补一条“命中窗” correctness 记录；2) 若要对齐 `Mind.md` 的“段级返回整段/跨桶 Master+Ghost”，需要在段级 schema 与 manifest/ghost 逻辑落地后再做端到端 recall 验证。 |
+
 # 实验与验证记录（Project）
 
 > 约定：每次重要实验后在此追加一条 **概要记录**（目的 / 结果 / 是否达预期 / 原因 / 下一步）。  
@@ -585,4 +668,115 @@ D:\Project\rocksdb\build\tools\st_meta_sst_diag.exe --window 1224600000 12248000
 | **消融重跑命令（单次 + 汇总）** | ① **`cache_wuxi_vanilla_wall_baseline.ps1`** 的 **`-RocksDbPathsCsv`** 须指向 **`*_vanilla_replica`**（三档与 fork 对齐）。② **`run_wuxi_segment_ablation_1_164_776.ps1 -SummarizePooled`**；**`-VerifyKVResults`** 在 **`VanillaAsBaseline` 时不会跑 fork full↔prune 对拍**（脚本会告警），剪枝自洽需另跑 **不带 Vanilla 基线** 的 sweep。 |
 | **本机已执行（2026-04-12）** | 缓存：**`wuxi_vanilla_wall_cache.json`** 重建 **36** 条（stratified12 × 3 replica，`RepeatCount=3`）。消融目录：**`data/experiments/wuxi_ablation_stratified12_vanilla_20260412`**（`wuxi_ablation_run_meta.json` 中 **`windows_csv`=stratified12**、**`compare_baseline`=vanilla**、**736 回退**）。`summarize_wuxi_ablation_three_modes.py --pooled-by-db` 已写入同目录 **`pooled_p50_summary.txt`**（含 Vanilla/prune 比）。 |
 | **是否达到预期** | **是**：正式窗与工具链默认已切换；Vanilla 缓存与三模式消融已用新 12 窗跑通。 |
+
+## 2026-04-13 — `st_meta_compact_existing`（164 段库）开启新 Compaction 参数后的首轮结果
+
+| 项 | 内容 |
+|----|------|
+| **实验目的** | 在 `verify_wuxi_segment_164sst` 上验证新接入的 Compaction 路径（事件时间切分 + 空间软/硬切分 + read-repair-first 调度入口）是否能稳定执行，并观察输出 SST 形态是否从 L0 小文件收敛到更规则的 L6 文件。 |
+| **实验结果** | 运行日志摘要：`L0 /000009.sst num_entries=266`；`KEY_PROBE sample=4096 e6=4096 e5=0 other=0 e6_t_first=1597374720 e6_t_last=1596264205`；`CompactRange` 完成后 **`AFTER live_sst=8`**，均在 **L6**：`004034..004041.sst`，`num_entries` 分别为 `11689, 11331, 11561, 11338, 11048, 11217, 11223, 2361`。 |
+| **是否达到预期** | **部分达到**：Compaction 成功且输出文件形态明显变化（L0→L6，多文件），说明参数链路可执行；但当前仅看到文件数与条目分布，尚未完成读路径收益验证。 |
+| **为什么** | 该结果证明新参数至少未阻断 compaction 主路径；L6 输出按较均匀条目分布拆分，符合“分桶/切分会打散单一大文件”的方向。是否真正减少读放大仍取决于这些新 SST 的 `st_file_bounds` 与目标查询窗相交关系。 |
+| **下一步** | 1) 先跑 `st_meta_sst_diag` 对 `004034..004041.sst` 做 **file-level 与 block-level** 诊断；2) 再跑 `st_meta_read_bench`（同窗）对比 compaction 前后 `block_read_count/bytes_read/wall_us`；3) 若要复现，保留本次命令参数组并追加到 `EXPERIMENTS_AND_SCRIPTS.md` 的 Compaction 实验段。 |
+
+## 2026-04-13 — 验证：Compaction 后 `verify_wuxi_segment_164sst`（默认无锡窄窗）
+
+| 项 | 内容 |
+|----|------|
+| **实验目的** | 按 `AGENT_HANDOFF.md` / `EXPERIMENTS_AND_SCRIPTS.md` 约定，用默认无锡窗（`wx_strat_narrow_01`）对刚完成 compaction 的 `verify_wuxi_segment_164sst` 做 **read_bench + sst_diag**，验证是否出现可解释的剪枝收益。 |
+| **实验结果** | **`st_meta_read_bench --db D:\Project\data\verify_wuxi_segment_164sst`**：`full_scan keys=54 keys_scanned_total=81768 block_read_count=24 wall_us=229829 bytes_read=486217361`；`prune_scan keys(last_iter)=62 keys_in_window=54 block_read_count=11960 wall_us_total=93975.5 bytes_read=145492160`；`wall_time_ratio=0.4089`。文件级诊断：`prune_file_skipped=0`，`considered=8`，`time_disjoint=0`。块级诊断：`index_examined=45036`，`index_skipped_st_disjoint=31897`，`Block_Skip_Rate=70.8256%`。 |
+| **SST diag（同窗）** | 对 `004034..004041.sst` 逐文件诊断：8/8 文件均 `file vs query window: INTERSECTS`，`with ST tail = index entries`（无缺失 tail）。各文件 `would skip`/`would keep` 分别为：`4540/1890`、`4465/1811`、`4507/1866`、`4467/1806`、`4367/1743`、`4332/1824`、`4304/1821`、`915/378`。合计约 `skip=31897`、`keep=13139`，与 bench 块级计数一致。 |
+| **是否达到预期** | **部分达到**：块级剪枝效果明显（~70.8%），并且 wall/bytes 相对 full 明显下降；但文件级跳过为 0（当前窗对 8 个文件全部相交）。 |
+| **为什么** | 这次收益主要来自 **SST 内 block-level ST 剪枝**，不是文件级。`st_file_bounds` 仍覆盖默认窗，因此 `file_skipped=0`；但块级 MBR 能跳过大量不相交数据块，故 `bytes_read` 与 `wall_us` 下降。 |
+| **下一步** | 1) 增加一个更“东向/时间窄”的窗，验证是否触发 `file_skipped>0`；2) 在同库跑 `--prune-mode manifest` / `sst` / `sst_manifest` 三模式，对比当前 compaction 后 Global 与 Local 的贡献占比。 |
+
+## 2026-04-15 — 点级 Verify 与 Compaction 策略适配首轮对照（`natural_compact_off` vs `natural_compact_on`）
+
+| 项 | 内容 |
+|----|------|
+| **实验目的** | 在开始 Manifest 分片实验前，先验证“新点级 `-VerifyKVResults`”与现有 Compaction 策略（`natural_compact_off/on`）是否兼容，作为后续改造基线。 |
+| **实验命令** | 1) `st_meta_read_bench --db D:\Project\data\verify_wuxi_segment_natural_compact_off --prune-mode sst_manifest --verify-kv-results`；2) `st_meta_read_bench --db D:\Project\data\verify_wuxi_segment_natural_compact_on --prune-mode sst_manifest --verify-kv-results`（默认窗 `wx_strat_narrow_01`）。 |
+| **实验结果（compact_off）** | `verify_kv_results correctness=OK`，`full_inwindow_kv=49`，`prune_inwindow_kv=49`，`full_decode_failed=0`，`prune_decode_failed=0`，`full_legacy_segment_value=0`，`prune_legacy_segment_value=0`。`prune_file_skipped=14/15`，`block_index_skip=3231/3283`。 |
+| **实验结果（compact_on）** | `verify_kv_results correctness=OK`，`full_inwindow_kv=49`，`prune_inwindow_kv=49`，`full_decode_failed=0`，`prune_decode_failed=0`，`full_legacy_segment_value=0`，`prune_legacy_segment_value=0`。`prune_file_skipped=71/74`，`block_index_skip=1818/1870`。 |
+| **是否达到预期** | **是**：两种 compaction 形态均通过点级真值 Verify，说明当前段 value（V2）与点级校验链路可稳定工作。 |
+| **为什么** | 新 Verify 走“`0xE6` value 点列 `∃点∈W`”判定；两库均无 decode/legacy 异常，表明 compaction 后数据布局变化未破坏点级语义一致性。 |
+| **下一步** | 1) 以这组结果作为 Manifest 分片实验基线；2) 分片实现中把“Compaction 输出边界 + `st_file_meta` 一致性”设为验收门槛；3) 补跑 `manifest` 单模式与更窄时间窗，观察 Global 路径对分片收益的敏感度。 |
+
+## 2026-04-15 — Manifest 分片 Phase 1（兼容读取层）首个真实库 smoke
+
+| 项 | 内容 |
+|----|------|
+| **实验目的** | 验证“兼容读取层”是否生效：`CURRENT` 指向 `MANIFEST_SET-*` 时，DB 仍可正常恢复打开（保持对单 MANIFEST 向后兼容）。 |
+| **实验方法** | 从 `verify_wuxi_segment_1sst` 复制副本到 `data/experiments/manifest_set_smoke_db`；新增 `MANIFEST_SET-000001`（内容：`version=1` + `MANIFEST-016277`）；将副本 `CURRENT` 改为 `MANIFEST_SET-000001`。 |
+| **实验命令** | `st_meta_read_bench --db D:\Project\data\experiments\manifest_set_smoke_db --no-prune-scan --full-scan-mode window`。 |
+| **实验结果** | 初次运行报 `CURRENT file corrupted`（原因：`st_meta_read_bench` 仍链接旧 `rocksdb.lib`）；重编 `st_meta_read_bench` 后复跑成功：`full_scan keys=7339`，`keys_scanned_total=81768`，`block_read_count=3`，`wall_us=57108.8`。 |
+| **是否达到预期** | **是（Phase 1 smoke）**：兼容读取链路已在真实库副本上工作，`CURRENT -> MANIFEST_SET-*` 可被识别并回放。 |
+| **为什么** | 新增的 `GetCurrentManifestPaths` 支持两种 `CURRENT` 语义（单 MANIFEST / MANIFEST_SET），`VersionSet::Recover` 按 manifest 列表顺序回放，保持旧格式兼容。 |
+| **下一步** | 1) 补充 `ListColumnFamilies` 的 manifest-set 回归验证；2) 开始 Phase 2：写路径路由（先不改默认行为，增加开关与兜底分片）；3) 加入与 Compaction 输出边界一致性的联动校验。 |
+
+## 2026-04-15 — Manifest 分片路由触发多 descriptor（`manifest_set_route_smoke_force4`）
+
+| 项 | 内容 |
+|----|------|
+| **实验目的** | 验证 Phase 2 的写路径分片路由是否可以在同一轮 batch 中产出“分片 descriptor + global 回退 descriptor”，并确认 `MANIFEST_SET-*` 能同时列出多个 MANIFEST。 |
+| **实验命令** | `findstr /C:"experimental_manifest_shard_route enabled=1" D:\Project\data\experiments\manifest_set_route_smoke_force4\LOG`；`type D:\Project\data\experiments\manifest_set_route_smoke_force4\MANIFEST_SET-*.*`。 |
+| **实验结果** | 日志出现：`batch_edit_shards=[1,0] reasons=[ok,new_files_empty]`（同文件中前一条为 `[0]`）；`MANIFEST_SET-000010` 内容含两条 descriptor：`MANIFEST-000010` 与 `MANIFEST-000011`。 |
+| **是否达到预期** | **是**：已成功触发多 MANIFEST 路由，且 CURRENT 指向的 manifest-set 可承载并消费多 descriptor。 |
+| **为什么** | 第一个 edit 命中 shard 1（`ok`）；第二个 edit 无 `new_files` 走 global 回退（`new_files_empty`）；最终 manifest-set 同时记录 shard/global 两条 MANIFEST，验证了“分片 + 回退”并存路径。 |
+| **下一步** | 1) 去除 `FORCE/FORCE_NEW_DESCRIPTOR` 实验强制依赖，收敛到真实 compaction 触发；2) 将路由启用条件固定在 `experimental_compaction_event_time_split` 场景，保留 `new_files_empty -> global` 回退；3) 补跑自然触发回归（wall/bytes + recover 一致性）。 |
+
+## 2026-04-15 — 去 FORCE 后自然触发验证（`manifest_set_route_smoke_noforce*`）
+
+| 项 | 内容 |
+|----|------|
+| **实验目的** | 在移除 `FORCE/FORCE_NEW_DESCRIPTOR` 代码依赖后，直接验证“仅靠真实 `experimental_compaction_event_time_split`”是否仍可触发 Manifest 分片路由与多 descriptor `MANIFEST_SET-*`。 |
+| **实验命令** | 1) 重编：`cmake --build D:\Project\rocks-demo\build --target st_meta_compact_existing --config Release`。2) 无 FORCE 环境：`ROCKSDB_EXPERIMENTAL_MANIFEST_SET_WRITE=1`、`ROCKSDB_EXPERIMENTAL_MANIFEST_SHARD_ROUTE=1`、`ROCKSDB_EXPERIMENTAL_MANIFEST_SHARD_BUCKET_WIDTH_SEC=3600`、`ROCKSDB_EXPERIMENTAL_MANIFEST_SHARD_BUCKET_COUNT=8`，并显式清空 `ROCKSDB_EXPERIMENTAL_MANIFEST_SHARD_FORCE*`。3) 运行：`st_meta_compact_existing --db ...manifest_set_route_smoke_noforce --st-time-split --st-bucket-sec 3600 --st-min-keys 1`；`st_meta_smoke --db ...manifest_set_route_smoke_noforce_fresh --csv ...segments_points.csv --st-keys --max-points 2000 --st-compaction-time-split --st-compaction-bucket-sec 3600 --compact-after-ingest`。 |
+| **实验结果** | `manifest_set_route_smoke_noforce`：成功 compact，但 `LOG` 无 `experimental_manifest_shard_route enabled=1` 路由命中行。`manifest_set_route_smoke_noforce_fresh`：出现 `batch_edit_shards=[0] reasons=[new_files_empty]`；`CURRENT=MANIFEST_SET-000005`，且 `MANIFEST_SET-000005` 仅包含 `MANIFEST-000005`（单 descriptor）。 |
+| **是否达到预期** | **部分达到**：验证了“无 FORCE 可正常运行并保持兼容”，但本轮未自然触发 `batch_edit_shards=[1,0]` 这类多 descriptor 路由。 |
+| **为什么** | 去掉 `FORCE_NEW_DESCRIPTOR` 后，分片路由受 `new_descriptor_log` 与批次内容约束更严格。本轮观测到的批次主要是 `new_files_empty`（global 回退），未形成“同批次内包含可路由 new_files edit + global 回退 edit”的组合。 |
+| **下一步** | 1) 在自然 workload 中制造“同一轮 LogAndApply 含可路由 new_files edit + 一个 metadata/edit 空变更”的批次；2) 增加轻量日志（`new_descriptor_log`、每个 `VersionEdit` 的 `new_files/deleted_files` 计数）定位为何落到 `[0]`；3) 补一次 recover/read_bench 回归，确认单 descriptor `MANIFEST_SET` 与旧 `CURRENT->MANIFEST` 均稳定。 |
+
+## 2026-04-15 — `MANIFEST_SET` 协议升级（`generation + entry(commit_seq,manifest)`）smoke
+
+| 项 | 内容 |
+|----|------|
+| **实验目的** | 按 manifest sharding 计划的 Phase 3 基础步，验证 `MANIFEST_SET-*` 新协议（`version=2` + `generation` + `entry=commit_seq,MANIFEST-*`）可正确写出，并可被恢复链路消费。 |
+| **实验命令** | 1) 建库：`ROCKSDB_EXPERIMENTAL_MANIFEST_SET_WRITE=1` + `st_meta_smoke --db D:\Project\data\experiments\manifest_set_proto_v2_smoke --csv D:\Project\data\processed\segments_points.csv --st-keys --max-points 2000 --compact-after-ingest`。2) 验证文件：读取 `CURRENT` 与 `MANIFEST_SET-000005`。3) 回放验证：重编 `st_meta_read_bench` 后运行 `st_meta_read_bench --db ...manifest_set_proto_v2_smoke --no-prune-scan --full-scan-mode window`。 |
+| **实验结果** | `CURRENT=MANIFEST_SET-000005`；`MANIFEST_SET-000005` 内容为：`version=2`、`generation=5`、`entry=1,MANIFEST-000005`。`st_meta_read_bench` 重编后可成功打开并扫描：`keys_scanned_total=2000`，`block_read_count=3`，`wall_us=1373.3`。 |
+| **是否达到预期** | **是**：新协议已落盘并可被恢复链路正确解析；旧流程（bench 打开 + 扫描）未回归失败。 |
+| **为什么** | `manifest_ops` 已兼容解析 `entry=` 与 `generation=`；`version_set` 写 `CURRENT` 时调用 `SetCurrentFileToManifestSet` 并传入 `commit_seq` 列表与 generation，因此写读两端协议一致。 |
+| **下一步** | 1) 继续推进 Phase 3：在多分片场景补齐 `commit_seq` 合并回放约束（尤其跨分片原子组）；2) 增加“旧 `version=1` / 新 `version=2` 混合”恢复回归；3) 在自然触发多 descriptor 场景验证 `entry` 顺序与 replay 顺序一致。 |
+
+## 2026-04-15 — 多 entry `MANIFEST_SET`（v2）回放验证 + 回放顺序接入
+
+| 项 | 内容 |
+|----|------|
+| **实验目的** | 验证 `MANIFEST_SET v2` 在多 entry 场景可被恢复链路消费；并推进 Recover 侧按 `commit_seq` 稳定排序回放（而非仅文件行序）。 |
+| **实验命令** | 在 `manifest_set_route_smoke_force4` 上临时写入 `MANIFEST_SET-999997`：`version=2`、`generation=999997`、`entry=20,MANIFEST-000010`、`entry=10,MANIFEST-000011`，将 `CURRENT` 临时切换后执行 `st_meta_read_bench --db ... --no-prune-scan --full-scan-mode window`，结束后恢复原 `CURRENT`。 |
+| **实验结果** | bench 可成功打开并扫描：`keys_scanned_total=1000`，`block_read_count=2`，`wall_us=373`；`LOG` 出现 `Recovering from manifest set: count=2`，说明多 entry v2 结构可被恢复链路读取。 |
+| **是否达到预期** | **是（功能层面）**：多 entry v2 manifest-set 可回放打开；兼容路径稳定。 |
+| **为什么** | `manifest_ops` 已支持 `entry=commit_seq,MANIFEST-*` 解析；Recover 侧已接入 `commit_seq` 序列并在多清单回放前执行稳定排序。 |
+| **下一步** | 1) 在“真实自然触发多 descriptor”场景确认 `entry` 顺序与提交顺序一致；2) 补 `experimental_manifest_sharding_enable` 灰度开关的端到端验证（默认写 `version=1`，开启后写 `version=2 + generation/entry`）。 |
+
+## 2026-04-15 — `generation + commit_seq` 状态机闭环（递增与重启恢复）
+
+| 项 | 内容 |
+|----|------|
+| **实验目的** | 在开启 `ROCKSDB_EXPERIMENTAL_MANIFEST_SHARDING_ENABLE=1` 后，验证 `MANIFEST_SET v2` 的 `entry(commit_seq, MANIFEST)` 在多次写入中持续单调递增，并在重启打开后保持可恢复。 |
+| **实验命令** | 目标库：`D:\Project\data\experiments\manifest_set_proto_v2_seq`。1) 先前状态确认：`CURRENT -> MANIFEST_SET-000017`，内容 `entry=4,MANIFEST-000017`。2) 再跑一轮 `st_meta_compact_existing --st-time-split --st-bucket-sec 3600 --st-min-keys 1`。3) 读取 `CURRENT` 与对应 `MANIFEST_SET-*`。4) 运行 `st_meta_read_bench --no-prune-scan --full-scan-mode window` 做 reopen 验证。 |
+| **实验结果** | 新一轮后 `CURRENT -> MANIFEST_SET-002062`；`MANIFEST_SET-002062` 内容为 `version=2`、`generation=5`、`entry=5,MANIFEST-002062`。`st_meta_read_bench` 可成功打开并扫描：`keys_scanned_total=3000`（`block_read_count=4074`，大量小 SST 形态下属预期）。 |
+| **是否达到预期** | **是**：`commit_seq` 从 `4 -> 5` 继续单调递增，且 DB 重启读取链路正常。 |
+| **为什么** | `VersionSet` 已维护 `manifest_set_next_commit_seq_` 与 `manifest_set_generation_`，写 `MANIFEST_SET` 时按状态机分配全局序号，Recover 时再由文件元数据回填下一序号，形成“写入递增 + 恢复续写”闭环。 |
+| **下一步** | 1) 进一步跑“自然触发多 descriptor（同一 MANIFEST_SET 含多条 entry）”并核对回放排序；2) 增加崩溃点回归（分片已写但 CURRENT 未切换 / CURRENT 已切换）完成 Phase 5 故障用例。 |
+
+## 2026-04-15 — 灰度开关与故障语义回归（Phase 5）
+
+| 项 | 内容 |
+|----|------|
+| **实验目的** | 补齐上线前两类关键回归：1) `experimental_manifest_sharding_enable` 开关语义（默认关/显式开）；2) 崩溃语义 A/B（分片文件已写但 `CURRENT` 未切换；`CURRENT` 已切换）。 |
+| **实验命令** | **开关语义**：建两库 `manifest_set_gate_off_smoke` / `manifest_set_gate_on_smoke`（均 `ROCKSDB_EXPERIMENTAL_MANIFEST_SET_WRITE=1`，仅后者额外 `ROCKSDB_EXPERIMENTAL_MANIFEST_SHARDING_ENABLE=1`），读取 `MANIFEST_SET-000005`。**故障语义**：在干净库 `manifest_set_crash_semantics_base` 上手工写 `MANIFEST_SET-123450/123451`；A) 保持 `CURRENT` 不变直接 reopen；B) 将 `CURRENT` 切到新 set 后 reopen。 |
+| **实验结果** | **开关语义**：`gate_off` 写出 `version=1 + MANIFEST-*`；`gate_on` 写出 `version=2 + generation + entry=`。**故障语义 A**（`CURRENT` 不切）：reopen 成功（`CASE_A_EXIT=0`）。**故障语义 B**（`CURRENT` 已切）：当 `entry` 指向不存在 descriptor 会失败（预期保护）；改为真实 descriptor（`MANIFEST-000017`）后 reopen 成功（`CASE_B_REAL_DESCRIPTOR_EXIT=0`）。 |
+| **是否达到预期** | **是**：灰度开关生效、兼容路径正常；故障语义与设计一致（可见性以 `CURRENT` 原子切换为准，且切换后必须引用存在的 descriptor）。 |
+| **为什么** | 读路径始终由 `CURRENT` 决定回放入口：A 场景仍读旧 set，因此稳定；B 场景切换后读取新 set，若 entry 无效则立即 fail-fast，entry 有效则可恢复打开。 |
+| **下一步** | 1) 继续追“自然触发同一 `MANIFEST_SET` 多 entry”（当前多发生单 entry）；2) 增加自动化崩溃注入（Sync 后/`CURRENT` Rename 前后）脚本化回归，减少手工构造。 |
 
