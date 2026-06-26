@@ -89,9 +89,18 @@ std::string DescriptorFileName(const std::string& dbname, uint64_t number);
 std::string DescriptorFileName(uint64_t number);
 
 // Return the name of manifest-set file for the db named by "dbname".
-// Format: MANIFEST_SET-[number]
+// Format: MANIFEST_SET-[number] (legacy; prefer M_manager)
 std::string ManifestSetFileName(const std::string& dbname, uint64_t number);
 std::string ManifestSetFileName(uint64_t number);
+
+// Manifest time-index file (shard MANIFEST-* time ranges only).
+// Format: M_manager-[number]
+std::string MManagerFileName(const std::string& dbname, uint64_t number);
+std::string MManagerFileName(uint64_t number);
+
+// Parse "M_manager-NNNNNN" (basename or db-relative path). Returns false if not
+// an M_manager file name.
+bool ParseMManagerFileNumber(const std::string& fname, uint64_t* number);
 
 extern const std::string kCurrentFileName;  // = "CURRENT"
 
@@ -182,8 +191,19 @@ IOStatus SetCurrentFile(const WriteOptions& write_options, FileSystem* fs,
                         Temperature temp,
                         FSDirectory* dir_contains_current_file);
 
+// Write M_manager file listing descriptor shards with time bounds; make CURRENT
+// point to that M_manager file.
+IOStatus SetCurrentFileToMManager(
+    const WriteOptions& write_options, FileSystem* fs, const std::string& dbname,
+    uint64_t manager_number, const std::vector<uint64_t>& descriptor_numbers,
+    uint64_t generation, Temperature temp,
+    FSDirectory* dir_contains_current_file,
+    const std::vector<uint64_t>* manifest_time_mins,
+    const std::vector<uint64_t>* manifest_time_maxs,
+    const std::vector<uint64_t>* manifest_host_buckets = nullptr);
+
 // Write MANIFEST_SET file listing descriptor files in replay order and make
-// CURRENT point to that MANIFEST_SET file.
+// CURRENT point to that MANIFEST_SET file (legacy).
 IOStatus SetCurrentFileToManifestSet(
     const WriteOptions& write_options, FileSystem* fs, const std::string& dbname,
     uint64_t manifest_set_number, const std::vector<uint64_t>& descriptor_numbers,

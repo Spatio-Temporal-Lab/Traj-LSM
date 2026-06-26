@@ -726,6 +726,26 @@ public class ReadOptions extends RocksObject {
   }
 
   /**
+   * EXPERIMENTAL (ST fork): configure spatio-temporal iterator prune scan.
+   */
+  @Experimental("ST fork spatio-temporal prune scan")
+  public ReadOptions setExperimentalStPruneScan(final ExperimentalStPruneScan scan) {
+    assert(isOwningHandle());
+    if (scan == null) {
+      clearExperimentalStPruneScan(nativeHandle_);
+    } else {
+      setExperimentalStPruneScan(nativeHandle_, scan);
+    }
+    return this;
+  }
+
+  @Experimental("ST fork spatio-temporal prune scan")
+  public boolean experimentalStPruneScanEnabled() {
+    assert(isOwningHandle());
+    return experimentalStPruneScanEnabled(nativeHandle_);
+  }
+
+  /**
    * If async_io is enabled, RocksDB will prefetch some of data asynchronously.
    * RocksDB apply it if reads are sequential and its internal automatic
    * prefetching.
@@ -824,4 +844,9 @@ public class ReadOptions extends RocksObject {
   private static native void setIoTimeout(final long handle, final long ioTimeout);
   private static native long valueSizeSoftLimit(final long handle);
   private static native void setValueSizeSoftLimit(final long handle, final long softLimit);
+
+  private static native void setExperimentalStPruneScan(
+      final long handle, final ExperimentalStPruneScan scan);
+  private static native void clearExperimentalStPruneScan(final long handle);
+  private static native boolean experimentalStPruneScanEnabled(final long handle);
 }

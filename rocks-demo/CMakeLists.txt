@@ -262,6 +262,15 @@ target_link_libraries(st_fork_kv_stream_dump PRIVATE
   rpcrt4)
 message(STATUS "rocks-demo: st_fork_kv_stream_dump (fork)")
 
+add_executable(st_kv_sample_probe st_kv_sample_probe.cpp)
+target_include_directories(st_kv_sample_probe PRIVATE "${ROCKSDB_ROOT}/include"
+  "${ROCKSDB_ROOT}" "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(st_kv_sample_probe PRIVATE
+  "${ROCKSDB_LIB}"
+  shlwapi
+  rpcrt4)
+message(STATUS "rocks-demo: st_kv_sample_probe (fork)")
+
 # Upstream-only: ingest dump into a new DB with plain SSTs (real Vanilla-readable paths).
 if(EXISTS "${VANILLA_ROCKSDB_LIB}" OR EXISTS "${VANILLA_ROCKSDB_LIB_VS}")
   if(EXISTS "${VANILLA_ROCKSDB_LIB}")
@@ -277,6 +286,14 @@ if(EXISTS "${VANILLA_ROCKSDB_LIB}" OR EXISTS "${VANILLA_ROCKSDB_LIB_VS}")
     shlwapi
     rpcrt4)
   message(STATUS "rocks-demo: st_vanilla_kv_stream_ingest -> ${_VANILLA_INGEST_LIB}")
+  add_executable(vanilla_db_live_audit vanilla_db_live_audit.cpp)
+  target_include_directories(vanilla_db_live_audit PRIVATE "${VANILLA_ROCKSDB_ROOT}/include")
+  target_link_libraries(vanilla_db_live_audit PRIVATE
+    "${_VANILLA_INGEST_LIB}"
+    ${_vanilla_extra_libs}
+    shlwapi
+    rpcrt4)
+  message(STATUS "rocks-demo: vanilla_db_live_audit -> ${_VANILLA_INGEST_LIB}")
 else()
   message(STATUS "rocks-demo: st_vanilla_kv_stream_ingest skipped (no rocksdb_vanilla build)")
 endif()
@@ -318,10 +335,47 @@ target_link_libraries(st_meta_scan_bench PRIVATE
   rpcrt4)
 
 # Real read IO / PerfContext on an existing ST-key DB (no rebuild).
-add_executable(st_meta_read_bench st_meta_read_bench.cpp)
+add_executable(st_meta_read_bench st_meta_read_bench.cpp st_meta_read_bench_batch.cpp db/manifest_ops.cpp)
+target_compile_definitions(st_meta_read_bench PRIVATE
+  ROCKS_DEMO_SKIP_ROCKSDB_MANIFEST_STATS_IMPL=1
+  ROCKS_DEMO_SKIP_ROCKSDB_MANIFEST_LEVEL_STATS_IMPL=1)
 target_include_directories(st_meta_read_bench PRIVATE "${ROCKSDB_ROOT}/include"
   "${ROCKSDB_ROOT}")
 target_link_libraries(st_meta_read_bench PRIVATE
+  "${ROCKSDB_LIB}"
+  shlwapi
+  rpcrt4)
+
+add_executable(st_manifest_set_inspect st_manifest_set_inspect.cpp db/manifest_ops.cpp)
+target_compile_definitions(st_manifest_set_inspect PRIVATE
+  ROCKS_DEMO_SKIP_ROCKSDB_MANIFEST_STATS_IMPL=1
+  ROCKS_DEMO_SKIP_ROCKSDB_MANIFEST_LEVEL_STATS_IMPL=1)
+target_include_directories(st_manifest_set_inspect PRIVATE "${ROCKSDB_ROOT}/include"
+  "${ROCKSDB_ROOT}")
+target_link_libraries(st_manifest_set_inspect PRIVATE
+  "${ROCKSDB_LIB}"
+  shlwapi
+  rpcrt4)
+
+add_executable(st_prune_stats st_prune_stats.cpp)
+target_include_directories(st_prune_stats PRIVATE "${ROCKSDB_ROOT}/include"
+  "${ROCKSDB_ROOT}")
+target_link_libraries(st_prune_stats PRIVATE
+  "${ROCKSDB_LIB}"
+  shlwapi
+  rpcrt4)
+
+add_executable(st_level_stats st_level_stats.cpp)
+target_include_directories(st_level_stats PRIVATE "${ROCKSDB_ROOT}/include"
+  "${ROCKSDB_ROOT}")
+target_link_libraries(st_level_stats PRIVATE
+  "${ROCKSDB_LIB}"
+  shlwapi
+  rpcrt4)
+
+add_executable(st_table_props st_table_props.cpp)
+target_include_directories(st_table_props PRIVATE "${ROCKSDB_ROOT}/include")
+target_link_libraries(st_table_props PRIVATE
   "${ROCKSDB_LIB}"
   shlwapi
   rpcrt4)
@@ -333,9 +387,38 @@ target_link_libraries(traj_db_audit PRIVATE
   shlwapi
   rpcrt4)
 
+add_executable(traj_db_repair traj_db_repair.cpp)
+target_include_directories(traj_db_repair PRIVATE "${ROCKSDB_ROOT}/include")
+target_link_libraries(traj_db_repair PRIVATE
+  "${ROCKSDB_LIB}"
+  shlwapi
+  rpcrt4)
+
 add_executable(st_meta_compact_existing st_meta_compact_existing.cpp)
-target_include_directories(st_meta_compact_existing PRIVATE "${ROCKSDB_ROOT}/include")
+target_include_directories(st_meta_compact_existing PRIVATE "${ROCKSDB_ROOT}/include"
+  "${ROCKSDB_ROOT}")
 target_link_libraries(st_meta_compact_existing PRIVATE
+  "${ROCKSDB_LIB}"
+  shlwapi
+  rpcrt4)
+
+# Multi-DB compaction comparison benchmark: ST vs Leveled vs Tiered.
+add_executable(st_compaction_bench st_compaction_bench.cpp db/manifest_ops.cpp)
+target_compile_definitions(st_compaction_bench PRIVATE
+  ROCKS_DEMO_SKIP_ROCKSDB_MANIFEST_STATS_IMPL=1
+  ROCKS_DEMO_SKIP_ROCKSDB_MANIFEST_LEVEL_STATS_IMPL=1)
+target_include_directories(st_compaction_bench PRIVATE "${ROCKSDB_ROOT}/include"
+  "${ROCKSDB_ROOT}")
+target_link_libraries(st_compaction_bench PRIVATE
+  "${ROCKSDB_LIB}"
+  shlwapi
+  rpcrt4)
+
+# Mixed read/write throughput benchmark: ST vs Leveled vs Tiered.
+add_executable(st_mixed_workload_bench st_mixed_workload_bench.cpp)
+target_include_directories(st_mixed_workload_bench PRIVATE "${ROCKSDB_ROOT}/include"
+  "${ROCKSDB_ROOT}")
+target_link_libraries(st_mixed_workload_bench PRIVATE
   "${ROCKSDB_LIB}"
   shlwapi
   rpcrt4)
@@ -345,6 +428,7 @@ add_executable(manifest_bucket_rtree_validate manifest_bucket_rtree_validate.cpp
 
 add_executable(st_meta_compaction_verify st_meta_compaction_verify.cpp)
 target_include_directories(st_meta_compaction_verify PRIVATE "${ROCKSDB_ROOT}/include"
+  "${ROCKSDB_ROOT}"
   "${CMAKE_CURRENT_SOURCE_DIR}")
 if(CMAKE_BUILD_TYPE)
   # Passed as -DROCKS_DEMO_BT=Release so we can stringify it in the tool.
@@ -360,6 +444,23 @@ add_executable(st_bucket_ingest_build st_bucket_ingest_build.cpp)
 target_include_directories(st_bucket_ingest_build PRIVATE "${ROCKSDB_ROOT}/include"
   "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(st_bucket_ingest_build PRIVATE
+  "${ROCKSDB_LIB}"
+  shlwapi
+  rpcrt4)
+
+add_executable(st_global_ghost_compact st_global_ghost_compact.cpp)
+target_include_directories(st_global_ghost_compact PRIVATE "${ROCKSDB_ROOT}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(st_global_ghost_compact PRIVATE
+  "${ROCKSDB_LIB}"
+  shlwapi
+  rpcrt4)
+
+# Compaction throughput benchmark: 5 strategies, write + read comparison.
+add_executable(st_compaction_throughput_bench st_compaction_throughput_bench.cpp)
+target_include_directories(st_compaction_throughput_bench PRIVATE
+  "${ROCKSDB_ROOT}/include" "${ROCKSDB_ROOT}")
+target_link_libraries(st_compaction_throughput_bench PRIVATE
   "${ROCKSDB_LIB}"
   shlwapi
   rpcrt4)

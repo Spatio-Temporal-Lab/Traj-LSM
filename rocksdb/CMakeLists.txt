@@ -880,11 +880,13 @@ set(SOURCES
         table/block_based/filter_block_reader_common.cc
         table/block_based/filter_policy.cc
         table/block_based/flush_block_policy.cc
+        table/block_based/st_mbr_flush_block_policy.cc
         table/block_based/full_filter_block.cc
         table/block_based/hash_index_reader.cc
         table/block_based/index_builder.cc
         table/index_value_codec.cc
         table/st_meta_user_key.cc
+        table/tman_rocksdb_value.cc
         table/block_based/index_reader_common.cc
         table/block_based/parsed_full_filter_block.cc
         table/block_based/partitioned_filter_block.cc

@@ -9,15 +9,40 @@
 
 #include "db/compaction/compaction_picker_level.h"
 
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "db/compaction/st_event_split_policy.h"
 #include "db/version_edit.h"
 #include "logging/log_buffer.h"
+#include "table/st_meta_index_extension.h"
 #include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+double GetCompactionScoreForLevel(VersionStorageInfo* vstorage, int level,
+                                  int num_sorted_slots) {
+  for (int i = 0; i < num_sorted_slots; ++i) {
+    if (vstorage->CompactionScoreLevel(i) == level) {
+      return vstorage->CompactionScore(i);
+    }
+  }
+  return 0.0;
+}
+
+int StCompactionL0OutputLevel(const MutableCFOptions& mopts,
+                              VersionStorageInfo* vstorage) {
+  if (mopts.experimental_st_compaction) {
+    return 1;
+  }
+  return vstorage->base_level();
+}
+
+}  // namespace
 
 bool LevelCompactionPicker::NeedsCompaction(
     const VersionStorageInfo* vstorage) const {
@@ -54,6 +79,459 @@ enum class CompactToNextLevel {
   kYes,  // compact to the next level except the last level to the same level
   kSkipLastLevel,  // compact to the next level but skip the last level
 };
+
+// Global spatiotemporal envelope: scans all live files across all levels
+// to get the current global bounding box for S_hybrid normalization.
+struct GlobalEnvelope {
+  double t_min = 0, t_max = 1;
+  double x_min = 0, x_max = 1;
+  double y_min = 0, y_max = 1;
+  bool valid = false;
+};
+
+GlobalEnvelope ComputeGlobalEnvelope(const VersionStorageInfo* vstorage) {
+  GlobalEnvelope e;
+  double t_min = std::numeric_limits<double>::max();
+  double t_max = std::numeric_limits<double>::lowest();
+  double x_min = std::numeric_limits<double>::max();
+  double x_max = std::numeric_limits<double>::lowest();
+  double y_min = std::numeric_limits<double>::max();
+  double y_max = std::numeric_limits<double>::lowest();
+  bool any = false;
+  for (int lvl = 0; lvl < vstorage->num_levels(); ++lvl) {
+    for (const auto* f : vstorage->LevelFiles(lvl)) {
+      if (f == nullptr || !f->has_st_file_meta) continue;
+      const auto& m = f->st_file_meta;
+      t_min = std::min(t_min, static_cast<double>(m.t_min));
+      t_max = std::max(t_max, static_cast<double>(m.t_max));
+      x_min = std::min(x_min, static_cast<double>(m.x_min));
+      x_max = std::max(x_max, static_cast<double>(m.x_max));
+      y_min = std::min(y_min, static_cast<double>(m.y_min));
+      y_max = std::max(y_max, static_cast<double>(m.y_max));
+      any = true;
+    }
+  }
+  if (!any) return e;  // no ST meta at all
+  constexpr double kEps = 1e-9;
+  e.t_min = t_min;  e.t_max = t_max + kEps;
+  e.x_min = x_min;  e.x_max = x_max + kEps;
+  e.y_min = y_min;  e.y_max = y_max + kEps;
+  e.valid = true;
+  return e;
+}
+
+// One-dimensional ST projection: maps a file's (t_center, x_center, y_center)
+// into a scalar S ∈ [0,1] using the global envelope for normalization.
+//   S = 0.50 * t_norm + 0.25 * x_norm + 0.25 * y_norm
+// Returns -1 if the file has no ST meta.
+double ComputeSHybrid(const FileMetaData* f, const GlobalEnvelope& env) {
+  if (!f->has_st_file_meta || !env.valid) return -1.0;
+  const auto& m = f->st_file_meta;
+  const double t_c = (static_cast<double>(m.t_min) + m.t_max) * 0.5;
+  const double x_c = (static_cast<double>(m.x_min) + m.x_max) * 0.5;
+  const double y_c = (static_cast<double>(m.y_min) + m.y_max) * 0.5;
+  const double t_n = (t_c - env.t_min) / std::max(env.t_max - env.t_min, 1e-9);
+  const double x_n = (x_c - env.x_min) / std::max(env.x_max - env.x_min, 1e-9);
+  const double y_n = (y_c - env.y_min) / std::max(env.y_max - env.y_min, 1e-9);
+  return 0.50 * t_n + 0.25 * x_n + 0.25 * y_n;
+}
+
+// Find the best pair of neighboring files to merge by scanning the level's
+// files sorted by S_hybrid. Returns the pair with the smallest ΔS that is
+// below the threshold, or empty if none qualify.
+//   ΔS_threshold: below this value, files are "close enough" to merge.
+constexpr double kDeltaSThreshold = 0.01;
+
+void FindBestNeighborPair(const std::vector<FileMetaData*>& files,
+                           const GlobalEnvelope& env,
+                           std::vector<FileMetaData*>* out_pair) {
+  out_pair->clear();
+  // Collect files with valid S_hybrid.
+  struct Scored {
+    FileMetaData* file;
+    double s;
+  };
+  std::vector<Scored> scored;
+  scored.reserve(files.size());
+  for (auto* f : files) {
+    if (f == nullptr || f->being_compacted) continue;
+    double s = ComputeSHybrid(f, env);
+    if (s < 0.0) continue;  // no ST meta, skip
+    scored.push_back({f, s});
+  }
+  if (scored.size() < 2) return;
+
+  // Sort by S_hybrid ascending.
+  std::sort(scored.begin(), scored.end(),
+            [](const Scored& a, const Scored& b) { return a.s < b.s; });
+
+  // Find the pair with smallest ΔS below threshold.
+  size_t best_i = 0;
+  double best_ds = std::numeric_limits<double>::max();
+  for (size_t i = 0; i < scored.size() - 1; ++i) {
+    double ds = scored[i + 1].s - scored[i].s;
+    if (ds < best_ds) {
+      best_ds = ds;
+      best_i = i;
+    }
+  }
+  if (best_ds < kDeltaSThreshold) {
+    out_pair->push_back(scored[best_i].file);
+    out_pair->push_back(scored[best_i + 1].file);
+  }
+}
+
+double ComputeMbrArea(const SpatioTemporalBlockMeta& m);
+
+// Check if a file is "bloated": large MBR area but low data density.
+// Returns true if the file should be pushed down (trigger B).
+bool IsBloatedFile(const FileMetaData* f, double area_threshold_factor) {
+  if (!f->has_st_file_meta) return false;
+  double area = ComputeMbrArea(f->st_file_meta);
+  if (area <= 0.0) return false;
+  double bytes = static_cast<double>(std::max<uint64_t>(f->fd.GetFileSize(), 1));
+  double density = bytes / area;  // bytes per unit area
+  // Low density + large area = bloated.
+  // Threshold: file spans > 25% of a degree and density < 4KB per sq-degree.
+  constexpr double kMinAreaDeg = 0.25;
+  constexpr double kMinDensity = 4096.0;
+  return (area >= kMinAreaDeg && density < kMinDensity * area_threshold_factor);
+}
+
+double ComputeMbrArea(const SpatioTemporalBlockMeta& m) {
+  const double w = std::max(0.0, static_cast<double>(m.x_max) -
+                                     static_cast<double>(m.x_min));
+  const double h = std::max(0.0, static_cast<double>(m.y_max) -
+                                     static_cast<double>(m.y_min));
+  return w * h;
+}
+
+SpatioTemporalBlockMeta UnionMbr(const SpatioTemporalBlockMeta& a,
+                                const SpatioTemporalBlockMeta& b) {
+  SpatioTemporalBlockMeta out = a;
+  out.x_min = std::min(out.x_min, b.x_min);
+  out.x_max = std::max(out.x_max, b.x_max);
+  out.y_min = std::min(out.y_min, b.y_min);
+  out.y_max = std::max(out.y_max, b.y_max);
+  out.t_min = std::min(out.t_min, b.t_min);
+  out.t_max = std::max(out.t_max, b.t_max);
+  // bitmap_words not used for picker scoring; ignore.
+  return out;
+}
+
+// Heuristic for Mind.md "spatially-near SST" picking:
+// Two-stage (best-effort) heuristic for Mind.md:
+//  1) Coarse filter: keep only candidates that are spatially close to at
+//     least one output-level overlapping file (MBR intersects or edge distance
+//     within a per-level threshold).
+//  2) Fine score: compute weighted score based on time gap + IoU/edge distance
+//     + MBR expansion penalty + file size imbalance penalty. Lower is better.
+//
+// This is best-effort and only used when file-level ST meta exists.
+double SpatialUnionExpansionScore(const FileMetaData* cand,
+                                 const std::vector<FileMetaData*>& overlaps) {
+  if (cand == nullptr || !cand->has_st_file_meta) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const auto& c = cand->st_file_meta;
+  const double base_area = std::max(ComputeMbrArea(c), 1e-12);
+  SpatioTemporalBlockMeta merged = c;
+  for (const FileMetaData* f : overlaps) {
+    if (f == nullptr || !f->has_st_file_meta) {
+      continue;
+    }
+    merged = UnionMbr(merged, f->st_file_meta);
+  }
+  const double merged_area = ComputeMbrArea(merged);
+  return merged_area / base_area;
+}
+
+bool MbrIntersects(const SpatioTemporalBlockMeta& a,
+                    const SpatioTemporalBlockMeta& b) {
+  return !(a.x_max < b.x_min || a.x_min > b.x_max || a.y_max < b.y_min ||
+           a.y_min > b.y_max);
+}
+
+double MbrIou(const SpatioTemporalBlockMeta& a,
+               const SpatioTemporalBlockMeta& b) {
+  const float ix_min = std::max(a.x_min, b.x_min);
+  const float ix_max = std::min(a.x_max, b.x_max);
+  const float iy_min = std::max(a.y_min, b.y_min);
+  const float iy_max = std::min(a.y_max, b.y_max);
+  const double iw = std::max(0.0, static_cast<double>(ix_max - ix_min));
+  const double ih = std::max(0.0, static_cast<double>(iy_max - iy_min));
+  const double inter = iw * ih;
+  if (inter <= 0.0) {
+    return 0.0;
+  }
+  const double area_a = std::max(ComputeMbrArea(a), 1e-12);
+  const double area_b = std::max(ComputeMbrArea(b), 1e-12);
+  const double uni = area_a + area_b - inter;
+  return uni > 0.0 ? (inter / uni) : 0.0;
+}
+
+double EdgeDistance(const SpatioTemporalBlockMeta& a,
+                     const SpatioTemporalBlockMeta& b) {
+  const double dx = (a.x_max < b.x_min)
+                         ? (static_cast<double>(b.x_min) - a.x_max)
+                         : (a.x_min > b.x_max)
+                               ? (static_cast<double>(a.x_min) - b.x_max)
+                               : 0.0;
+  const double dy = (a.y_max < b.y_min)
+                         ? (static_cast<double>(b.y_min) - a.y_max)
+                         : (a.y_min > b.y_max)
+                               ? (static_cast<double>(a.y_min) - b.y_max)
+                               : 0.0;
+  return std::sqrt(dx * dx + dy * dy);
+}
+
+double TimeGapNormalized(const SpatioTemporalBlockMeta& a,
+                          const SpatioTemporalBlockMeta& b,
+                          uint32_t time_norm) {
+  const uint32_t lo = std::min(a.t_min, a.t_max);
+  const uint32_t hi = std::max(a.t_min, a.t_max);
+  const uint32_t blo = std::min(b.t_min, b.t_max);
+  const uint32_t bhi = std::max(b.t_min, b.t_max);
+  uint32_t gap = 0;
+  if (hi < blo) {
+    gap = blo - hi;
+  } else if (bhi < lo) {
+    gap = lo - bhi;
+  } else {
+    gap = 0;
+  }
+  const double denom = time_norm > 0 ? static_cast<double>(time_norm) : 21600.0;
+  return gap == 0 ? 0.0 : (static_cast<double>(gap) / denom);
+}
+
+double SpatialProximityFineScore(
+    const FileMetaData* cand, const FileMetaData* overlap,
+    uint32_t time_norm) {
+  if (cand == nullptr || overlap == nullptr || !cand->has_st_file_meta ||
+      !overlap->has_st_file_meta) {
+    return std::numeric_limits<double>::infinity();
+  }
+  const auto& cm = cand->st_file_meta;
+  const auto& om = overlap->st_file_meta;
+
+  // Mind.md recommended weights.
+  constexpr double wt = 0.35;
+  constexpr double ws = 0.35;
+  constexpr double we = 0.20;
+  constexpr double wb = 0.10;
+
+  const double d_t = TimeGapNormalized(cm, om, time_norm);
+
+  const double iou = MbrIou(cm, om);
+  double d_s = 0.0;
+  if (iou > 0.0) {
+    d_s = 1.0 - iou;
+  } else {
+    const double d_edge = EdgeDistance(cm, om);
+    const double base = std::sqrt(std::max(ComputeMbrArea(cm), 1e-12));
+    d_s = 1.0 + d_edge / std::max(base, 1e-6);
+  }
+
+  const SpatioTemporalBlockMeta merged = UnionMbr(cm, om);
+  const double expansion =
+      (ComputeMbrArea(merged) - ComputeMbrArea(cm)) /
+      std::max(ComputeMbrArea(cm), 1e-12);
+
+  const double cand_size = static_cast<double>(cand->fd.GetFileSize());
+  const double overlap_size =
+      static_cast<double>(overlap->fd.GetFileSize());
+  const double avg = std::max((cand_size + overlap_size) * 0.5, 1.0);
+  const double imbalance = std::abs(cand_size - overlap_size) / avg;
+
+  const double score = wt * d_t + ws * d_s + we * expansion + wb * imbalance;
+  return score;
+}
+
+double SpatialProximityCoarseEdgeThreshold(int out_level) {
+  // Normalize edge distance by sqrt(area_base) inside the picker.
+  if (out_level <= 1) {
+    return 0.10;
+  }
+  if (out_level <= 3) {
+    return 0.15;
+  }
+  return 0.25;
+}
+
+// Time IoU: intersection(t_A, t_B) / union(t_A, t_B).
+// Returns 0 when time ranges are completely disjoint.
+double IouTime(const SpatioTemporalBlockMeta& a,
+               const SpatioTemporalBlockMeta& b) {
+  const uint32_t a_lo = std::min(a.t_min, a.t_max);
+  const uint32_t a_hi = std::max(a.t_min, a.t_max);
+  const uint32_t b_lo = std::min(b.t_min, b.t_max);
+  const uint32_t b_hi = std::max(b.t_min, b.t_max);
+  const uint32_t i_lo = std::max(a_lo, b_lo);
+  const uint32_t i_hi = std::min(a_hi, b_hi);
+  if (i_hi <= i_lo) return 0.0;
+  const double inter = static_cast<double>(i_hi - i_lo);
+  const double uni =
+      static_cast<double>(std::max(a_hi, b_hi) - std::min(a_lo, b_lo));
+  return uni > 0.0 ? (inter / uni) : 0.0;
+}
+
+// ST-aware merge efficiency score for two runs (files) in a tiered level.
+// Higher score → more beneficial to merge per I/O byte.
+//   efficiency = (alpha * IouTime + beta * IouSpatial) / log2(1 + total_bytes)
+// If both time AND space are disjoint, returns 0 (skip — no pruning benefit).
+double MergePriorityScore(const FileMetaData* a, const FileMetaData* b) {
+  if (a == nullptr || b == nullptr ||
+      !a->has_st_file_meta || !b->has_st_file_meta) {
+    return 0.01;  // no ST meta → low baseline, eligible but deprioritized
+  }
+  const auto& ma = a->st_file_meta;
+  const auto& mb = b->st_file_meta;
+
+  constexpr double alpha = 0.50;  // time overlap
+  constexpr double beta  = 0.50;  // spatial overlap
+
+  const double iou_t = IouTime(ma, mb);
+  const double iou_s = MbrIou(ma, mb);
+
+  // If no overlap in either dimension, merging has no pruning benefit.
+  if (iou_t <= 0.0 && iou_s <= 0.0) return 0.0;
+
+  // Size efficiency: prefer merging small files (higher score per I/O byte).
+  const double sz_a = static_cast<double>(std::max<uint64_t>(a->fd.GetFileSize(), 1));
+  const double sz_b = static_cast<double>(std::max<uint64_t>(b->fd.GetFileSize(), 1));
+  const double total_mb = (sz_a + sz_b) / (1024.0 * 1024.0);
+  const double size_den = std::log2(1.0 + total_mb);
+
+  return (alpha * iou_t + beta * iou_s) / std::max(size_den, 1e-6);
+}
+
+// Select a batch of overlapping files to merge from a level with too many
+// runs. Strategy: find the "center" file with the highest total merge
+// benefit (sum of scores with all other files), then greedily add its best
+// neighbors until enough runs are eliminated or no more good candidates.
+// Merging a batch in one job reduces compaction job count vs pair-by-pair.
+void SelectBestMergeBatch(const std::vector<FileMetaData*>& level_files,
+                          int max_runs,
+                          std::vector<FileMetaData*>* out_selected) {
+  out_selected->clear();
+  const size_t n = level_files.size();
+  if (n < 2) return;
+
+  // Count active (non-compacting) files.
+  int active = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (level_files[i] != nullptr && !level_files[i]->being_compacted)
+      ++active;
+  }
+  if (active <= max_runs) return;  // no merge needed
+
+  // Compute total merge benefit per file (sum of scores with all others).
+  struct Candidate {
+    size_t index;
+    double total_score;
+    int    neighbor_count;  // files with score > 0
+  };
+  std::vector<Candidate> cands;
+  cands.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    if (level_files[i] == nullptr || level_files[i]->being_compacted)
+      continue;
+    double sum = 0.0;
+    int neighbors = 0;
+    for (size_t j = 0; j < n; ++j) {
+      if (i == j) continue;
+      if (level_files[j] == nullptr || level_files[j]->being_compacted)
+        continue;
+      const double s = MergePriorityScore(level_files[i], level_files[j]);
+      sum += s;
+      if (s > 0.0) ++neighbors;
+    }
+    cands.push_back({i, sum, neighbors});
+  }
+  if (cands.empty()) return;
+
+  // Pick the center: file with highest total_score (most overlap benefit).
+  std::sort(cands.begin(), cands.end(),
+            [](const Candidate& a, const Candidate& b) {
+              return a.total_score > b.total_score;  // descending
+            });
+
+  // Build a merge batch around the center.  Include the center plus
+  // enough neighbors to bring the run count down to max_runs.
+  const int need = active - max_runs;  // runs to eliminate
+  const size_t center = cands[0].index;
+  out_selected->push_back(
+      const_cast<FileMetaData*>(level_files[center]));
+
+  // Score all files against the center, sort by score descending.
+  std::vector<std::pair<double, size_t>> by_score;
+  for (size_t j = 0; j < n; ++j) {
+    if (j == center) continue;
+    if (level_files[j] == nullptr || level_files[j]->being_compacted)
+      continue;
+    const double s = MergePriorityScore(level_files[center], level_files[j]);
+    if (s > 0.0) {
+      by_score.push_back({s, j});
+    }
+  }
+  std::sort(by_score.begin(), by_score.end(),
+            [](const auto& a, const auto& b) {
+              return a.first > b.first;  // highest score first
+            });
+
+  // Add neighbors until we eliminate enough runs.
+  // Each added file merges one extra run into the batch (eliminating it).
+  int added = 0;
+  for (const auto& p : by_score) {
+    if (added >= need) break;
+    out_selected->push_back(
+        const_cast<FileMetaData*>(level_files[p.second]));
+    ++added;
+  }
+
+  // If we still haven't met the target and there are files without ST meta
+  // (score = 0.01), add those as a last resort.
+  if (added < need) {
+    for (size_t j = 0; j < n && added < need; ++j) {
+      if (j == center) continue;
+      if (level_files[j] == nullptr || level_files[j]->being_compacted)
+        continue;
+      // Check if already selected
+      bool already = false;
+      for (auto* f : *out_selected) {
+        if (f == level_files[j]) { already = true; break; }
+      }
+      if (already) continue;
+      const double s = MergePriorityScore(level_files[center],
+                                           level_files[j]);
+      if (s <= 0.0) {  // no-ST-meta files get 0.01
+        out_selected->push_back(
+            const_cast<FileMetaData*>(level_files[j]));
+        ++added;
+      }
+    }
+  }
+
+  // If batch is still just 1 file (no neighbors), add at least one more.
+  if (out_selected->size() < 2 && by_score.empty() && n >= 2) {
+    for (size_t j = 0; j < n; ++j) {
+      if (j != center && level_files[j] != nullptr &&
+          !level_files[j]->being_compacted) {
+        out_selected->push_back(
+            const_cast<FileMetaData*>(level_files[j]));
+        break;
+      }
+    }
+  }
+}
+
+double ComputeMbrArea(const SpatioTemporalBlockMeta& m);
+double EdgeDistance(const SpatioTemporalBlockMeta& a,
+                    const SpatioTemporalBlockMeta& b);
+double SpatialProximityFineScore(
+    const FileMetaData* cand, const FileMetaData* overlap,
+    uint32_t time_norm);
+double SpatialProximityCoarseEdgeThreshold(int out_level);
 
 // A class to build a leveled compaction step-by-step.
 class LevelCompactionBuilder {
@@ -127,6 +605,9 @@ class LevelCompactionBuilder {
   // a compaction is picked.
   bool PickSizeBasedIntraL0Compaction();
 
+  // ST-compaction (Mind.md): all non-compacting SSTs on start_level_ (>0).
+  bool TryPickWholeLevelNonL0ST();
+
   // Return true if TrivialMove is extended. `start_index` is the index of
   // the initial file picked, which should already be in `start_level_inputs_`.
   bool TryExtendNonL0TrivialMove(int start_index,
@@ -172,6 +653,115 @@ class LevelCompactionBuilder {
 void LevelCompactionBuilder::PickFileToCompact(
     const autovector<std::pair<int, FileMetaData*>>& level_files,
     CompactToNextLevel compact_to_next_level) {
+  // Optional ST-aware preference: if multiple candidates exist for the same
+  // start/output level, prefer the one that is spatially closer to the
+  // output-level overlaps (Mind.md coarse+fine heuristic).
+  int preferred_idx = -1;
+  double preferred_score = std::numeric_limits<double>::infinity();
+  if (!level_files.empty()) {
+    for (size_t i = 0; i < level_files.size(); ++i) {
+      const int start_level = level_files[i].first;
+      FileMetaData* f = level_files[i].second;
+      if (f == nullptr || !f->has_st_file_meta) {
+        continue;
+      }
+      int out_level = start_level;
+      if (compact_to_next_level != CompactToNextLevel::kNo &&
+          (start_level < vstorage_->num_non_empty_levels() - 1)) {
+        out_level = (start_level == 0)
+                        ? StCompactionL0OutputLevel(mutable_cf_options_,
+                                                      vstorage_)
+                        : start_level + 1;
+      }
+      if (out_level <= 0 || out_level >= vstorage_->num_levels()) {
+        continue;
+      }
+      // Overlapping output-level files by key range (existing API), then
+      // coarse+fine spatial proximity scoring based on file-level ST meta.
+      std::vector<FileMetaData*> overlaps;
+      vstorage_->GetOverlappingInputs(out_level, &f->smallest, &f->largest, &overlaps);
+      if (overlaps.empty()) {
+        continue;
+      }
+
+      const auto& fm = f->st_file_meta;
+      const double base_edge = std::sqrt(std::max(ComputeMbrArea(fm), 1e-12));
+      const double coarse_th = SpatialProximityCoarseEdgeThreshold(out_level);
+      const uint32_t base_time_norm =
+          mutable_cf_options_.experimental_compaction_event_time_max_span;
+      const uint32_t time_norm = std::max<uint32_t>(
+          1, ComputeStEventSplitLevelPolicy(out_level, base_time_norm)
+                 .effective_max_time_span);
+
+      double best_score = std::numeric_limits<double>::infinity();
+      bool coarse_any = false;
+
+      for (FileMetaData* g : overlaps) {
+        if (g == nullptr || !g->has_st_file_meta) {
+          continue;
+        }
+        const auto& gm = g->st_file_meta;
+
+        bool coarse_ok = false;
+        if (MbrIntersects(fm, gm)) {
+          coarse_ok = true;
+        } else {
+          const double d_edge = EdgeDistance(fm, gm);
+          const double d_norm = d_edge / std::max(base_edge, 1e-6);
+          coarse_ok = (d_norm <= coarse_th);
+        }
+        if (!coarse_ok) {
+          continue;
+        }
+        coarse_any = true;
+        best_score = std::min(best_score, SpatialProximityFineScore(f, g, time_norm));
+      }
+
+      if (coarse_any && best_score < preferred_score) {
+        preferred_score = best_score;
+        preferred_idx = static_cast<int>(i);
+      }
+    }
+  }
+
+  auto try_pick_at = [&](size_t idx) -> bool {
+    auto level_file = level_files[idx];
+    // If it's being compacted it has nothing to do here.
+    assert(!level_file.second->being_compacted);
+    start_level_ = level_file.first;
+    if ((compact_to_next_level == CompactToNextLevel::kSkipLastLevel &&
+         start_level_ == vstorage_->num_non_empty_levels() - 1) ||
+        (start_level_ == 0 &&
+         !compaction_picker_->level0_compactions_in_progress()->empty())) {
+      return false;
+    }
+
+    if (compact_to_next_level != CompactToNextLevel::kNo &&
+        (start_level_ < vstorage_->num_non_empty_levels() - 1)) {
+      output_level_ =
+          (start_level_ == 0)
+              ? StCompactionL0OutputLevel(mutable_cf_options_, vstorage_)
+              : start_level_ + 1;
+    } else {
+      output_level_ = start_level_;
+    }
+    start_level_inputs_.files = {level_file.second};
+    start_level_inputs_.level = start_level_;
+    if (compaction_picker_->ExpandInputsToCleanCut(cf_name_, vstorage_,
+                                                   &start_level_inputs_)) {
+      return true;
+    }
+    return false;
+  };
+
+  if (preferred_idx >= 0) {
+    if (try_pick_at(static_cast<size_t>(preferred_idx))) {
+      return;
+    }
+    // Fall through to default order if preferred choice cannot form a clean cut.
+    start_level_inputs_.files.clear();
+  }
+
   for (auto& level_file : level_files) {
     // If it's being compacted it has nothing to do here.
     // If this assert() fails that means that some function marked some
@@ -190,7 +780,9 @@ void LevelCompactionBuilder::PickFileToCompact(
     if (compact_to_next_level != CompactToNextLevel::kNo &&
         (start_level_ < vstorage_->num_non_empty_levels() - 1)) {
       output_level_ =
-          (start_level_ == 0) ? vstorage_->base_level() : start_level_ + 1;
+          (start_level_ == 0)
+              ? StCompactionL0OutputLevel(mutable_cf_options_, vstorage_)
+              : start_level_ + 1;
     } else {
       output_level_ = start_level_;
     }
@@ -204,23 +796,172 @@ void LevelCompactionBuilder::PickFileToCompact(
   start_level_inputs_.files.clear();
 }
 
+// Write-pressure signal for adaptive compaction scope.
+// Uses L0 file count as a direct proxy: L0 files are produced by flushes,
+// so L0 backlog == how much write pressure the system is under.
+enum class WritePressure { IDLE, NORMAL, HIGH };
+
+WritePressure ComputeWritePressure(const VersionStorageInfo* vstorage,
+                                    int l0_compaction_trigger) {
+  int l0_count = static_cast<int>(vstorage->LevelFiles(0).size());
+  if (l0_count == 0) return WritePressure::IDLE;
+  if (l0_compaction_trigger > 0 &&
+      l0_count >= 2 * l0_compaction_trigger)
+    return WritePressure::HIGH;
+  return WritePressure::NORMAL;
+}
+
 void LevelCompactionBuilder::SetupInitialFiles() {
   // Find the compactions by size on all levels.
   bool skipped_l0_to_base = false;
-  for (int i = 0; i < compaction_picker_->NumberLevels() - 1; i++) {
+  const int num_score_slots = compaction_picker_->NumberLevels() - 1;
+
+  // ST-compaction: if L0 still needs work but a deeper level sorts first by
+  // score, prefer L0 before considering deeper levels.
+  if (mutable_cf_options_.experimental_st_compaction &&
+      ioptions_.compaction_style == kCompactionStyleLevel &&
+      num_score_slots > 0) {
+    const double l0_score =
+        GetCompactionScoreForLevel(vstorage_, 0, num_score_slots);
+    if (l0_score >= 1.0 && vstorage_->CompactionScoreLevel(0) != 0) {
+      start_level_ = 0;
+      start_level_score_ = l0_score;
+      output_level_ =
+          StCompactionL0OutputLevel(mutable_cf_options_, vstorage_);
+      if (PickFileToCompact()) {
+        compaction_reason_ = CompactionReason::kLevelL0FilesNum;
+        return;
+      }
+      start_level_inputs_.clear();
+      skipped_l0_to_base = true;
+      if (PickIntraL0Compaction()) {
+        output_level_ = 0;
+        compaction_reason_ = CompactionReason::kLevelL0FilesNum;
+        return;
+      }
+    }
+  }
+
+  // Write-pressure adaptive threshold: when idle, proactively compact
+  // at a lower threshold. When under high write pressure, skip non-L0
+  // compaction entirely — let L0 backlog clear first.
+  const WritePressure wp = ComputeWritePressure(
+      vstorage_,
+      mutable_cf_options_.level0_file_num_compaction_trigger);
+  constexpr double kIdleScoreThreshold = 0.7;
+  const double effective_threshold =
+      (wp == WritePressure::IDLE) ? kIdleScoreThreshold : 1.0;
+
+  // ── STFR Trigger A: intra-level neighbor merge (ALL non-L0 levels) ──
+  // Scan ALL non-L0, non-last levels for files with small ΔS (close in
+  // spatiotemporal position). Merge them in-place (output = start_level)
+  // to reduce run count without pushing data deeper.
+  if (start_level_inputs_.empty() &&
+      wp != WritePressure::HIGH &&
+      mutable_cf_options_.experimental_st_compaction_l1_l2_tiered &&
+      mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2 &&
+      mutable_cf_options_.experimental_st_compaction_stfp_enable) {
+    // Trigger A uses per-level envelope (not global) to avoid
+    // normalization collapse: a 20-year global span would flatten all
+    // local time differences to near-zero, making DeltaS meaningless.
+    for (int lvl = 1; lvl < vstorage_->num_levels() - 1; ++lvl) {
+      const auto& files = vstorage_->LevelFiles(lvl);
+      if (files.size() < 2) continue;
+      GlobalEnvelope env = ComputeLevelEnvelope(files);
+      if (!env.valid) continue;
+      std::vector<FileMetaData*> pair;
+      FindBestNeighborPair(files, env, &pair);
+      if (pair.size() >= 2) {
+        start_level_inputs_.level = lvl;
+        start_level_inputs_.files = std::move(pair);
+        // Intra-level: merge neighbors back into the same level.
+        output_level_ = lvl;
+        start_level_ = lvl;
+        compaction_reason_ = CompactionReason::kLevelMaxLevelSize;
+        break;
+      }
+    }
+  }
+
+  // ── STFR Trigger B: bloated file push-down (IDLE only, ALL non-L0 levels) ──
+  // When idle, identify files with large MBR but low data density.
+  // Push them down to the next level for consolidation.
+  if (start_level_inputs_.empty() &&
+      wp == WritePressure::IDLE &&
+      mutable_cf_options_.experimental_st_compaction_l1_l2_tiered &&
+      mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2 &&
+      mutable_cf_options_.experimental_st_compaction_stfp_enable) {
+    for (int lvl = 1; lvl < vstorage_->num_levels() - 1; ++lvl) {
+      const auto& files = vstorage_->LevelFiles(lvl);
+      for (auto* f : files) {
+        if (f == nullptr || f->being_compacted) continue;
+        if (IsBloatedFile(f, 1.0)) {
+          start_level_inputs_.level = lvl;
+          start_level_inputs_.files.push_back(f);
+          // Find best-IoU neighbor in the next level to merge with.
+          const auto& next_files = vstorage_->LevelFiles(lvl + 1);
+          double best_iou = -1.0;
+          FileMetaData* best_nf = nullptr;
+          for (auto* nf : next_files) {
+            if (nf == nullptr || nf->being_compacted) continue;
+            if (!f->has_st_file_meta || !nf->has_st_file_meta) continue;
+            double iou = MbrIou(f->st_file_meta, nf->st_file_meta);
+            if (iou > best_iou) { best_iou = iou; best_nf = nf; }
+          }
+          if (best_nf != nullptr) {
+            start_level_inputs_.files.push_back(best_nf);
+          }
+          output_level_ = lvl + 1;
+          start_level_ = lvl;
+          compaction_reason_ = CompactionReason::kLevelMaxLevelSize;
+          break;
+        }
+      }
+      if (!start_level_inputs_.empty()) break;
+    }
+  }
+
+  if (!start_level_inputs_.empty()) {
+    return;
+  }
+
+  for (int i = 0; i < num_score_slots; i++) {
     start_level_score_ = vstorage_->CompactionScore(i);
     start_level_ = vstorage_->CompactionScoreLevel(i);
     assert(i == 0 || start_level_score_ <= vstorage_->CompactionScore(i - 1));
-    if (start_level_score_ >= 1) {
-      if (skipped_l0_to_base && start_level_ == vstorage_->base_level()) {
-        // If L0->base_level compaction is pending, don't schedule further
-        // compaction from base level. Otherwise L0->base_level compaction
-        // may starve.
+
+    // HIGH write pressure: skip non-L0 compaction (only L0→L1 allowed).
+    if (wp == WritePressure::HIGH && start_level_ > 0) continue;
+
+    if (start_level_score_ >= effective_threshold) {
+      const int l0_dest_level =
+          StCompactionL0OutputLevel(mutable_cf_options_, vstorage_);
+      if (skipped_l0_to_base && start_level_ == l0_dest_level) {
+        // If L0->dest compaction is pending, don't schedule further compaction
+        // from the destination level. Otherwise L0->dest may starve.
         continue;
       }
-      output_level_ =
-          (start_level_ == 0) ? vstorage_->base_level() : start_level_ + 1;
-      bool picked_file_to_compact = PickFileToCompact();
+      if (mutable_cf_options_.experimental_st_compaction &&
+          ioptions_.compaction_style == kCompactionStyleLevel &&
+          start_level_ > 0) {
+        const int max_out = vstorage_->MaxOutputLevel(
+            ioptions_.cf_allow_ingest_behind || ioptions_.allow_ingest_behind);
+        output_level_ =
+            (start_level_ >= max_out) ? start_level_ : start_level_ + 1;
+      } else {
+        output_level_ = (start_level_ == 0)
+                            ? StCompactionL0OutputLevel(mutable_cf_options_,
+                                                        vstorage_)
+                            : start_level_ + 1;
+      }
+      bool picked_file_to_compact = false;
+      if (mutable_cf_options_.experimental_st_compaction &&
+          ioptions_.compaction_style == kCompactionStyleLevel &&
+          start_level_ > 0) {
+        picked_file_to_compact = TryPickWholeLevelNonL0ST();
+      } else {
+        picked_file_to_compact = PickFileToCompact();
+      }
       TEST_SYNC_POINT_CALLBACK("PostPickFileToCompact",
                                &picked_file_to_compact);
       if (picked_file_to_compact) {
@@ -254,8 +995,58 @@ void LevelCompactionBuilder::SetupInitialFiles() {
       }
     } else {
       // Compaction scores are sorted in descending order, no further scores
-      // will be >= 1.
+      // will be >= effective_threshold.
       break;
+    }
+  }
+  // ST run-count trigger: when an ST-tiered level has more files (runs)
+  // than tiered_max_runs_per_level, select the best pair of runs to merge
+  // based on time+spatial overlap (ST-aware merge selection). The merged
+  // output goes to the next level (standard L(n)→L(n+1) tiered compaction),
+  // which reduces the run count in this level.
+  // Skip under HIGH write pressure — write throughput takes priority.
+  // Run-count trigger: applies to ALL real_tiered strategies.
+  // STFP additionally enables Trigger A + B via stfp_enable.
+  if (wp != WritePressure::HIGH &&
+      start_level_inputs_.empty() &&
+      mutable_cf_options_.experimental_st_compaction_l1_l2_tiered &&
+      mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2) {
+    const int max_runs =
+        mutable_cf_options_.experimental_st_compaction_tiered_max_runs_per_level;
+    if (max_runs > 0) {  // 0 = unlimited, never trigger
+      int tiered_min =
+          mutable_cf_options_.experimental_st_compaction_tiered_min_level;
+      if (tiered_min <= 0) tiered_min = 1;
+      for (int lvl = std::max(tiered_min, 1);
+           lvl < vstorage_->num_levels() - 1; ++lvl) {
+        const auto& files = vstorage_->LevelFiles(lvl);
+        // Count non-compacting files as runs
+        int active_runs = 0;
+        for (auto* f : files) {
+          if (f != nullptr && !f->being_compacted) ++active_runs;
+        }
+        if (active_runs <= max_runs) continue;
+
+        // Select a batch of runs to merge (one compaction job).
+        // NOTE: batch may span multiple calendar buckets. Cross-bucket
+        // SST coexistence is by design — st_file_meta time windows
+        // guarantee recall regardless of which bucket a segment lives in.
+        std::vector<FileMetaData*> merge_batch;
+        SelectBestMergeBatch(files, max_runs, &merge_batch);
+        if (merge_batch.size() < 2) continue;
+
+        // Found a level with too many runs. Compact the selected batch
+        // to the next level in one job (tiered: no output-level files
+        // are involved — enforced in SetupOtherInputsIfNeeded).
+        start_level_inputs_.level = lvl;
+        start_level_inputs_.files = std::move(merge_batch);
+        const int max_out = vstorage_->MaxOutputLevel(
+            ioptions_.cf_allow_ingest_behind || ioptions_.allow_ingest_behind);
+        output_level_ = (lvl >= max_out) ? lvl : lvl + 1;
+        start_level_ = lvl;
+        compaction_reason_ = CompactionReason::kLevelMaxLevelSize;
+        break;
+      }
     }
   }
   if (!start_level_inputs_.empty()) {
@@ -483,6 +1274,26 @@ bool LevelCompactionBuilder::SetupOtherInputsIfNeeded() {
   // spans of files that do not interact with any pending compactions, so don't
   // need to consider other levels.
   if (output_level_ != 0) {
+    // Unified Soft-Tiered: when real_tiered_l1_l2 is enabled, skip
+    // output-level involvement entirely. Output files are NOT read or
+    // rewritten, reducing write amp. Multiple sorted runs per level are
+    // allowed — trajectory data has no duplicate keys, so version
+    // resolution is unnecessary. The old Adaptive hysteresis and
+    // per-level tiered cutoff are removed; all levels >= tiered_min
+    // use tiered uniformly.
+    bool is_real_tiered = false;
+    if (mutable_cf_options_.experimental_st_compaction_l1_l2_tiered &&
+        mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2 &&
+        start_level_ >= 1) {
+      int tiered_min =
+          mutable_cf_options_.experimental_st_compaction_tiered_min_level;
+      if (tiered_min <= 0) tiered_min = 1;
+      int tiered_max =
+          mutable_cf_options_.experimental_st_compaction_tiered_max_level;
+      is_real_tiered = (start_level_ >= tiered_min &&
+                        (tiered_max <= 0 || start_level_ <= tiered_max));
+    }
+
     output_level_inputs_.level = output_level_;
     bool round_robin_expanding =
         ioptions_.compaction_pri == kRoundRobin &&
@@ -490,7 +1301,7 @@ bool LevelCompactionBuilder::SetupOtherInputsIfNeeded() {
     if (round_robin_expanding) {
       SetupOtherFilesWithRoundRobinExpansion();
     }
-    if (!is_l0_trivial_move_ &&
+    if (!is_real_tiered && !is_l0_trivial_move_ &&
         !compaction_picker_->SetupOtherInputs(
             cf_name_, mutable_cf_options_, vstorage_, &start_level_inputs_,
             &output_level_inputs_, &parent_index_, base_index_,
@@ -518,7 +1329,7 @@ bool LevelCompactionBuilder::SetupOtherInputsIfNeeded() {
       // of a currently running compaction, we cannot run it.
       return false;
     }
-    if (!is_l0_trivial_move_) {
+    if (!is_real_tiered && !is_l0_trivial_move_) {
       compaction_picker_->GetGrandparents(vstorage_, start_level_inputs_,
                                           output_level_inputs_, &grandparents_);
     }
@@ -922,6 +1733,11 @@ bool LevelCompactionBuilder::PickFileToCompact() {
 }
 
 bool LevelCompactionBuilder::PickIntraL0Compaction() {
+  if (mutable_cf_options_.experimental_st_compaction &&
+      ioptions_.compaction_style == kCompactionStyleLevel) {
+    // ST-compaction contract (Mind.md): clear L0 only via L0->L1, not L0->L0.
+    return false;
+  }
   start_level_inputs_.clear();
   const std::vector<FileMetaData*>& level_files =
       vstorage_->LevelFiles(0 /* level */);
@@ -941,6 +1757,10 @@ bool LevelCompactionBuilder::PickIntraL0Compaction() {
 
 bool LevelCompactionBuilder::PickSizeBasedIntraL0Compaction() {
   assert(start_level_ == 0);
+  if (mutable_cf_options_.experimental_st_compaction &&
+      ioptions_.compaction_style == kCompactionStyleLevel) {
+    return false;
+  }
   int base_level = vstorage_->base_level();
   if (base_level <= 0) {
     return false;
@@ -991,6 +1811,151 @@ bool LevelCompactionBuilder::PickSizeBasedIntraL0Compaction() {
   }
   output_level_ = 0;
   return true /* picked an intra-L0 compaction */;
+}
+
+
+bool LevelCompactionBuilder::TryPickWholeLevelNonL0ST() {
+  assert(start_level_ > 0);
+  start_level_inputs_.clear();
+  start_level_inputs_.level = start_level_;
+  const std::vector<FileMetaData*>& level_files =
+      vstorage_->LevelFiles(start_level_);
+  std::vector<FileMetaData*> candidates;
+  candidates.reserve(level_files.size());
+  for (auto* f : level_files) {
+    if (f != nullptr && !f->being_compacted) {
+      candidates.push_back(f);
+    }
+  }
+  if (candidates.empty()) {
+    return false;
+  }
+
+  const int max_out = vstorage_->MaxOutputLevel(
+      ioptions_.cf_allow_ingest_behind || ioptions_.allow_ingest_behind);
+  const int out_level =
+      (start_level_ >= max_out) ? start_level_ : start_level_ + 1;
+  const uint32_t base_time_norm =
+      mutable_cf_options_.experimental_compaction_event_time_max_span;
+  const uint32_t time_norm = std::max<uint32_t>(
+      1, ComputeStEventSplitLevelPolicy(out_level, base_time_norm)
+             .effective_max_time_span);
+  const double coarse_th = SpatialProximityCoarseEdgeThreshold(out_level);
+  constexpr double kMaxNeighborFineScore = 2.5;
+
+  FileMetaData* anchor = nullptr;
+  uint32_t anchor_t_min = UINT32_MAX;
+  for (FileMetaData* f : candidates) {
+    if (!f->has_st_file_meta) {
+      continue;
+    }
+    const uint32_t t = f->st_file_meta.t_min;
+    if (anchor == nullptr || t < anchor_t_min ||
+        (t == anchor_t_min &&
+         ioptions_.internal_comparator.Compare(f->smallest, anchor->smallest) <
+             0)) {
+      anchor = f;
+      anchor_t_min = t;
+    }
+  }
+  if (anchor == nullptr) {
+    anchor = candidates[0];
+    for (FileMetaData* f : candidates) {
+      if (ioptions_.internal_comparator.Compare(f->smallest, anchor->smallest) <
+          0) {
+        anchor = f;
+      }
+    }
+  }
+
+  std::vector<FileMetaData*> picked;
+  picked.push_back(anchor);
+  if (anchor->has_st_file_meta) {
+    const auto& am = anchor->st_file_meta;
+    const double base_edge = std::sqrt(std::max(ComputeMbrArea(am), 1e-12));
+    for (FileMetaData* f : candidates) {
+      if (f == anchor) {
+        continue;
+      }
+      bool include = false;
+      if (f->has_st_file_meta) {
+        const auto& fm = f->st_file_meta;
+        if (MbrIntersects(fm, am)) {
+          include = true;
+        } else {
+          const double d_edge = EdgeDistance(fm, am);
+          const double d_norm = d_edge / std::max(base_edge, 1e-6);
+          include = (d_norm <= coarse_th);
+        }
+        if (include) {
+          const double fine = SpatialProximityFineScore(f, anchor, time_norm);
+          include = fine <= kMaxNeighborFineScore;
+        }
+      } else if (ioptions_.internal_comparator.Compare(f->smallest,
+                                                         anchor->largest) <=
+                     0 &&
+                 ioptions_.internal_comparator.Compare(anchor->smallest,
+                                                     f->largest) <= 0) {
+        include = true;
+      }
+      if (include) {
+        picked.push_back(f);
+      }
+    }
+  } else {
+    picked = candidates;
+  }
+
+  std::sort(picked.begin(), picked.end(),
+            [&](const FileMetaData* a, const FileMetaData* b) {
+              return ioptions_.internal_comparator.Compare(a->smallest,
+                                                           b->smallest) < 0;
+            });
+  start_level_inputs_.files = std::move(picked);
+  if (start_level_inputs_.files.empty()) {
+    return false;
+  }
+  if (!compaction_picker_->ExpandInputsToCleanCut(cf_name_, vstorage_,
+                                                  &start_level_inputs_)) {
+    start_level_inputs_.clear();
+    return false;
+  }
+  output_level_ = out_level;
+
+  // Unified Soft-Tiered: when l1_l2_tiered + real_tiered_l1_l2 are both
+  // enabled, all levels >= tiered_min use tiered compaction uniformly.
+  // All picked files are kept (no 3-file soft cap). Output-level files
+  // are NOT involved (enforced in SetupOtherInputsIfNeeded). The old
+  // ComputeAdaptiveTieredMaxLevel hysteresis and per-level tiered_max
+  // cutoff are removed. Run-count is controlled by the new option
+  // experimental_st_compaction_tiered_max_runs_per_level.
+  int tiered_min = mutable_cf_options_.experimental_st_compaction_tiered_min_level;
+  if (tiered_min <= 0) tiered_min = 1;
+  int tiered_max = mutable_cf_options_.experimental_st_compaction_tiered_max_level;
+  bool is_tiered = (mutable_cf_options_.experimental_st_compaction_l1_l2_tiered &&
+                    mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2 &&
+                    start_level_ >= tiered_min &&
+                    (tiered_max <= 0 || start_level_ <= tiered_max));
+  if (is_tiered) {
+    // Real Tiered: keep ALL files (whole-level compaction).
+  } else if (mutable_cf_options_.experimental_st_compaction_l1_l2_tiered &&
+             !mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2 &&
+             start_level_ >= tiered_min) {
+    // Legacy soft-tiered path: capped at 3 files (for A/B comparison).
+    if (start_level_inputs_.files.size() > 3) {
+      start_level_inputs_.files.resize(3);
+    }
+  }
+
+  if (compaction_picker_->FilesRangeOverlapWithCompaction(
+          {start_level_inputs_}, output_level_,
+          Compaction::EvaluateProximalLevel(vstorage_, mutable_cf_options_,
+                                            ioptions_, start_level_,
+                                            output_level_))) {
+    start_level_inputs_.clear();
+    return false;
+  }
+  return true;
 }
 }  // namespace
 

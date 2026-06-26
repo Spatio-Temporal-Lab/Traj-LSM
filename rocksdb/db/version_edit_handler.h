@@ -9,6 +9,10 @@
 
 #pragma once
 
+#include <functional>
+#include <limits>
+
+#include "db/manifest_sst_prune_stats.h"
 #include "db/version_builder.h"
 #include "db/version_edit.h"
 #include "db/version_set.h"
@@ -118,6 +122,37 @@ class FileChecksumRetriever : public VersionEditHandlerBase {
       cf_file_checksums_;
 };
 
+// Query-time diagnostics: replay one MANIFEST shard and count live SST files
+// whose file-level ST bounds intersect a spatiotemporal window.
+class ManifestSstPruneStatsHandler : public VersionEditHandlerBase {
+ public:
+  explicit ManifestSstPruneStatsHandler(const ReadOptions& read_options,
+                                        uint32_t column_family_id_filter =
+                                            std::numeric_limits<uint32_t>::max())
+      : VersionEditHandlerBase(read_options),
+        column_family_id_filter_(column_family_id_filter) {}
+
+  ~ManifestSstPruneStatsHandler() override {}
+
+  void ComputeStats(uint32_t query_t_min, uint32_t query_t_max, float query_x_min,
+                    float query_x_max, float query_y_min, float query_y_max,
+                    bool enable_spatial_window,
+                    ManifestSstPruneStats* out) const;
+
+  void ForEachLiveFile(
+      const std::function<void(int level, const FileMetaData&)>& fn) const;
+
+ protected:
+  Status ApplyVersionEdit(VersionEdit& edit,
+                          ColumnFamilyData** /*unused*/) override;
+
+ private:
+  uint32_t column_family_id_filter_;
+  std::unordered_map<uint32_t,
+                     std::unordered_map<uint64_t, std::pair<int, FileMetaData>>>
+      live_files_by_cf_;
+};
+
 using VersionBuilderUPtr = std::unique_ptr<BaseReferencedVersionBuilder>;
 
 // A class used for scanning MANIFEST file.
@@ -147,12 +182,13 @@ class VersionEditHandler : public VersionEditHandlerBase {
       const ReadOptions& read_options, bool allow_incomplete_valid_version,
       EpochNumberRequirement epoch_number_requirement =
           EpochNumberRequirement::kMustPresent,
-      bool skip_load_table_files = false)
+      bool skip_load_table_files = false,
+      bool idempotent_manifest_file_edits = false)
       : VersionEditHandler(
             read_only, column_families, version_set,
             track_found_and_missing_files, no_error_if_files_missing, io_tracer,
             read_options, skip_load_table_files, allow_incomplete_valid_version,
-            epoch_number_requirement) {}
+            epoch_number_requirement, idempotent_manifest_file_edits) {}
 
   ~VersionEditHandler() override {}
 
@@ -165,6 +201,12 @@ class VersionEditHandler : public VersionEditHandlerBase {
       *db_id = version_edit_params_.GetDbId();
     }
   }
+
+  // M_manager multi-shard Recover: defer LoadTables/version install until the
+  // last shard MANIFEST is replayed (intermediate shards may reference SSTs
+  // superseded by later shards).
+  void SetMultiShardManifestReplay(bool v) { multi_shard_manifest_replay_ = v; }
+  void SetFinalShardInReplay(bool v) { final_shard_in_replay_ = v; }
 
   virtual Status VerifyFile(ColumnFamilyData* /*cfd*/,
                             const std::string& /*fpath*/, int /*level*/,
@@ -187,7 +229,8 @@ class VersionEditHandler : public VersionEditHandlerBase {
       const ReadOptions& read_options, bool skip_load_table_files,
       bool allow_incomplete_valid_version,
       EpochNumberRequirement epoch_number_requirement =
-          EpochNumberRequirement::kMustPresent);
+          EpochNumberRequirement::kMustPresent,
+      bool idempotent_manifest_file_edits = false);
 
   Status ApplyVersionEdit(VersionEdit& edit, ColumnFamilyData** cfd) override;
 
@@ -248,6 +291,9 @@ class VersionEditHandler : public VersionEditHandlerBase {
   // considered valid if the Version is never edited in an atomic group.
   const bool allow_incomplete_valid_version_;
   EpochNumberRequirement epoch_number_requirement_;
+  const bool idempotent_manifest_file_edits_;
+  bool multi_shard_manifest_replay_ = false;
+  bool final_shard_in_replay_ = true;
   std::unordered_set<uint32_t> cfds_to_mark_no_udt_;
 
  private:

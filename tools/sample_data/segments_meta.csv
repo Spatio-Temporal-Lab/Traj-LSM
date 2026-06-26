@@ -1,4 +1,4 @@
-segment_id,dataset,point_index,unix_time_s,lon,lat,alt_m,source_ref
+segment_id,dataset,point_count,t_start_unix,t_end_unix,lon_min,lon_max,lat_min,lat_max,source_ref
 tdrive:7343:7343_29,tdrive,187,1202410025,1202463427,116.30534,116.33493,40.02731,40.04822,part-00018
 tdrive:1867:1867_31,tdrive,39,1202115883,1202123772,116.35751,116.46542,39.90578,39.94012,part-00002
 tdrive:8088:8088_6,tdrive,15,1201971417,1201973383,116.34035,116.36465,39.94748,39.98957,part-00000

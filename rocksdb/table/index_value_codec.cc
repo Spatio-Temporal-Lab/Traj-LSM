@@ -40,7 +40,9 @@ void AppendSpatioTemporalIndexTail(std::string* dst,
   AppendFloatAsLittleEndianU32(dst, meta.y_min);
   AppendFloatAsLittleEndianU32(dst, meta.x_max);
   AppendFloatAsLittleEndianU32(dst, meta.y_max);
-  PutFixed64(dst, meta.bitmap);
+  for (uint64_t word : meta.bitmap_words) {
+    PutFixed64(dst, word);
+  }
 }
 
 Status DecodeSpatioTemporalIndexTail(Slice* input,
@@ -63,9 +65,10 @@ Status DecodeSpatioTemporalIndexTail(Slice* input,
       !ReadFloatFromLittleEndianU32(input, &y_max)) {
     return Status::Corruption("bad MBR floats");
   }
-  uint64_t bitmap = 0;
-  if (!GetFixed64(input, &bitmap)) {
-    return Status::Corruption("bad bitmap");
+  for (size_t i = 0; i < meta->bitmap_words.size(); ++i) {
+    if (!GetFixed64(input, &meta->bitmap_words[i])) {
+      return Status::Corruption("bad bitmap");
+    }
   }
   meta->t_min = t_min;
   meta->t_max = t_max;
@@ -73,7 +76,6 @@ Status DecodeSpatioTemporalIndexTail(Slice* input,
   meta->y_min = y_min;
   meta->x_max = x_max;
   meta->y_max = y_max;
-  meta->bitmap = bitmap;
   return Status::OK();
 }
 

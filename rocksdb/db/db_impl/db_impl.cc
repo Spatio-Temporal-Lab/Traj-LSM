@@ -181,7 +181,7 @@ bool IsGlobalSegmentUserKey(const Slice& user_key) {
   }
   const unsigned char magic =
       static_cast<unsigned char>(user_key.data()[0]);
-  return magic == kSpatioTemporalSegmentKeyMagic ||
+  return magic == kSpatioTemporalSegmentKeyLegacyMagic ||
          magic == kSpatioTemporalSegmentKeyTzidMagic;
 }
 
@@ -313,11 +313,26 @@ Status MaybeMaterializeGlobalSegmentValue(
   }
 
   DecodedGlobalSegmentValue decoded;
+  const bool e7_key =
+      user_key.size() > 0 &&
+      static_cast<unsigned char>(user_key.data()[0]) ==
+          kSpatioTemporalSegmentKeyTzidMagic;
+  const bool key_says_ghost = e7_key && IsE7GhostByKeyType(user_key);
+  if (e7_key && !key_says_ghost) {
+    // Key-first routing for E7: non-ghost can return immediately.
+    *applicable = true;
+    *was_ghost = false;
+    canonical_key->assign(user_key.data(), user_key.size());
+    return Status::OK();
+  }
   if (!DecodeGlobalSegmentValue(raw_value, &decoded)) {
     return Status::OK();
   }
   *applicable = true;
-  *was_ghost = decoded.is_ghost;
+  *was_ghost = e7_key ? key_says_ghost : decoded.is_ghost;
+  if (e7_key && key_says_ghost && !decoded.is_ghost) {
+    return Status::Corruption("E7 key marks ghost but value is not ghost");
+  }
   if (!decoded.is_ghost) {
     canonical_key->assign(user_key.data(), user_key.size());
     return Status::OK();

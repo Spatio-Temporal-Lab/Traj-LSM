@@ -43,7 +43,8 @@ class VersionBuilder {
                  ColumnFamilyData* cfd = nullptr,
                  VersionEditHandler* version_edit_handler = nullptr,
                  bool track_found_and_missing_files = false,
-                 bool allow_incomplete_valid_version = false);
+                 bool allow_incomplete_valid_version = false,
+                 bool idempotent_manifest_file_edits = false);
   ~VersionBuilder();
 
   bool CheckConsistencyForNumLevels();
@@ -126,12 +127,14 @@ class BaseReferencedVersionBuilder {
   explicit BaseReferencedVersionBuilder(
       ColumnFamilyData* cfd, VersionEditHandler* version_edit_handler = nullptr,
       bool track_found_and_missing_files = false,
-      bool allow_incomplete_valid_version = false);
+      bool allow_incomplete_valid_version = false,
+      bool idempotent_manifest_file_edits = false);
   BaseReferencedVersionBuilder(
       ColumnFamilyData* cfd, Version* v,
       VersionEditHandler* version_edit_handler = nullptr,
       bool track_found_and_missing_files = false,
-      bool allow_incomplete_valid_version = false);
+      bool allow_incomplete_valid_version = false,
+      bool idempotent_manifest_file_edits = false);
   ~BaseReferencedVersionBuilder();
   VersionBuilder* version_builder() const { return version_builder_.get(); }
 

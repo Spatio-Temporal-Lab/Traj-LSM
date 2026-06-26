@@ -248,6 +248,15 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
       moptions.experimental_global_master_ghost;
   cf_opts->experimental_global_verify_ghost =
       moptions.experimental_global_verify_ghost;
+  cf_opts->experimental_st_compaction = moptions.experimental_st_compaction;
+  cf_opts->experimental_st_compaction_level_trigger_ratio =
+      moptions.experimental_st_compaction_level_trigger_ratio;
+  cf_opts->experimental_st_compaction_l1_l2_tiered =
+      moptions.experimental_st_compaction_l1_l2_tiered;
+  cf_opts->experimental_st_compaction_tiered_max_level =
+      moptions.experimental_st_compaction_tiered_max_level;
+  cf_opts->experimental_st_compaction_tiered_max_runs_per_level =
+      moptions.experimental_st_compaction_tiered_max_runs_per_level;
   cf_opts->experimental_compaction_read_repair_first =
       moptions.experimental_compaction_read_repair_first;
   cf_opts->experimental_compaction_read_repair_min_reads =
@@ -260,6 +269,8 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
       moptions.experimental_compaction_spatial_hard_expansion_ratio;
   cf_opts->experimental_compaction_spatial_hard_min_file_size =
       moptions.experimental_compaction_spatial_hard_min_file_size;
+  cf_opts->experimental_st_block_mbr_flush_enable =
+      moptions.experimental_st_block_mbr_flush_enable;
   cf_opts->memtable_protection_bytes_per_key =
       moptions.memtable_protection_bytes_per_key;
   cf_opts->block_protection_bytes_per_key =

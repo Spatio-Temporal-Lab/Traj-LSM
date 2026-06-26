@@ -189,9 +189,11 @@ Status DiagnoseOneSst(const std::string& path, bool verify_checksum,
       } else {
         std::fprintf(stdout,
                      "  file ST bounds: t[%" PRIu32 ", %" PRIu32
-                     "] x[%.6g,%.6g] y[%.6g,%.6g] bitmap=%" PRIu64 "\n",
+                     "] x[%.6g,%.6g] y[%.6g,%.6g] bitmap=%016" PRIx64
+                     ":%016" PRIx64 ":%016" PRIx64 ":%016" PRIx64 "\n",
                      fm.t_min, fm.t_max, fm.x_min, fm.x_max, fm.y_min,
-                     fm.y_max, fm.bitmap);
+                     fm.y_max, fm.bitmap_words[0], fm.bitmap_words[1],
+                     fm.bitmap_words[2], fm.bitmap_words[3]);
         if (prune_window && prune_window->enable) {
           bool disjoint = StMetaDisjointFromQuery(fm, *prune_window);
           std::fprintf(stdout, "  file vs query window: %s\n",

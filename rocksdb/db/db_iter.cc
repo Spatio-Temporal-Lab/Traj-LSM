@@ -32,6 +32,7 @@
 #include "rocksdb/system_clock.h"
 #include "table/internal_iterator.h"
 #include "table/iterator_wrapper.h"
+#include "table/st_meta_user_key.h"
 #include "trace_replay/trace_replay.h"
 #include "util/mutexlock.h"
 #include "util/string_util.h"
@@ -93,6 +94,12 @@ DBIter::DBIter(Env* _env, const ReadOptions& read_options,
       allow_unprepared_value_(read_options.allow_unprepared_value),
       is_blob_(false),
       arena_mode_(arena_mode),
+      st_query_dedup_enable_(
+          read_options.experimental_st_prune_scan.enable &&
+          read_options.experimental_st_prune_scan
+              .query_dedup_by_segment_uid_enable),
+      st_query_segment_uid_dedup_(
+          read_options.experimental_st_prune_scan.query_segment_uid_dedup),
       range_tomb_max_seq_(0) {
   RecordTick(statistics_, NO_ITERATOR_CREATED);
   if (pin_thru_lifetime_) {
@@ -378,6 +385,14 @@ bool DBIter::PrepareValue() {
 // The prefix parameter, if not null, indicates that we need to iterate
 // within the prefix, and the iterator needs to be made invalid, if no
 // more entry for the prefix can be found.
+bool DBIter::StQueryDedupAcceptUserKey(const Slice& user_key,
+                                       const Slice& value) {
+  if (!st_query_dedup_enable_ || st_query_segment_uid_dedup_ == nullptr) {
+    return true;
+  }
+  return st_query_segment_uid_dedup_->AcceptEmitUserKey(user_key, value);
+}
+
 bool DBIter::FindNextUserEntry(bool skipping_saved_key) {
   PERF_TIMER_GUARD(find_next_user_entry_time);
   return FindNextUserEntryInternal(skipping_saved_key);
@@ -539,6 +554,11 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
               if (ikey_.type == kTypeValuePreferredSeqno) {
                 value = ParsePackedValueForValue(value);
               }
+              if (!StQueryDedupAcceptUserKey(ikey_.user_key, value)) {
+                MarkMemtableForFlushForPerOpTrigger(mem_hidden_op_scanned);
+                iter_.Next();
+                continue;
+              }
               SetValueAndColumnsFromPlain(value);
             }
 
@@ -553,6 +573,11 @@ bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key) {
                 ikey_.user_key,
                 !pin_thru_lifetime_ || !iter_.iter()->IsKeyPinned() /* copy */);
             // By now, we are sure the current ikey is going to yield a value
+            if (!StQueryDedupAcceptUserKey(ikey_.user_key, iter_.value())) {
+              MarkMemtableForFlushForPerOpTrigger(mem_hidden_op_scanned);
+              iter_.Next();
+              continue;
+            }
             current_entry_is_merged_ = true;
             valid_ = true;
             return MergeValuesNewToOld();  // Go to a different state machine

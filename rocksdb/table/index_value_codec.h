@@ -3,7 +3,8 @@
 // Extended layout when appended after a standard IndexValue encoding:
 //   [ existing IndexValue encoding ]
 //   [ uint32 LE T_min ][ uint32 LE T_max ]
-//   [ float32 LE x_min ][ y_min ][ x_max ][ y_max ][ uint64 LE bitmap ]
+//   [ float32 LE x_min ][ y_min ][ x_max ][ y_max ]
+//   [ 4 x uint64 LE bitmap_words ]   // 16x16 block-local bitmap
 
 #pragma once
 

@@ -38,6 +38,11 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+// Per-query segment_uid dedup state (Mind.md P0); defined in table/st_meta_user_key.h.
+struct StQuerySegmentUidDedup;
+// Manifest-level SST file filter; defined in db/manifest_ops.h.
+struct StManifestSstFilterResult;
+
 class Cache;
 class CompactionFilter;
 class CompactionFilterFactory;
@@ -993,14 +998,13 @@ struct DBOptions {
   // settings). Now it is essentially a minimum for the auto-tuned max manifest
   // file size.
   //
-  // Until the max_manifest_space_amp_pct feature is fully validated to show a
-  // smaller default here like 1MB is appropriate, the default value is 1GB to
-  // match historical behavior (without it being a hard limit in case of giant
-  // compacted manifest size).
+  // Default 4MB allows the auto-tuned max (compacted_size × space_amp) to
+  // take effect for typical ST workloads where compacted manifests are ~2-20MB.
+  // Set higher (e.g. 64MB) for DBs with very large numbers of SST files.
   //
   // This option is mutable with SetDBOptions(), taking effect on the next
   // manifest write (e.g. completed DB compaction or flush).
-  uint64_t max_manifest_file_size = 1024 * 1024 * 1024;
+  uint64_t max_manifest_file_size = 4 * 1024 * 1024;  // 4MB (ST: tuned for ~2-20MB compacted manifests)
 
   // If true, on DB close, read back the entire MANIFEST file and validate
   // CRC checksums and logical record content. If corruption is detected,
@@ -2323,9 +2327,8 @@ struct ReadOptions {
   // axis-aligned window. Also skips opening SST files (LevelIterator) when
   // FileMetaData::has_st_file_meta and file-level bounds are disjoint from this
   // window (same axis test); files with range deletions are never skipped.
-  // After SeekToFirst() and on Next(), also skips individual user keys whose
-  // decoded ST point (same magic layout) is disjoint from the window, inside
-  // blocks whose MBR still intersects the window.
+  // After SeekToFirst() and on Next(), skips user keys inside MBR-intersecting
+  // blocks when value decode finds no trajectory point in the query window.
   // Only applied after SeekToFirst() and on Next(); not applied to
   // Seek(key!=nullptr). User keys must use the st-meta prefix
   // (magic 0xE5 + t + lon + lat) so block-level meta is populated.
@@ -2336,11 +2339,22 @@ struct ReadOptions {
     // For strict experiments, set each sub-feature explicitly.
     bool file_level_enable = true;   // Skip opening SST files via Manifest/Version.
     bool block_level_enable = true;  // Skip data blocks via SST index tail.
+    // Seek index to E7 lower bound (bucket_id from q_t_min - lookback) instead of
+    // SeekToFirst + linear skip; uses index block binary search.
+    bool block_level_index_seek_lower_bound_enable = true;
+    uint32_t event_time_bucket_width_sec = 3600;
+    // Calendar buckets to subtract from floor(q_t_min/W) for index Seek lower bound.
+    // Default UINT32_MAX => bucket_id 0 (see kSpatioTemporalE7PruneSeekLookbackAll in
+    // st_meta_user_key.h). Use a smaller value only after validating recall.
+    uint32_t event_time_bucket_lookback = UINT32_MAX;
     bool key_level_enable = true;    // Skip individual (t,x,y) keys inside blocks.
     // When true with key_level_enable, only run key-level pruning on blocks whose
     // index ST MBR is not fully contained by the query window (interior blocks
     // skip per-key checks). No effect when key_level_enable is false.
     bool key_level_boundary_blocks_only_enable = false;
+    // After block MBR pruning, require at least one trajectory point in the
+    // query window (value decode). Conservative on decode failure.
+    bool value_level_point_truth_enable = true;
     // EXPERIMENTAL (fork): Build a per-query in-memory index on SST file
     // spatio-temporal bounds:
     //   1) Partition files by coarse time buckets (global across the level).
@@ -2406,6 +2420,15 @@ struct ReadOptions {
     // Internal diagnostics: per-key ST pruning inside data blocks (key-level).
     uint64_t* key_level_keys_examined = nullptr;
     uint64_t* key_level_keys_skipped_disjoint = nullptr;
+    uint64_t* key_level_keys_skipped_false_positive = nullptr;
+    // Query result dedup by logical segment_uid (cross-bucket replicas). Caller
+    // owns *query_segment_uid_dedup for the iterator lifetime.
+    bool query_dedup_by_segment_uid_enable = false;
+    StQuerySegmentUidDedup* query_segment_uid_dedup = nullptr;
+    // Manifest-level SST filter: pre-computed file numbers that pass per-SST
+    // st_file_meta time+spatial intersection. When non-null, iterator
+    // construction skips files not in the set. Caller must keep alive.
+    const StManifestSstFilterResult* manifest_sst_filter = nullptr;
     // Internal: per-file overlap result computed at file-open time
     // (LevelIterator/TableCache). Default preserves legacy behavior.
     STPruneResult file_level_overlap_result = STPruneResult::kIntersect;
@@ -2552,9 +2575,15 @@ struct FlushOptions {
   // all column families to be flushed in a single atomic operation.
   // Default: false (uses DBOptions::atomic_flush setting).
   bool force_atomic_flush;
+  // Spatio-temporal ingest: calendar host bucket for the next flush manifest
+  // route (MANIFEST-b). UINT64_MAX means unset (fallback heuristics apply).
+  uint64_t st_manifest_host_bucket;
 
   FlushOptions()
-      : wait(true), allow_write_stall(false), force_atomic_flush(false) {}
+      : wait(true),
+        allow_write_stall(false),
+        force_atomic_flush(false),
+        st_manifest_host_bucket(std::numeric_limits<uint64_t>::max()) {}
 };
 
 struct FlushWALOptions {
@@ -2621,12 +2650,17 @@ struct CompactionOptions {
   // Default: false
   bool allow_trivial_move;
 
+  // Spatio-temporal ingest: calendar host bucket for the next compaction
+  // manifest route (MANIFEST-b). UINT64_MAX means unset (fallback heuristics).
+  uint64_t st_manifest_host_bucket;
+
   CompactionOptions()
       : compression(kDisableCompressionOption),
         output_file_size_limit(std::numeric_limits<uint64_t>::max()),
         max_subcompactions(0),
         canceled(nullptr),
-        allow_trivial_move(false) {}
+        allow_trivial_move(false),
+        st_manifest_host_bucket(std::numeric_limits<uint64_t>::max()) {}
 };
 
 // For level based compaction, we can configure if we want to skip/force

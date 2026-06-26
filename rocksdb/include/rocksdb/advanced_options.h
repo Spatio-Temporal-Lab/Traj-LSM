@@ -379,6 +379,9 @@ struct AdvancedColumnFamilyOptions {
   // configured thresholds. Intended for trajectory workloads: align physical
   // SST boundaries with business time buckets / max span. Non-ST keys do not
   // trigger this path. Default: false.
+  // When set, SanitizeCfOptions() forces level_compaction_dynamic_level_bytes
+  // to false so L0 compactions follow L0->L1->... (not L0->last level), which
+  // keeps per-level ST split thresholds in st_event_split_policy.h meaningful.
   bool experimental_compaction_event_time_split = false;
   // Max inclusive time span (t_max - t_min) among ST keys already in the
   // current output file, after including the next key; if exceeded, cut before
@@ -403,24 +406,19 @@ struct AdvancedColumnFamilyOptions {
   // Weight multiplier for ST shape penalty (perimeter^2 / area).
   // Effective score ~= sampled_reads * (1 + weight * shape_penalty).
   double experimental_compaction_read_repair_shape_weight = 1.0;
-  // If > 0, evaluates spatial MBR expansion before adding the next ST key.
-  // Let old_area be current output-file MBR area and new_area be area after
-  // including the next ST key. If
-  //   (new_area - old_area) / max(old_area, tiny_eps)
-  // exceeds this threshold, mark a soft spatial split signal.
-  // The split is allowed only when enough ST keys are already present
-  // (`experimental_compaction_event_time_min_keys_per_file`).
-  // 0 = disable.
+  // If > 0, also enables ST Data Block MBR flush policy when
+  // experimental_spatio_temporal_meta_in_index_value is on. Ratio =
+  // (union_area - block_mbr_area) / max(block_mbr_area, eps). File-level spatial
+  // SST split is deprecated; this threshold drives FlushBlockPolicy only.
+  // When meta-in-index is on but this is 0, block policy uses default 2.5.
   double experimental_compaction_spatial_soft_expansion_ratio = 0.0;
-  // Hard spatial split threshold. Same ratio definition as above.
-  // If exceeded and current output file size >=
-  // `experimental_compaction_spatial_hard_min_file_size`, cut immediately.
-  // 0 = disable.
+  // Deprecated: file-level hard spatial SST split (unused; block policy only).
   double experimental_compaction_spatial_hard_expansion_ratio = 0.0;
-  // Minimum output SST size (bytes) required before allowing hard spatial
-  // split. Prevents pathological over-splitting of very small files.
-  // 0 = no minimum guard.
+  // Deprecated with file-level spatial split.
   uint64_t experimental_compaction_spatial_hard_min_file_size = 0;
+  // Enable ST MBR / bucket_id Data Block flush when building tables with
+  // experimental_spatio_temporal_meta_in_index_value (ingest + compaction).
+  bool experimental_st_block_mbr_flush_enable = true;
   // [experimental]
   // Enable Global manifest semantics for trajectory segment indexing:
   // master records live in their start-time shard, and other shards may carry
@@ -432,6 +430,60 @@ struct AdvancedColumnFamilyOptions {
   //
   // Dynamically changeable through SetOptions() API
   bool experimental_global_master_ghost = false;
+  // [experimental]
+  // When true with leveled compaction, use ST-compaction scheduling from
+  // Mind.md: L1+ trigger at (ratio * MaxBytesForLevel), whole-layer inputs for
+  // Lx->Lx+1, L0 output pinned to L1, prefer L0 when L0 still needs work but a
+  // deeper level has higher score, and disable intra-L0 compactions so L0
+  // drains only through L0->L1. Default: false.
+  bool experimental_st_compaction = false;
+  // Fraction of MaxBytesForLevel(Lx) at which Lx->Lx+1 may trigger (L1+ only).
+  // Must be in (0, 1]; default 0.9 per Mind.md.
+  double experimental_st_compaction_level_trigger_ratio = 0.9;
+  // When experimental_st_compaction is true, use Tiered/Universal compaction
+  // semantics for L1→L2 and L2→L3 (shallow levels: write-heavy). L3+ uses
+  // standard Leveled compaction (read-optimized). Default: false.
+  //
+  // Dynamically changeable through SetOptions() API
+  bool experimental_st_compaction_l1_l2_tiered = false;
+  // When >0, overrides adaptive tiered level detection with a fixed range.
+  // 0 = adaptive (default), 1 = L1 only, 2 = L1-L2, etc.
+  // Combine with tiered_min_level for sparse ranges (e.g. min=2 max=2 = L2 only).
+  //
+  // Dynamically changeable through SetOptions() API
+  int experimental_st_compaction_tiered_max_level = 0;
+  // When >0, tiered only applies to levels >= this value.
+  // 0 = default (start from L1). Use with tiered_max_level to define fixed range.
+  // e.g., min=2 max=2 = L2-only Tiered; min=1 max=2 = L1+L2 both Tiered.
+  //
+  // Dynamically changeable through SetOptions() API
+  int experimental_st_compaction_tiered_min_level = 0;
+  // When experimental_st_compaction_l1_l2_tiered is true, use real Tiered
+  // (intra-level-only merge) instead of the default soft Tiered (Leveled with
+  // file count capped at 3). Real Tiered compacts all files from L(n) into
+  // L(n+1) WITHOUT involving L(n+1) files in the merge, dramatically reducing
+  // write amplification. Read amplification increases but is alleviated by
+  // ST pruning.
+  //
+  // Dynamically changeable through SetOptions() API
+  bool experimental_st_compaction_real_tiered_l1_l2 = false;
+  // Maximum number of sorted runs allowed per non-L0 level under Tiered
+  // (experimental_st_compaction_l1_l2_tiered) compaction before triggering an
+  // intra-level merge. The merge selects runs with the highest time+spatial
+  // overlap (ST-aware) to maximize pruning efficiency. Merged runs stay in
+  // the same level (no cross-level read). 0 = unlimited (pure Tiered, never
+  // trigger intra-level merge). Default: 4.
+  //
+  // Dynamically changeable through SetOptions() API
+  int experimental_st_compaction_tiered_max_runs_per_level = 4;
+  // When true, enable STFP-specific compaction triggers: intra-level
+  // neighbor merge (Trigger A), bloated-file push-down (Trigger B), and
+  // ST-aware run-count merge. Only effective when l1_l2_tiered and
+  // real_tiered_l1_l2 are both true. Set to false for pure Hybrid or
+  // All-Tiered to isolate STFP's contribution.
+  //
+  // Dynamically changeable through SetOptions() API
+  bool experimental_st_compaction_stfp_enable = false;
   // [experimental]
   // If true, enforce ghost metadata consistency checks against the single
   // MasterMeta source during write path. Mismatch triggers fail-fast instead of

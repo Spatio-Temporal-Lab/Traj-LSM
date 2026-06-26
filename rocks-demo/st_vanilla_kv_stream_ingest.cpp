@@ -100,6 +100,58 @@ uint64_t Fnv1a64(const std::string& s) {
   return h;
 }
 
+bool ParseUnsignedDecimal(const std::string& text, uint64_t* out) {
+  if (out == nullptr || text.empty()) {
+    return false;
+  }
+  uint64_t value = 0;
+  for (char ch : text) {
+    if (ch < '0' || ch > '9') {
+      return false;
+    }
+    value = value * 10 + static_cast<uint64_t>(ch - '0');
+  }
+  *out = value;
+  return true;
+}
+
+void ParseSegmentIdForE7(const std::string& segment_id, uint64_t* vehicle_id,
+                         uint32_t* segment_seq, uint16_t* chunk_seq) {
+  if (vehicle_id == nullptr || segment_seq == nullptr || chunk_seq == nullptr) {
+    return;
+  }
+  *vehicle_id = Fnv1a64(segment_id);
+  *segment_seq = 0;
+  *chunk_seq = 0;
+
+  const size_t colon = segment_id.rfind(':');
+  const std::string tail =
+      (colon == std::string::npos) ? segment_id : segment_id.substr(colon + 1);
+  const size_t hash = tail.find('#');
+  const std::string main_part = tail.substr(0, hash);
+  const std::string chunk_part =
+      (hash == std::string::npos) ? std::string() : tail.substr(hash + 1);
+  const size_t underscore = main_part.rfind('_');
+  if (underscore != std::string::npos) {
+    uint64_t parsed_vehicle = 0;
+    if (ParseUnsignedDecimal(main_part.substr(0, underscore), &parsed_vehicle)) {
+      *vehicle_id = parsed_vehicle;
+    }
+    uint64_t parsed_segment = 0;
+    if (ParseUnsignedDecimal(main_part.substr(underscore + 1), &parsed_segment)) {
+      *segment_seq = static_cast<uint32_t>(parsed_segment);
+    }
+  }
+  if (chunk_part.size() >= 2 && chunk_part[0] == 'p') {
+    uint64_t parsed_chunk = 0;
+    if (ParseUnsignedDecimal(chunk_part.substr(1), &parsed_chunk)) {
+      *chunk_seq = static_cast<uint16_t>(parsed_chunk);
+      return;
+    }
+  }
+  *chunk_seq = 1;
+}
+
 bool ExtractStringField(const std::string& line, const std::string& key,
                         std::string* out) {
   const std::string needle = "\"" + key + "\"";
@@ -192,16 +244,7 @@ bool PutFromJsonl(rocksdb::DB* db, const std::string& jsonl_path,
       ++skipped;
       continue;
     }
-    // For legacy E6 key schema, also need MBR fields.
-    if (key_schema == "e6_mbr") {
-      if (!ExtractNumberField(line, "min_lon", &x_min) ||
-          !ExtractNumberField(line, "min_lat", &y_min) ||
-          !ExtractNumberField(line, "max_lon", &x_max) ||
-          !ExtractNumberField(line, "max_lat", &y_max)) {
-        ++skipped;
-        continue;
-      }
-    }
+    // E7 schema does not require MBR in key; MBR lives in value/meta.
     if (t_min_d < 0 || t_max_d < 0) {
       ++skipped;
       continue;
@@ -210,14 +253,12 @@ bool PutFromJsonl(rocksdb::DB* db, const std::string& jsonl_path,
     const uint32_t t_max = static_cast<uint32_t>(t_max_d);
     const uint64_t id = Fnv1a64(segment_id);
     const uint64_t zorder_start = static_cast<uint64_t>(zorder_start_d);
-    std::string key;
-    if (key_schema == "e7_tzid") {
-      key = StSegmentKeyTzid(t_min, t_max, zorder_start, id);
-    } else {
-      key = StSegmentKey(t_min, t_max, static_cast<float>(x_min),
-                         static_cast<float>(y_min), static_cast<float>(x_max),
-                         static_cast<float>(y_max), id);
-    }
+    uint64_t vehicle_id = 0;
+    uint32_t segment_seq = 0;
+    uint16_t chunk_seq = 0;
+    ParseSegmentIdForE7(segment_id, &vehicle_id, &segment_seq, &chunk_seq);
+    const std::string key =
+        StSegmentKeyTzid(t_min, zorder_start, vehicle_id, segment_seq, chunk_seq);
     // Keep full JSON line as value so later pipelines can parse points if needed.
     batch.Put(key, line);
     batch_bytes += key.size() + line.size() + 32;
@@ -254,7 +295,7 @@ int main(int argc, char** argv) {
   int write_buffer_mb = 256;
   std::string compression_name = "none";
   uint64_t block_size = 4096;
-  std::string key_schema = "e6_mbr";
+  std::string key_schema = "e7_tzid";
   bool experimental_global_master_ghost = false;
   bool experimental_global_verify_ghost = false;
 
@@ -289,7 +330,7 @@ int main(int argc, char** argv) {
              "    segment_id, t_min, t_max, mbr.{min_lon,min_lat,max_lon,max_lat}\n"
              "  --compression {none|snappy|zstd|lz4} (default: none)\n"
              "  --block-size <bytes> (default: 4096)\n"
-             "  --key-schema {e6_mbr|e7_tzid} (default: e6_mbr)\n"
+             "  --key-schema {e7_tzid} (default: e7_tzid)\n"
              "  --experimental-global-master-ghost\n"
              "      Enable Global Master/Ghost manifest semantics in CF options.\n"
              "  --experimental-global-verify-ghost\n"

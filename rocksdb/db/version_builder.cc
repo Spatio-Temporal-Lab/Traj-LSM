@@ -316,6 +316,10 @@ class VersionBuilder::Rep {
   // True if version is ever edited in an atomic group.
   bool edited_in_atomic_group_;
 
+  // Multi-manifest shard-route recover: tolerate duplicate adds / missing
+  // deletes across per-bucket MANIFEST replay order.
+  bool idempotent_manifest_file_edits_;
+
   // Flag to indicate if the Version is updated since last validity check. If no
   // `Apply` call is made between a `Rep`'s construction and a
   // `ValidVersionAvailable` check or between two `ValidVersionAvailable` calls.
@@ -332,7 +336,8 @@ class VersionBuilder::Rep {
       VersionSet* version_set,
       std::shared_ptr<CacheReservationManager> file_metadata_cache_res_mgr,
       ColumnFamilyData* cfd, VersionEditHandler* version_edit_handler,
-      bool track_found_and_missing_files, bool allow_incomplete_valid_version)
+      bool track_found_and_missing_files, bool allow_incomplete_valid_version,
+      bool idempotent_manifest_file_edits)
       : file_options_(file_options),
         ioptions_(ioptions),
         table_cache_(table_cache),
@@ -349,7 +354,8 @@ class VersionBuilder::Rep {
         cfd_(cfd),
         version_edit_handler_(version_edit_handler),
         track_found_and_missing_files_(track_found_and_missing_files),
-        allow_incomplete_valid_version_(allow_incomplete_valid_version) {
+        allow_incomplete_valid_version_(allow_incomplete_valid_version),
+        idempotent_manifest_file_edits_(idempotent_manifest_file_edits) {
     assert(ioptions_);
 
     levels_ = new LevelState[num_levels_];
@@ -387,6 +393,7 @@ class VersionBuilder::Rep {
         version_edit_handler_(other.version_edit_handler_),
         track_found_and_missing_files_(other.track_found_and_missing_files_),
         allow_incomplete_valid_version_(other.allow_incomplete_valid_version_),
+        idempotent_manifest_file_edits_(other.idempotent_manifest_file_edits_),
         found_files_(other.found_files_),
         l0_missing_files_(other.l0_missing_files_),
         non_l0_missing_files_(other.non_l0_missing_files_),
@@ -861,6 +868,9 @@ class VersionBuilder::Rep {
           << level << " since it is ";
       if (current_level ==
           VersionStorageInfo::FileLocation::Invalid().GetLevel()) {
+        if (idempotent_manifest_file_edits_) {
+          return Status::OK();
+        }
         oss << "not in the LSM tree";
       } else {
         oss << "on level " << current_level;
@@ -941,6 +951,9 @@ class VersionBuilder::Rep {
 
     if (current_level !=
         VersionStorageInfo::FileLocation::Invalid().GetLevel()) {
+      if (idempotent_manifest_file_edits_ && current_level == level) {
+        return Status::OK();
+      }
       if (level >= num_levels_) {
         has_invalid_levels_ = true;
       }
@@ -1716,11 +1729,12 @@ VersionBuilder::VersionBuilder(
     VersionSet* version_set,
     std::shared_ptr<CacheReservationManager> file_metadata_cache_res_mgr,
     ColumnFamilyData* cfd, VersionEditHandler* version_edit_handler,
-    bool track_found_and_missing_files, bool allow_incomplete_valid_version)
+    bool track_found_and_missing_files, bool allow_incomplete_valid_version,
+    bool idempotent_manifest_file_edits)
     : rep_(new Rep(file_options, ioptions, table_cache, base_vstorage,
                    version_set, file_metadata_cache_res_mgr, cfd,
                    version_edit_handler, track_found_and_missing_files,
-                   allow_incomplete_valid_version)) {}
+                   allow_incomplete_valid_version, idempotent_manifest_file_edits)) {}
 
 VersionBuilder::~VersionBuilder() = default;
 
@@ -1790,27 +1804,29 @@ void VersionBuilder::ClearSavePoint() { savepoint_.reset(nullptr); }
 
 BaseReferencedVersionBuilder::BaseReferencedVersionBuilder(
     ColumnFamilyData* cfd, VersionEditHandler* version_edit_handler,
-    bool track_found_and_missing_files, bool allow_incomplete_valid_version)
+    bool track_found_and_missing_files, bool allow_incomplete_valid_version,
+    bool idempotent_manifest_file_edits)
     : version_builder_(new VersionBuilder(
           cfd->current()->version_set()->file_options(), &cfd->ioptions(),
           cfd->table_cache(), cfd->current()->storage_info(),
           cfd->current()->version_set(),
           cfd->GetFileMetadataCacheReservationManager(), cfd,
           version_edit_handler, track_found_and_missing_files,
-          allow_incomplete_valid_version)),
+          allow_incomplete_valid_version, idempotent_manifest_file_edits)),
       version_(cfd->current()) {
   version_->Ref();
 }
 
 BaseReferencedVersionBuilder::BaseReferencedVersionBuilder(
     ColumnFamilyData* cfd, Version* v, VersionEditHandler* version_edit_handler,
-    bool track_found_and_missing_files, bool allow_incomplete_valid_version)
+    bool track_found_and_missing_files, bool allow_incomplete_valid_version,
+    bool idempotent_manifest_file_edits)
     : version_builder_(new VersionBuilder(
           cfd->current()->version_set()->file_options(), &cfd->ioptions(),
           cfd->table_cache(), v->storage_info(), v->version_set(),
           cfd->GetFileMetadataCacheReservationManager(), cfd,
           version_edit_handler, track_found_and_missing_files,
-          allow_incomplete_valid_version)),
+          allow_incomplete_valid_version, idempotent_manifest_file_edits)),
       version_(v) {
   assert(version_ != cfd->current());
 }

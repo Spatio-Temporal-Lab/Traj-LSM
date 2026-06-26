@@ -12,7 +12,7 @@ from pathlib import Path
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--csv", default="data/processed/generated/segments_points.csv")
+    ap.add_argument("--csv", default="data/processed/generated_p80_100/segments_points.csv")
     ap.add_argument("--max-rows", type=int, default=200000)
     args = ap.parse_args()
 

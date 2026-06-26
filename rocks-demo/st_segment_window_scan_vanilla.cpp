@@ -1,5 +1,5 @@
 // Scan default CF with **upstream RocksDB** (no fork headers): SeekToFirst..Next,
-// count keys whose user key lies in the spatio-temporal window (0xE5 point / 0xE6 segment).
+// count keys whose user key lies in the spatio-temporal window (E5 point / E7 segment).
 // Same window semantics as st_meta_read_bench full_scan mode=window for Wuxi segment DBs.
 //
 // Build: prefers rocksdb_vanilla/build[/Release]/rocksdb.lib (see tools/bootstrap_rocksdb_vanilla.ps1).
@@ -28,7 +28,6 @@ namespace {
 using rocksdb::Slice;
 
 constexpr unsigned char kMagicPoint = 0xE5;
-constexpr unsigned char kMagicSegment = 0xE6;
 constexpr unsigned char kMagicSegmentTzid = 0xE7;
 
 inline Slice UserKeyFromInternalKey(const Slice& internal_key) {
@@ -40,17 +39,17 @@ inline Slice UserKeyFromInternalKey(const Slice& internal_key) {
 }
 
 // DBIter usually yields internal key (user | seq+type). Some paths yield user keys
-// already; stripping 8 bytes then corrupts 0xE6 segment payloads (e.g. 25-byte user).
+// already; stripping 8 bytes then corrupts short user keys.
 inline Slice UserKeyFromIteratorKey(const Slice& raw) {
   Slice uk = UserKeyFromInternalKey(raw);
   if (uk.empty()) {
     return uk;
   }
   const auto m = static_cast<unsigned char>(uk[0]);
-  if (m == kMagicSegment && uk.size() < 25) {
+  if (m == kMagicPoint && uk.size() < 13) {
     return raw;
   }
-  if (m == kMagicPoint && uk.size() < 13) {
+  if (m == kMagicSegmentTzid && uk.size() < 31) {
     return raw;
   }
   return uk;
@@ -88,7 +87,31 @@ bool ConsumeFixed32BigEndian(Slice* s, uint32_t* out) {
   return true;
 }
 
-// Mirrors rocksdb/table/st_meta_user_key.cc UserKeySpatioTemporalInWindow for E5/E6 only.
+bool TryDecodeE7KeyStartTime(const Slice& user_key, uint32_t* t_start) {
+  if (t_start == nullptr || user_key.size() < 31 ||
+      static_cast<unsigned char>(user_key.data()[0]) != kMagicSegmentTzid) {
+    return false;
+  }
+  constexpr uint32_t kE7BucketSeconds = 3600;
+  const size_t payload_offset = user_key.size() >= 32 ? 2 : 1;
+  Slice s(user_key.data() + payload_offset, user_key.size() - payload_offset);
+  uint32_t bucket_id = 0;
+  if (!ConsumeFixed32BigEndian(&s, &bucket_id)) {
+    return false;
+  }
+  if (s.size() < 8) {
+    return false;
+  }
+  s.remove_prefix(8);
+  uint32_t t_start_offset = 0;
+  if (!ConsumeFixed32BigEndian(&s, &t_start_offset)) {
+    return false;
+  }
+  *t_start = bucket_id * kE7BucketSeconds + t_start_offset;
+  return true;
+}
+
+// Mirrors rocksdb/table/st_meta_user_key.cc UserKeySpatioTemporalInWindow for E5/E7 only.
 bool UserKeyStInWindow(const Slice& user_key, uint32_t t_min, uint32_t t_max, float x_min,
                        float x_max, float y_min, float y_max) {
   if (user_key.size() < 13) {
@@ -96,8 +119,7 @@ bool UserKeyStInWindow(const Slice& user_key, uint32_t t_min, uint32_t t_max, fl
   }
   const char* p = user_key.data();
   const auto magic = static_cast<unsigned char>(p[0]);
-  if (magic != kMagicPoint && magic != kMagicSegment &&
-      magic != kMagicSegmentTzid) {
+  if (magic != kMagicPoint && magic != kMagicSegmentTzid) {
     return false;
   }
   Slice s(p + 1, user_key.size() - 1);
@@ -122,37 +144,13 @@ bool UserKeyStInWindow(const Slice& user_key, uint32_t t_min, uint32_t t_max, fl
   if (magic == kMagicSegmentTzid) {
     // E7 key no longer guarantees in-key t_end/MBR. Keep key filtering
     // conservative and rely on value verification for the final answer.
-    if (user_key.size() < 5) {
-      return false;
-    }
     uint32_t t_start = 0;
-    if (!ConsumeFixed32BigEndian(&s, &t_start)) {
+    if (!TryDecodeE7KeyStartTime(user_key, &t_start)) {
       return false;
     }
     return t_start <= t_max;
   }
-  if (user_key.size() < 25) {
-    return false;
-  }
-  uint32_t t_start = 0, t_end = 0;
-  if (!ConsumeFixed32BigEndian(&s, &t_start) ||
-      !ConsumeFixed32BigEndian(&s, &t_end)) {
-    return false;
-  }
-  uint32_t xmin_bits = 0, ymin_bits = 0, xmax_bits = 0, ymax_bits = 0;
-  if (!ConsumeFixed32(&s, &xmin_bits) || !ConsumeFixed32(&s, &ymin_bits) ||
-      !ConsumeFixed32(&s, &xmax_bits) || !ConsumeFixed32(&s, &ymax_bits)) {
-    return false;
-  }
-  float kx_min = 0.f, ky_min = 0.f, kx_max = 0.f, ky_max = 0.f;
-  std::memcpy(&kx_min, &xmin_bits, sizeof(kx_min));
-  std::memcpy(&ky_min, &ymin_bits, sizeof(ky_min));
-  std::memcpy(&kx_max, &xmax_bits, sizeof(kx_max));
-  std::memcpy(&ky_max, &ymax_bits, sizeof(ky_max));
-  const bool time_intersects = !(t_start > t_max || t_end < t_min);
-  const bool space_intersects =
-      !(kx_min > x_max || kx_max < x_min || ky_min > y_max || ky_max < y_min);
-  return time_intersects && space_intersects;
+  return false;
 }
 
 bool ValueHasPointInWindow(const std::string& json_line, uint32_t t_min,

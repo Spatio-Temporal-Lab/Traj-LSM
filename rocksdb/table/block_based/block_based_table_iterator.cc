@@ -24,12 +24,70 @@ inline bool IsStLocalPruneShortCircuited(const ReadOptions& ro) {
          q.file_level_overlap_result == STPruneResult::kContains;
 }
 
+inline bool StPruneNeedsMaterializedDataBlock(const ReadOptions& ro) {
+  const auto& q = ro.experimental_st_prune_scan;
+  return q.enable &&
+         (q.key_level_enable || q.value_level_point_truth_enable);
+}
+
+void SeekStPruneIndexForScan(const ReadOptions& ro,
+                             InternalIteratorBase<IndexValue>* index_iter) {
+  const auto& q = ro.experimental_st_prune_scan;
+  if (!q.enable || !q.block_level_enable ||
+      !q.block_level_index_seek_lower_bound_enable) {
+    index_iter->SeekToFirst();
+    return;
+  }
+  std::string user_key;
+  AppendStPruneSeekLowerBoundUserKey(
+      q.t_min, q.event_time_bucket_width_sec, q.event_time_bucket_lookback,
+      3600.0, 149, q.event_time_bucket_lookback,
+      StUserKeySchemaPrefersTmanSt(), &user_key);
+  std::string ikey;
+  AppendInternalKey(
+      &ikey, ParsedInternalKey(user_key, kMaxSequenceNumber, kValueTypeForSeek));
+  index_iter->Seek(ikey);
+}
+
+// Check whether the index separator key's bucket_id exceeds the query's
+// maximum bucket_id. If so, all subsequent blocks start after the query
+// window (keys are sorted by bucket_id) and we can safely stop.
+// Returns true when iteration should stop.
+inline bool IndexBucketPastQueryWindow(const Slice& index_separator_key,
+                                        const ReadOptions::ExperimentalSpatioTemporalPruneScan& q) {
+  if (q.event_time_bucket_width_sec == 0) {
+    return false;  // no bucket width configured, cannot optimize
+  }
+  const Slice uk = UserKeyFromIteratorKey(index_separator_key);
+  if (uk.size() < 6) return false;
+  const unsigned char magic = static_cast<unsigned char>(uk.data()[0]);
+  // E7 segment key: bucket_id at bytes [2:6) big-endian
+  if (magic != kSpatioTemporalSegmentKeyTzidMagic) {
+    return false;  // not E7, skip optimization
+  }
+  const unsigned char* p = reinterpret_cast<const unsigned char*>(uk.data());
+  const uint32_t bucket_id = (static_cast<uint32_t>(p[2]) << 24) |
+                             (static_cast<uint32_t>(p[3]) << 16) |
+                             (static_cast<uint32_t>(p[4]) << 8) |
+                             static_cast<uint32_t>(p[5]);
+  const uint32_t max_query_bucket = q.t_max / q.event_time_bucket_width_sec;
+  // Conservative: stop only when bucket_id is strictly past max_query_bucket+1
+  // (+1 accounts for segments that start near the query end boundary)
+  return bucket_id > max_query_bucket + 1;
+}
+
 void AdvanceIndexPastPrunedForward(
     const ReadOptions& ro, InternalIteratorBase<IndexValue>* index_iter) {
   while (index_iter->Valid()) {
     if (!ro.experimental_st_prune_scan.enable ||
         !ro.experimental_st_prune_scan.block_level_enable ||
         IsStLocalPruneShortCircuited(ro)) {
+      break;
+    }
+    // Early termination: if index key's bucket_id is past the query window,
+    // all subsequent blocks are guaranteed not to contain the window.
+    if (IndexBucketPastQueryWindow(index_iter->key(),
+                                   ro.experimental_st_prune_scan)) {
       break;
     }
     const auto t0 = std::chrono::steady_clock::now();
@@ -92,7 +150,8 @@ void BlockBasedTableIterator::SeekSecondPass(const Slice* target) {
     assert(!Valid() || icomp_.Compare(*target, key()) <= 0);
   }
   if (target == nullptr && read_options_.experimental_st_prune_scan.enable &&
-      read_options_.experimental_st_prune_scan.key_level_enable &&
+      (read_options_.experimental_st_prune_scan.key_level_enable ||
+       read_options_.experimental_st_prune_scan.value_level_point_truth_enable) &&
       !IsStLocalPruneShortCircuited(read_options_) && Valid()) {
     st_prune_key_level_forward_active_ = true;
   }
@@ -195,7 +254,7 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
     if (target) {
       index_iter_->Seek(*target);
     } else {
-      index_iter_->SeekToFirst();
+      SeekStPruneIndexForScan(read_options_, index_iter_.get());
     }
     is_index_at_curr_block_ = true;
     if (!index_iter_->Valid()) {
@@ -220,9 +279,7 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
 
   if (!v.first_internal_key.empty() && !same_block &&
       (!target || icomp_.Compare(*target, v.first_internal_key) <= 0) &&
-      allow_unprepared_value_ &&
-      (!read_options_.experimental_st_prune_scan.enable ||
-       !read_options_.experimental_st_prune_scan.key_level_enable)) {
+      allow_unprepared_value_ && !StPruneNeedsMaterializedDataBlock(read_options_)) {
     // Index contains the first key of the block, and it's >= target.
     // We can defer reading the block.
     is_at_first_key_from_index_ = true;
@@ -279,7 +336,8 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
            icomp_.Compare(*target, key()) <= 0);
   }
   if (target == nullptr && read_options_.experimental_st_prune_scan.enable &&
-      read_options_.experimental_st_prune_scan.key_level_enable &&
+      (read_options_.experimental_st_prune_scan.key_level_enable ||
+       read_options_.experimental_st_prune_scan.value_level_point_truth_enable) &&
       !IsStLocalPruneShortCircuited(read_options_) && Valid()) {
     st_prune_key_level_forward_active_ = true;
   }
@@ -712,27 +770,40 @@ void BlockBasedTableIterator::FindKeyForward() {
         return;
       }
     }
-    if (!read_options_.experimental_st_prune_scan.enable ||
-        !read_options_.experimental_st_prune_scan.key_level_enable ||
-        IsStLocalPruneShortCircuited(read_options_) ||
+    const auto& q = read_options_.experimental_st_prune_scan;
+    if (!q.enable || IsStLocalPruneShortCircuited(read_options_) ||
         !st_prune_key_level_forward_active_) {
       return;
     }
-    if (StKeyLevelSkipBecauseBlockFullyContained()) {
+    if (!q.key_level_enable && !q.value_level_point_truth_enable) {
       return;
     }
-    const auto& q = read_options_.experimental_st_prune_scan;
+    if (q.key_level_enable && StKeyLevelSkipBecauseBlockFullyContained()) {
+      return;
+    }
     if (q.key_level_keys_examined != nullptr) {
       ++(*q.key_level_keys_examined);
     }
     const Slice ukey = ExtractUserKey(block_iter_.key());
-    if (!UserKeySpatioTemporalDisjointFromPruneScan(ukey, q)) {
-      return;
+    if (q.key_level_enable &&
+        UserKeySpatioTemporalDisjointFromPruneScan(ukey, q)) {
+      if (q.key_level_keys_skipped_disjoint != nullptr) {
+        ++(*q.key_level_keys_skipped_disjoint);
+      }
+      block_iter_.Next();
+      continue;
     }
-    if (q.key_level_keys_skipped_disjoint != nullptr) {
-      ++(*q.key_level_keys_skipped_disjoint);
+    if (q.value_level_point_truth_enable) {
+      const Slice val = block_iter_.value();
+      if (!KeyValueHasPointInSpatioTemporalWindow(ukey, val, q)) {
+        if (q.key_level_keys_skipped_false_positive != nullptr) {
+          ++(*q.key_level_keys_skipped_false_positive);
+        }
+        block_iter_.Next();
+        continue;
+      }
     }
-    block_iter_.Next();
+    return;
   }
 }
 
@@ -859,7 +930,8 @@ void BlockBasedTableIterator::FindBlockForward() {
       }
       IndexValue v = index_iter_->value();
 
-      if (!v.first_internal_key.empty() && allow_unprepared_value_) {
+      if (!v.first_internal_key.empty() && allow_unprepared_value_ &&
+          !StPruneNeedsMaterializedDataBlock(read_options_)) {
         // Index contains the first key of the block. Defer reading the block.
         is_at_first_key_from_index_ = true;
         return;

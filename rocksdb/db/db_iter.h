@@ -18,6 +18,7 @@
 #include "rocksdb/iterator.h"
 #include "rocksdb/wide_columns.h"
 #include "table/iterator_wrapper.h"
+#include "table/st_meta_user_key.h"
 #include "util/autovector.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -317,6 +318,8 @@ class DBIter final : public Iterator {
   bool IsVisible(SequenceNumber sequence, const Slice& ts,
                  bool* more_recent = nullptr);
 
+  bool StQueryDedupAcceptUserKey(const Slice& user_key, const Slice& value);
+
   // Temporarily pin the blocks that we encounter until ReleaseTempPinnedData()
   // is called
   void TempPinData() {
@@ -591,6 +594,8 @@ class DBIter final : public Iterator {
   bool allow_unprepared_value_;
   bool is_blob_;
   bool arena_mode_;
+  const bool st_query_dedup_enable_;
+  StQuerySegmentUidDedup* const st_query_segment_uid_dedup_;
 
   SequenceNumber range_tomb_max_seq_;
   IterKey range_tomb_first_key_;

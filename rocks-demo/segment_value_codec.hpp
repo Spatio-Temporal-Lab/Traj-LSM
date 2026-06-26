@@ -228,8 +228,11 @@ inline bool LoadSegmentPointsCsv(
     std::cerr << "Empty segment points CSV.\n";
     return false;
   }
-  std::unordered_map<std::string, std::map<int, SegmentPoint>> indexed;
+  // Per-segment vectors avoid std::map node overhead (~4GB CSV -> much lower RSS).
+  std::unordered_map<std::string, std::vector<std::pair<int, SegmentPoint>>> indexed;
+  indexed.reserve(150000);
   std::string line;
+  uint64_t lines = 0;
   while (std::getline(in, line)) {
     if (line.empty()) {
       continue;
@@ -245,16 +248,28 @@ inline bool LoadSegmentPointsCsv(
     p.unix_s = static_cast<uint32_t>(std::stoul(f[3]));
     p.lon = static_cast<float>(std::stod(f[4]));
     p.lat = static_cast<float>(std::stod(f[5]));
-    indexed[segment_id][point_index] = p;
+    indexed[segment_id].emplace_back(point_index, p);
+    if (++lines % 5000000 == 0) {
+      std::cerr << "  points CSV lines=" << lines << " segments=" << indexed.size()
+                << "\n";
+    }
   }
+  std::cerr << "  points CSV done lines=" << lines << " segments=" << indexed.size()
+            << " sorting...\n";
+  by_segment->reserve(indexed.size());
   for (auto& kv : indexed) {
+    auto& pairs = kv.second;
+    std::sort(pairs.begin(), pairs.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
     std::vector<SegmentPoint> vec;
-    vec.reserve(kv.second.size());
-    for (const auto& pr : kv.second) {
+    vec.reserve(pairs.size());
+    for (const auto& pr : pairs) {
       vec.push_back(pr.second);
     }
     (*by_segment)[std::move(kv.first)] = std::move(vec);
   }
+  indexed.clear();
+  indexed.rehash(0);
   return true;
 }
 

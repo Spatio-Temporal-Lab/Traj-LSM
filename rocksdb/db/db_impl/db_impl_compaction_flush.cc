@@ -464,6 +464,10 @@ Status DBImpl::FlushMemTablesToOutputFiles(
 
   const auto& bg_flush_arg = bg_flush_args[0];
   ColumnFamilyData* cfd = bg_flush_arg.cfd_;
+  if (bg_flush_arg.st_manifest_host_bucket_ !=
+      std::numeric_limits<uint64_t>::max()) {
+    versions_->SetNextManifestHostBucket(bg_flush_arg.st_manifest_host_bucket_);
+  }
   // intentional infrequent copy for each flush
   const MutableCFOptions mutable_cf_options_copy =
       cfd->GetLatestMutableCFOptions();
@@ -1522,6 +1526,11 @@ Status DBImpl::CompactFiles(const CompactionOptions& compact_options,
                                &manual_compaction_paused_)));
   {
     InstrumentedMutexLock l(&mutex_);
+    if (compact_options.st_manifest_host_bucket !=
+        std::numeric_limits<uint64_t>::max()) {
+      versions_->SetNextManifestHostBucket(
+          compact_options.st_manifest_host_bucket);
+    }
     auto* current = cfd->current();
     current->Ref();
 
@@ -2588,6 +2597,7 @@ Status DBImpl::FlushMemTable(ColumnFamilyData* cfd,
           IsRecoveryFlush(flush_reason)) {
         FlushRequest req{
             flush_reason, false /* atomic_flush */, {{cfd, flush_memtable_id}}};
+        req.st_manifest_host_bucket = flush_options.st_manifest_host_bucket;
         flush_reqs.emplace_back(std::move(req));
         memtable_ids_to_wait.emplace_back(
             cfd->imm()->GetLatestMemTableID(false /* for_atomic_flush */));
@@ -3676,7 +3686,8 @@ Status DBImpl::BackgroundFlush(bool* made_progress, JobContext* job_context,
       superversion_contexts.emplace_back(true);
       bg_flush_args.emplace_back(cfd, max_memtable_id,
                                  &(superversion_contexts.back()), flush_reason,
-                                 flush_req.atomic_flush);
+                                 flush_req.atomic_flush,
+                                 flush_req.st_manifest_host_bucket);
     }
     // `MaybeScheduleFlushOrCompaction` schedules as many `BackgroundCallFlush`
     // jobs as the number of `FlushRequest` in the `flush_queue_`, a.k.a

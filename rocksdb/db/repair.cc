@@ -576,6 +576,7 @@ class Repairer {
       t->meta.oldest_ancester_time = props->creation_time;
       t->meta.user_defined_timestamps_persisted =
           static_cast<bool>(props->user_defined_timestamps_persisted);
+      ExtractStFileBoundsFromTableProperties(*props, &t->meta);
     }
     if (status.ok()) {
       uint64_t tail_size = FileMetaData::CalculateTailSize(file_size, *props);

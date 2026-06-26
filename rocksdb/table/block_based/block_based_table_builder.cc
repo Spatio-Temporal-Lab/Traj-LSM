@@ -34,7 +34,7 @@
 #include "rocksdb/comparator.h"
 #include "rocksdb/env.h"
 #include "rocksdb/filter_policy.h"
-#include "rocksdb/flush_block_policy.h"
+#include "table/block_based/st_mbr_flush_block_policy.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/table.h"
 #include "rocksdb/types.h"
@@ -1096,9 +1096,8 @@ struct BlockBasedTableBuilder::Rep {
         reason(tbo.reason),
         target_file_size_is_upper_bound(
             tbo.moptions.target_file_size_is_upper_bound),
-        flush_block_policy(
-            table_options.flush_block_policy_factory->NewFlushBlockPolicy(
-                table_options, data_block)),
+        flush_block_policy(NewDefaultOrStMbrFlushBlockPolicy(
+            table_options, tbo.moptions, data_block)),
         warm_cache_config(WarmCacheConfig::Compute(
             table_options.prepopulate_block_cache, reason)),
         create_context(&table_options, &ioptions, ioptions.stats,
@@ -2463,6 +2462,18 @@ void BlockBasedTableBuilder::WritePropertiesBlock(
         rep_->table_options.filter_policy != nullptr
             ? rep_->table_options.filter_policy->Name()
             : "";
+    if (rep_->table_options.experimental_spatio_temporal_meta_in_index_value) {
+      SpatioTemporalBlockMeta st_file_meta{};
+      bool st_file_meta_valid = false;
+      rep_->index_builder->AccumulateFileSpatioTemporalMetaForManifest(
+          &st_file_meta, &st_file_meta_valid);
+      if (st_file_meta_valid) {
+        std::string st_bounds;
+        AppendSpatioTemporalIndexTail(&st_bounds, st_file_meta);
+        rep_->props.user_collected_properties.insert(
+            {kExperimentalStFileBoundsPropertyName(), st_bounds});
+      }
+    }
     rep_->props.index_size =
         rep_->index_builder->IndexSize() + kBlockTrailerSize;
     rep_->props.comparator_name = rep_->ioptions.user_comparator != nullptr

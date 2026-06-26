@@ -8633,6 +8633,65 @@ void Java_org_rocksdb_ReadOptions_setAsyncIo(JNIEnv*, jobject, jlong jhandle,
   opt->async_io = static_cast<bool>(jasync_io);
 }
 
+namespace {
+
+void CopyExperimentalStPruneScanFromJava(
+    JNIEnv* env, jobject jscan,
+    ROCKSDB_NAMESPACE::ReadOptions::ExperimentalSpatioTemporalPruneScan* q) {
+  jclass cls = env->GetObjectClass(jscan);
+  q->enable = env->GetBooleanField(jscan, env->GetFieldID(cls, "enable", "Z"));
+  q->file_level_enable =
+      env->GetBooleanField(jscan, env->GetFieldID(cls, "fileLevelEnable", "Z"));
+  q->block_level_enable =
+      env->GetBooleanField(jscan, env->GetFieldID(cls, "blockLevelEnable", "Z"));
+  q->key_level_enable =
+      env->GetBooleanField(jscan, env->GetFieldID(cls, "keyLevelEnable", "Z"));
+  q->value_level_point_truth_enable = env->GetBooleanField(
+      jscan, env->GetFieldID(cls, "valueLevelPointTruthEnable", "Z"));
+  q->file_level_time_bucket_rtree_enable = env->GetBooleanField(
+      jscan, env->GetFieldID(cls, "fileLevelTimeBucketRtreeEnable", "Z"));
+  q->key_level_adaptive_gate_enable = env->GetBooleanField(
+      jscan, env->GetFieldID(cls, "keyLevelAdaptiveGateEnable", "Z"));
+  q->block_level_adaptive_gate_enable = env->GetBooleanField(
+      jscan, env->GetFieldID(cls, "blockLevelAdaptiveGateEnable", "Z"));
+  q->key_level_boundary_blocks_only_enable = env->GetBooleanField(
+      jscan, env->GetFieldID(cls, "keyLevelBoundaryBlocksOnlyEnable", "Z"));
+  q->key_level_disable_overlap_threshold = env->GetFloatField(
+      jscan, env->GetFieldID(cls, "keyLevelDisableOverlapThreshold", "F"));
+  q->block_level_disable_overlap_threshold = env->GetFloatField(
+      jscan, env->GetFieldID(cls, "blockLevelDisableOverlapThreshold", "F"));
+  q->t_min = static_cast<uint32_t>(
+      env->GetIntField(jscan, env->GetFieldID(cls, "tMinSec", "I")));
+  q->t_max = static_cast<uint32_t>(
+      env->GetIntField(jscan, env->GetFieldID(cls, "tMaxSec", "I")));
+  q->x_min = env->GetFloatField(jscan, env->GetFieldID(cls, "xMin", "F"));
+  q->y_min = env->GetFloatField(jscan, env->GetFieldID(cls, "yMin", "F"));
+  q->x_max = env->GetFloatField(jscan, env->GetFieldID(cls, "xMax", "F"));
+  q->y_max = env->GetFloatField(jscan, env->GetFieldID(cls, "yMax", "F"));
+}
+
+}  // namespace
+
+void Java_org_rocksdb_ReadOptions_setExperimentalStPruneScan(
+    JNIEnv* env, jclass, jlong jhandle, jobject jscan) {
+  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::ReadOptions*>(jhandle);
+  CopyExperimentalStPruneScanFromJava(env, jscan,
+                                      &opt->experimental_st_prune_scan);
+}
+
+void Java_org_rocksdb_ReadOptions_clearExperimentalStPruneScan(JNIEnv*, jclass,
+                                                             jlong jhandle) {
+  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::ReadOptions*>(jhandle);
+  opt->experimental_st_prune_scan =
+      ROCKSDB_NAMESPACE::ReadOptions::ExperimentalSpatioTemporalPruneScan{};
+}
+
+jboolean Java_org_rocksdb_ReadOptions_experimentalStPruneScanEnabled(
+    JNIEnv*, jclass, jlong jhandle) {
+  auto* opt = reinterpret_cast<ROCKSDB_NAMESPACE::ReadOptions*>(jhandle);
+  return static_cast<jboolean>(opt->experimental_st_prune_scan.enable);
+}
+
 /////////////////////////////////////////////////////////////////////
 // ROCKSDB_NAMESPACE::ComparatorOptions
 

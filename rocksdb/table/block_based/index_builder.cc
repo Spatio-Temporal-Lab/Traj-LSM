@@ -172,6 +172,7 @@ SpatioTemporalBlockMeta ShortenedIndexBuilder::FinalizeBlockStMetaForDataBlock(
   SpatioTemporalBlockMeta out{};
   if (block_st_meta_accumulator_valid_) {
     out = block_st_meta_accumulator_;
+    SetSpatioTemporalBitmapAll(&out);
   } else {
     // No st-encoded keys in this block: use bounds that intersect every finite
     // query window so experimental prune scan never skips the block.
@@ -181,7 +182,7 @@ SpatioTemporalBlockMeta ShortenedIndexBuilder::FinalizeBlockStMetaForDataBlock(
     out.x_max = std::numeric_limits<float>::infinity();
     out.y_min = -std::numeric_limits<float>::infinity();
     out.y_max = std::numeric_limits<float>::infinity();
-    out.bitmap = UINT64_MAX;
+    SetSpatioTemporalBitmapAll(&out);
   }
   block_st_meta_accumulator_valid_ = false;
   block_st_meta_accumulator_ = SpatioTemporalBlockMeta{};

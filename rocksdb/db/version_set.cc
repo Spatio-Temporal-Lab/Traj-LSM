@@ -11,9 +11,11 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cinttypes>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <list>
 #include <limits>
 #include <map>
@@ -111,6 +113,34 @@ bool ExperimentalManifestSetWriteEnabled() {
     return true;
   }
   return std::string(v) == "1";
+}
+
+bool ExperimentalManifestShardRouteEnabled() {
+  const char* v = std::getenv("ROCKSDB_EXPERIMENTAL_MANIFEST_SHARD_ROUTE");
+  if (v == nullptr) {
+    return false;
+  }
+  return std::string(v) == "1" || std::string(v) == "true";
+}
+
+bool ExperimentalManifestShardRouteEnabled(ColumnFamilySet* column_family_set) {
+  (void)column_family_set;
+  return ExperimentalManifestShardRouteEnabled();
+}
+
+uint32_t ExperimentalManifestShardBucketWidthSec() {
+  const char* v =
+      std::getenv("ROCKSDB_EXPERIMENTAL_MANIFEST_SHARD_BUCKET_WIDTH_SEC");
+  if (v == nullptr || *v == '\0') {
+    return 0;
+  }
+  char* end = nullptr;
+  const unsigned long parsed = std::strtoul(v, &end, 10);
+  if (end == v || *end != '\0' || parsed == 0 ||
+      parsed > static_cast<unsigned long>(UINT32_MAX)) {
+    return 0;
+  }
+  return static_cast<uint32_t>(parsed);
 }
 
 // Find File in LevelFilesBrief data structure
@@ -1035,6 +1065,16 @@ inline bool StFileDisjointFromExperimentalPruneScanWithDiag(
   if (q.file_level_files_considered != nullptr) {
     ++(*q.file_level_files_considered);
   }
+  // Manifest-level SST filter takes priority: if file not in pre-computed
+  // intersection set, treat as disjoint (skip). This is the design's
+  // "Manifest does per-SST st_file_meta time+spatial coarse filter".
+  if (q.manifest_sst_filter != nullptr && f != nullptr) {
+    if (q.manifest_sst_filter->file_numbers.find(f->fd.GetNumber()) ==
+        q.manifest_sst_filter->file_numbers.end()) {
+      return true;
+    }
+    // File passes manifest filter; fall through to per-file diag counters.
+  }
   if (!q.enable || !q.file_level_enable || f == nullptr || !f->has_st_file_meta) {
     if (q.file_level_files_missing_meta != nullptr) {
       ++(*q.file_level_files_missing_meta);
@@ -1803,11 +1843,11 @@ bool LevelIterator::TrySkipEightFilesWithAvx2(size_t i, size_t* next_i) const {
   }
   if (q.file_level_files_time_disjoint != nullptr) {
     *q.file_level_files_time_disjoint +=
-        static_cast<uint64_t>(__popcnt(static_cast<unsigned int>(time_mask)));
+        static_cast<uint64_t>(std::popcount(static_cast<unsigned int>(time_mask)));
   }
   if (q.file_level_files_space_disjoint != nullptr) {
     *q.file_level_files_space_disjoint +=
-        static_cast<uint64_t>(__popcnt(static_cast<unsigned int>(space_mask)));
+        static_cast<uint64_t>(std::popcount(static_cast<unsigned int>(space_mask)));
   }
   if (q.file_level_files_skipped != nullptr) {
     *q.file_level_files_skipped += 8;
@@ -3140,6 +3180,28 @@ void Version::AddIterators(const ReadOptions& read_options,
                            bool allow_unprepared_value) {
   assert(storage_info_.finalized_);
 
+  // Manifest-level SST filter (design: m_manager time filter + Manifest
+  // per-SST st_file_meta time+spatial filter). Computed once per query;
+  // LevelIterator and L0 handling use it to skip disjoint files.
+  std::unique_ptr<StManifestSstFilterResult> manifest_filter;
+  if (read_options.experimental_st_prune_scan.enable &&
+      read_options.experimental_st_prune_scan.file_level_enable &&
+      read_options.experimental_st_prune_scan.manifest_sst_filter == nullptr) {
+    manifest_filter.reset(new StManifestSstFilterResult(
+        ManifestFilterSstByStFileMeta(
+            storage_info_,
+            read_options.experimental_st_prune_scan.t_min,
+            read_options.experimental_st_prune_scan.t_max,
+            read_options.experimental_st_prune_scan.x_min,
+            read_options.experimental_st_prune_scan.x_max,
+            read_options.experimental_st_prune_scan.y_min,
+            read_options.experimental_st_prune_scan.y_max)));
+    // Cast away constness; the ReadOptions is effectively mutable for the
+    // iterator's lifetime. The unique_ptr keeps the filter alive.
+    const_cast<ReadOptions&>(read_options)
+        .experimental_st_prune_scan.manifest_sst_filter = manifest_filter.get();
+  }
+
   for (int level = 0; level < storage_info_.num_non_empty_levels(); level++) {
     AddIteratorsForLevel(read_options, soptions, merge_iter_builder, level,
                          allow_unprepared_value);
@@ -3199,24 +3261,63 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
       }
     }
   } else if (storage_info_.LevelFilesBrief(level).num_files > 0) {
-    // For levels > 0, we can use a concatenating iterator that sequentially
-    // walks through the non-overlapping files in the level, opening them
-    // lazily.
-    auto* mem = arena->AllocateAligned(sizeof(LevelIterator));
-    std::unique_ptr<TruncatedRangeDelIterator>** tombstone_iter_ptr = nullptr;
-    auto level_iter = new (mem) LevelIterator(
-        cfd_->table_cache(), read_options, soptions,
-        cfd_->internal_comparator(), &storage_info_.LevelFilesBrief(level),
-        mutable_cf_options_, cfd_->internal_stats()->GetFileReadHist(level),
-        TableReaderCaller::kUserIterator, IsFilterSkipped(level), level,
-        /*range_del_agg=*/nullptr,
-        /*compaction_boundaries=*/nullptr, allow_unprepared_value,
-        &tombstone_iter_ptr, db_statistics_, clock_);
-    if (read_options.ignore_range_deletions) {
-      merge_iter_builder->AddIterator(level_iter);
+    if (mutable_cf_options_.experimental_st_compaction_l1_l2_tiered) {
+      // Tiered multi-run mode: each file is an independent sorted run that
+      // may overlap with other files in the same level. Use per-file table
+      // iterators merged via MergingIterator (same pattern as L0). Trajectory
+      // data has no duplicate keys, so version resolution is unnecessary.
+      std::unique_ptr<TruncatedRangeDelIterator> tombstone_iter = nullptr;
+      for (size_t i = 0; i < storage_info_.LevelFilesBrief(level).num_files;
+           i++) {
+        const auto& file = storage_info_.LevelFilesBrief(level).files[i];
+        if (StFileDisjointFromExperimentalPruneScanWithDiag(file.file_metadata,
+                                                            read_options)) {
+          if (read_options.experimental_st_prune_scan
+                  .file_level_files_skipped != nullptr) {
+            ++(*read_options.experimental_st_prune_scan
+                    .file_level_files_skipped);
+          }
+          continue;
+        }
+        auto table_iter = cfd_->table_cache()->NewIterator(
+            read_options, soptions, cfd_->internal_comparator(),
+            *file.file_metadata, /*range_del_agg=*/nullptr,
+            mutable_cf_options_, nullptr,
+            cfd_->internal_stats()->GetFileReadHist(level),
+            TableReaderCaller::kUserIterator, arena,
+            /*skip_filters=*/false, /*level=*/level,
+            max_file_size_for_l0_meta_pin_,
+            /*smallest_compaction_key=*/nullptr,
+            /*largest_compaction_key=*/nullptr, allow_unprepared_value,
+            /*range_del_read_seqno=*/nullptr, &tombstone_iter,
+            /*maybe_pin_table_handle=*/true);
+        if (read_options.ignore_range_deletions) {
+          merge_iter_builder->AddIterator(table_iter);
+        } else {
+          merge_iter_builder->AddPointAndTombstoneIterator(
+              table_iter, std::move(tombstone_iter));
+        }
+      }
     } else {
-      merge_iter_builder->AddPointAndTombstoneIterator(
-          level_iter, nullptr /* tombstone_iter */, tombstone_iter_ptr);
+      // For levels > 0, we can use a concatenating iterator that sequentially
+      // walks through the non-overlapping files in the level, opening them
+      // lazily.
+      auto* mem = arena->AllocateAligned(sizeof(LevelIterator));
+      std::unique_ptr<TruncatedRangeDelIterator>** tombstone_iter_ptr = nullptr;
+      auto level_iter = new (mem) LevelIterator(
+          cfd_->table_cache(), read_options, soptions,
+          cfd_->internal_comparator(), &storage_info_.LevelFilesBrief(level),
+          mutable_cf_options_, cfd_->internal_stats()->GetFileReadHist(level),
+          TableReaderCaller::kUserIterator, IsFilterSkipped(level), level,
+          /*range_del_agg=*/nullptr,
+          /*compaction_boundaries=*/nullptr, allow_unprepared_value,
+          &tombstone_iter_ptr, db_statistics_, clock_);
+      if (read_options.ignore_range_deletions) {
+        merge_iter_builder->AddIterator(level_iter);
+      } else {
+        merge_iter_builder->AddPointAndTombstoneIterator(
+            level_iter, nullptr /* tombstone_iter */, tombstone_iter_ptr);
+      }
     }
   }
 }
@@ -4756,6 +4857,16 @@ void VersionStorageInfo::ComputeCompactionScore(
       } else if (level_total_bytes > MaxBytesForLevel(level)) {
         total_downcompact_bytes +=
             static_cast<double>(level_total_bytes - MaxBytesForLevel(level));
+      }
+      // ST-compaction (Mind.md): trigger Lx->Lx+1 when layer bytes reach
+      // (ratio * MaxBytesForLevel); scale score so threshold aligns at 1.0.
+      if (compaction_style_ == kCompactionStyleLevel &&
+          mutable_cf_options.experimental_st_compaction) {
+        const double ratio =
+            mutable_cf_options.experimental_st_compaction_level_trigger_ratio;
+        if (ratio > 0.0 && ratio <= 1.0) {
+          score /= ratio;
+        }
       }
     }
     compaction_level_[level] = level;
@@ -6474,6 +6585,7 @@ VersionSet::VersionSet(
       options_file_size_(0),
       pending_manifest_file_number_(0),
       manifest_set_generation_(0),
+      m_manager_file_number_(0),
       last_sequence_(0),
       last_allocated_sequence_(0),
       last_published_sequence_(0),
@@ -6679,6 +6791,9 @@ void VersionSet::Reset() {
   options_file_number_ = 0;
   pending_manifest_file_number_ = 0;
   manifest_set_generation_ = 0;
+  m_manager_file_number_ = 0;
+  next_manifest_host_bucket_ = std::numeric_limits<uint64_t>::max();
+  st_manifest_file_shard_index_.clear();
   last_sequence_.store(0);
   last_allocated_sequence_.store(0);
   last_published_sequence_.store(0);
@@ -6844,35 +6959,42 @@ bool TryBuildPendingManifestTimeBounds(
     }
   }
   if (!has_any) {
-  uint32_t bucket_width = 0;
-  bool bucket_width_initialized = false;
-  bool bucket_width_consistent = true;
-  for (auto cfd : *column_family_set) {
-    if (cfd->IsDropped() || !cfd->initialized()) {
-      continue;
+    // Shard-route mode: pending M_manager bounds must reflect this VersionEdit batch
+    // only (typically one hourly bucket per flush). Falling back to the full live
+    // LSM would collapse every shard to the dataset-wide [tmin,tmax].
+    if (ExperimentalManifestShardRouteEnabled()) {
+      return false;
     }
-    const uint32_t cfd_bucket_width =
-        cfd->GetLatestMutableCFOptions().experimental_compaction_event_time_bucket_width;
-    if (!bucket_width_initialized) {
-      bucket_width = cfd_bucket_width;
-      bucket_width_initialized = true;
-    } else if (bucket_width != cfd_bucket_width) {
-      // Keep a conservative fallback when CF settings are inconsistent.
-      bucket_width_consistent = false;
-    }
-    const VersionStorageInfo* vstorage = nullptr;
-    for (size_t vi = 0; vi < versions.size(); ++vi) {
-      if (versions[vi]->cfd()->GetID() == cfd->GetID()) {
-        vstorage = versions[vi]->storage_info();
-        break;
+    uint32_t bucket_width = 0;
+    bool bucket_width_initialized = false;
+    bool bucket_width_consistent = true;
+    for (auto cfd : *column_family_set) {
+      if (cfd->IsDropped() || !cfd->initialized()) {
+        continue;
       }
+      const uint32_t cfd_bucket_width =
+          cfd->GetLatestMutableCFOptions()
+              .experimental_compaction_event_time_bucket_width;
+      if (!bucket_width_initialized) {
+        bucket_width = cfd_bucket_width;
+        bucket_width_initialized = true;
+      } else if (bucket_width != cfd_bucket_width) {
+        // Keep a conservative fallback when CF settings are inconsistent.
+        bucket_width_consistent = false;
+      }
+      const VersionStorageInfo* vstorage = nullptr;
+      for (size_t vi = 0; vi < versions.size(); ++vi) {
+        if (versions[vi]->cfd()->GetID() == cfd->GetID()) {
+          vstorage = versions[vi]->storage_info();
+          break;
+        }
+      }
+      if (vstorage == nullptr) {
+        vstorage = cfd->current()->storage_info();
+      }
+      AggregateStFileTimeBoundsFromVersionStorage(vstorage, &min_t, &max_t,
+                                                    &has_any);
     }
-    if (vstorage == nullptr) {
-      vstorage = cfd->current()->storage_info();
-    }
-    AggregateStFileTimeBoundsFromVersionStorage(vstorage, &min_t, &max_t,
-                                                  &has_any);
-  }
     if (!has_any) {
       return false;
     }
@@ -6974,13 +7096,35 @@ bool TryBuildPendingManifestGlobalCounts(
     }
     const auto& mopts = cfd->GetLatestMutableCFOptions();
     const uint32_t cfd_id = cfd->GetID();
+    bucket_width_by_cf_id[cfd_id] =
+        mopts.experimental_compaction_event_time_bucket_width;
     if (mopts.experimental_global_master_ghost) {
       any_global_enabled = true;
       global_enabled_cf_ids.insert(cfd_id);
-      bucket_width_by_cf_id[cfd_id] =
-          mopts.experimental_compaction_event_time_bucket_width;
       if (mopts.experimental_global_verify_ghost) {
         verify_ghost = true;
+      }
+    }
+  }
+  // Maintenance tools often open with experimental_global_master_ghost=false
+  // but still append MANIFEST records. If we bail out entirely, MANIFEST_SET
+  // stores zeros and APIs like GetCurrentManifestGlobalCountsFilteredByTimeRange
+  // become misleading. Treat SSTs that carry file-level ST bounds (including
+  // ingested SSTs once ExtractStFileBoundsFromTableProperties runs) as signals
+  // that this manifest batch should still contribute global pressure stats.
+  if (!any_global_enabled) {
+    for (const auto* e : batch_edits) {
+      if (e == nullptr) {
+        continue;
+      }
+      for (const auto& nf : e->GetNewFiles()) {
+        if (nf.second.has_st_file_meta) {
+          any_global_enabled = true;
+          break;
+        }
+      }
+      if (any_global_enabled) {
+        break;
       }
     }
   }
@@ -6990,7 +7134,8 @@ bool TryBuildPendingManifestGlobalCounts(
     *out_verify_ghost = false;
     return false;
   }
-  // Stage-3 baseline for Global metrics (per Global-enabled CF only):
+  // Stage-3 baseline for Global metrics (mutable-global CFs, or any CF when the
+  // batch adds SSTs that already carry file-level ST bounds):
   // - each newly generated SST file contributes one master-side shard update
   // - ghost count is estimated from event-time bucket span using that CF's
   //   compaction_event_time_bucket_width:
@@ -7003,9 +7148,8 @@ bool TryBuildPendingManifestGlobalCounts(
       continue;
     }
     const uint32_t edit_cf_id = e->GetColumnFamily();
-    if (global_enabled_cf_ids.find(edit_cf_id) == global_enabled_cf_ids.end()) {
-      continue;
-    }
+    const bool cf_mutable_global =
+        global_enabled_cf_ids.find(edit_cf_id) != global_enabled_cf_ids.end();
     uint32_t bucket_width = 0;
     auto bw_it = bucket_width_by_cf_id.find(edit_cf_id);
     if (bw_it != bucket_width_by_cf_id.end()) {
@@ -7014,6 +7158,9 @@ bool TryBuildPendingManifestGlobalCounts(
     const bool can_estimate_ghosts = (bucket_width > 0);
     for (const auto& nf : e->GetNewFiles()) {
       const auto& f = nf.second;
+      if (!cf_mutable_global && !f.has_st_file_meta) {
+        continue;
+      }
       ++masters;
       if (f.has_st_file_meta && can_estimate_ghosts) {
         const uint64_t tmin = static_cast<uint64_t>(f.st_file_meta.t_min);
@@ -7031,6 +7178,85 @@ bool TryBuildPendingManifestGlobalCounts(
   *out_masters = masters;
   *out_ghosts = ghosts;
   *out_verify_ghost = verify_ghost;
+  return true;
+}
+
+bool TryBuildPendingManifestGlobalCountsFromLiveFiles(
+    ColumnFamilySet* column_family_set, const autovector<Version*>& versions,
+    bool pending_has_time_bounds, uint64_t pending_tmin, uint64_t pending_tmax,
+    bool pending_has_mbr_bounds, float pending_xmin, float pending_xmax,
+    float pending_ymin, float pending_ymax, uint64_t* out_masters,
+    uint64_t* out_ghosts) {
+  assert(out_masters != nullptr);
+  assert(out_ghosts != nullptr);
+  if (!pending_has_time_bounds) {
+    return false;
+  }
+  uint64_t masters = 0;
+  uint64_t ghosts = 0;
+  (void)ghosts;  // For now: true ghost references are not materialized here.
+
+  auto file_overlaps = [&](const FileMetaData* f) -> bool {
+    if (f == nullptr) {
+      return false;
+    }
+    // Some operational flows may have live SSTs without decoded ST file bounds
+    // at this stage. Count them as master-side pressure so MANIFEST_SET counters
+    // do not get stuck at 0 forever.
+    if (!f->has_st_file_meta) {
+      return true;
+    }
+    const uint64_t fmin = static_cast<uint64_t>(f->st_file_meta.t_min);
+    const uint64_t fmax = static_cast<uint64_t>(f->st_file_meta.t_max);
+    if (fmax < pending_tmin || fmin > pending_tmax) {
+      return false;
+    }
+    if (pending_has_mbr_bounds) {
+      const float xmin = f->st_file_meta.x_min;
+      const float xmax = f->st_file_meta.x_max;
+      const float ymin = f->st_file_meta.y_min;
+      const float ymax = f->st_file_meta.y_max;
+      if (xmax < pending_xmin || xmin > pending_xmax || ymax < pending_ymin ||
+          ymin > pending_ymax) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  for (auto cfd : *column_family_set) {
+    if (cfd->IsDropped() || !cfd->initialized()) {
+      continue;
+    }
+    const VersionStorageInfo* vstorage = nullptr;
+    for (size_t vi = 0; vi < versions.size(); ++vi) {
+      if (versions[vi]->cfd()->GetID() == cfd->GetID()) {
+        vstorage = versions[vi]->storage_info();
+        break;
+      }
+    }
+    if (vstorage == nullptr) {
+      vstorage = cfd->current()->storage_info();
+    }
+    if (vstorage == nullptr) {
+      continue;
+    }
+    const int levels = vstorage->num_levels();
+    for (int level = 0; level < levels; ++level) {
+      const auto& files = vstorage->LevelFiles(level);
+      for (FileMetaData* f : files) {
+        if (file_overlaps(f)) {
+          ++masters;
+        }
+      }
+    }
+  }
+
+  if (masters == 0) {
+    return false;
+  }
+  *out_masters = masters;
+  *out_ghosts = 0;
   return true;
 }
 
@@ -7081,21 +7307,559 @@ void GetCurrentManifestRetainedAndReferencedGlobalCounts(
   }
 }
 
+bool StPendingTimeRangeCrossesBuckets(uint64_t tmin, uint64_t tmax,
+                                    uint32_t bucket_width) {
+  if (bucket_width == 0 || tmax < tmin) {
+    return false;
+  }
+  return (tmax / bucket_width) > (tmin / bucket_width);
+}
+
+bool StManifestTimeRangesIntersect(uint64_t a_min, uint64_t a_max, uint64_t b_min,
+                                   uint64_t b_max) {
+  return !(a_max < b_min || b_max < a_min);
+}
+
+uint32_t ResolveManifestShardBucketWidth(ColumnFamilySet* column_family_set) {
+  if (column_family_set == nullptr) {
+    return 0;
+  }
+  uint32_t bucket_width = 0;
+  bool initialized = false;
+  bool consistent = true;
+  for (auto cfd : *column_family_set) {
+    if (cfd->IsDropped() || !cfd->initialized()) {
+      continue;
+    }
+    const uint32_t w =
+        cfd->GetLatestMutableCFOptions()
+            .experimental_compaction_event_time_bucket_width;
+    if (!initialized) {
+      bucket_width = w;
+      initialized = true;
+    } else if (bucket_width != w) {
+      consistent = false;
+    }
+  }
+  return (initialized && consistent) ? bucket_width : 0;
+}
+
+constexpr uint64_t kManifestHostBucketUnknown =
+    std::numeric_limits<uint64_t>::max();
+
+bool TryResolvePendingHostBucket(const autovector<Version*>& versions,
+                               const autovector<VersionEdit*>& batch_edits,
+                               uint32_t bucket_width, uint64_t* host_bucket) {
+  if (host_bucket == nullptr || bucket_width == 0) {
+    return false;
+  }
+  auto absorb_host_bucket = [&](uint32_t t_min) {
+    const uint64_t b = static_cast<uint64_t>(t_min) / bucket_width;
+    *host_bucket = (*host_bucket == kManifestHostBucketUnknown)
+                       ? b
+                       : std::min(*host_bucket, b);
+    return true;
+  };
+  *host_bucket = kManifestHostBucketUnknown;
+  bool any = false;
+  for (const auto* e : batch_edits) {
+    if (e == nullptr) {
+      continue;
+    }
+    for (const auto& nf : e->GetNewFiles()) {
+      if (!nf.second.has_st_file_meta) {
+        continue;
+      }
+      any = absorb_host_bucket(nf.second.st_file_meta.t_min) || any;
+    }
+    const uint32_t edit_cf_id = e->GetColumnFamily();
+    const Version* version = nullptr;
+    for (const Version* v : versions) {
+      if (v != nullptr && v->cfd()->GetID() == edit_cf_id) {
+        version = v;
+        break;
+      }
+    }
+    if (version == nullptr) {
+      continue;
+    }
+    const VersionStorageInfo* vstorage = version->storage_info();
+    for (const auto& del : e->GetDeletedFiles()) {
+      FileMetaData* f = vstorage->GetFileMetaDataByNumber(del.second);
+      if (f != nullptr && f->has_st_file_meta) {
+        any = absorb_host_bucket(f->st_file_meta.t_min) || any;
+      }
+    }
+  }
+  if (!any) {
+    return false;
+  }
+  return true;
+}
+
+bool TryDeriveSingleHostBucketFromTimeRange(uint64_t tmin, uint64_t tmax,
+                                          uint32_t bucket_width,
+                                          uint64_t* host_bucket) {
+  if (host_bucket == nullptr || bucket_width == 0) {
+    return false;
+  }
+  const uint64_t b0 = tmin / bucket_width;
+  const uint64_t b1 = tmax / bucket_width;
+  if (b0 != b1) {
+    return false;
+  }
+  *host_bucket = b0;
+  return true;
+}
+
+bool ManifestShardEntryCoversHostBucket(uint64_t tmin, uint64_t tmax,
+                                        uint32_t bucket_width,
+                                        uint64_t host_bucket) {
+  if (bucket_width == 0) {
+    return false;
+  }
+  constexpr uint64_t kTimeUnknownMin = 0;
+  constexpr uint64_t kTimeUnknownMax = std::numeric_limits<uint64_t>::max();
+  if (tmin == kTimeUnknownMin && tmax == kTimeUnknownMax) {
+    return false;
+  }
+  const uint64_t b0 = tmin / bucket_width;
+  const uint64_t b1 = tmax / bucket_width;
+  return host_bucket >= b0 && host_bucket <= b1;
+}
+
+size_t FindManifestIndexForHostBucket(
+    const std::vector<uint64_t>& manifest_numbers,
+    const std::vector<uint64_t>& host_buckets,
+    const std::vector<uint64_t>& time_mins,
+    const std::vector<uint64_t>& time_maxs, uint32_t bucket_width,
+    uint64_t host_bucket) {
+  size_t best_idx = manifest_numbers.size();
+  uint64_t best_span = std::numeric_limits<uint64_t>::max();
+  for (size_t i = 0; i < manifest_numbers.size(); ++i) {
+    if (i < host_buckets.size() &&
+        host_buckets[i] != kManifestHostBucketUnknown &&
+        host_buckets[i] == host_bucket) {
+      if (i < time_mins.size() && i < time_maxs.size()) {
+        constexpr uint64_t kTimeUnknownMin = 0;
+        constexpr uint64_t kTimeUnknownMax =
+            std::numeric_limits<uint64_t>::max();
+        if (time_mins[i] == kTimeUnknownMin &&
+            time_maxs[i] == kTimeUnknownMax) {
+          continue;
+        }
+      }
+      return i;
+    }
+    if (bucket_width > 0 && i < time_mins.size() && i < time_maxs.size()) {
+      const uint64_t tmin = time_mins[i];
+      const uint64_t tmax = time_maxs[i];
+      if (!ManifestShardEntryCoversHostBucket(tmin, tmax, bucket_width,
+                                              host_bucket)) {
+        continue;
+      }
+      const uint64_t b0 = tmin / bucket_width;
+      const uint64_t b1 = tmax / bucket_width;
+      if (b0 == host_bucket && b1 == host_bucket) {
+        return i;
+      }
+      const uint64_t span = tmax - tmin;
+      if (span < best_span) {
+        best_span = span;
+        best_idx = i;
+      }
+    }
+  }
+  // Reject dataset-wide rows (legacy bug); they must not anchor per-bucket reuse.
+  if (best_idx < manifest_numbers.size() && bucket_width > 0) {
+    const uint64_t tmin = time_mins[best_idx];
+    const uint64_t tmax = time_maxs[best_idx];
+    const uint64_t span_buckets =
+        (tmax / bucket_width) - (tmin / bucket_width) + 1;
+    if (span_buckets <= 2) {
+      return best_idx;
+    }
+  }
+  return manifest_numbers.size();
+}
+
+void DedupeMManagerEntriesByHostBucket(
+    std::vector<uint64_t>* descriptor_numbers, std::vector<uint64_t>* time_mins,
+    std::vector<uint64_t>* time_maxs, std::vector<uint64_t>* host_buckets,
+    std::vector<float>* mbr_x_mins, std::vector<float>* mbr_x_maxs,
+    std::vector<float>* mbr_y_mins, std::vector<float>* mbr_y_maxs,
+    std::vector<uint64_t>* master_counts, std::vector<uint64_t>* ghost_counts) {
+  struct Row {
+    uint64_t manifest = 0;
+    uint64_t tmin = 0;
+    uint64_t tmax = 0;
+    uint64_t host_bucket = kManifestHostBucketUnknown;
+    float xmin = 0.f;
+    float xmax = 0.f;
+    float ymin = 0.f;
+    float ymax = 0.f;
+    uint64_t masters = 0;
+    uint64_t ghosts = 0;
+  };
+  std::unordered_map<uint64_t, Row> by_bucket;
+  const float nanf = std::numeric_limits<float>::quiet_NaN();
+  for (size_t i = 0; i < descriptor_numbers->size(); ++i) {
+    const uint64_t hb =
+        (i < host_buckets->size()) ? (*host_buckets)[i] : kManifestHostBucketUnknown;
+    if (hb == kManifestHostBucketUnknown) {
+      continue;
+    }
+    Row row;
+    row.manifest = (*descriptor_numbers)[i];
+    row.tmin = (*time_mins)[i];
+    row.tmax = (*time_maxs)[i];
+    row.host_bucket = hb;
+    row.xmin = i < mbr_x_mins->size() ? (*mbr_x_mins)[i] : nanf;
+    row.xmax = i < mbr_x_maxs->size() ? (*mbr_x_maxs)[i] : nanf;
+    row.ymin = i < mbr_y_mins->size() ? (*mbr_y_mins)[i] : nanf;
+    row.ymax = i < mbr_y_maxs->size() ? (*mbr_y_maxs)[i] : nanf;
+    row.masters = i < master_counts->size() ? (*master_counts)[i] : 0;
+    row.ghosts = i < ghost_counts->size() ? (*ghost_counts)[i] : 0;
+    auto it = by_bucket.find(hb);
+    if (it == by_bucket.end() || row.manifest >= it->second.manifest) {
+      by_bucket[hb] = row;
+    }
+  }
+  descriptor_numbers->clear();
+  time_mins->clear();
+  time_maxs->clear();
+  host_buckets->clear();
+  mbr_x_mins->clear();
+  mbr_x_maxs->clear();
+  mbr_y_mins->clear();
+  mbr_y_maxs->clear();
+  master_counts->clear();
+  ghost_counts->clear();
+  std::vector<uint64_t> bucket_ids;
+  bucket_ids.reserve(by_bucket.size());
+  for (const auto& kv : by_bucket) {
+    bucket_ids.push_back(kv.first);
+  }
+  std::sort(bucket_ids.begin(), bucket_ids.end());
+  for (uint64_t hb : bucket_ids) {
+    const Row& row = by_bucket[hb];
+    descriptor_numbers->push_back(row.manifest);
+    time_mins->push_back(row.tmin);
+    time_maxs->push_back(row.tmax);
+    host_buckets->push_back(row.host_bucket);
+    mbr_x_mins->push_back(row.xmin);
+    mbr_x_maxs->push_back(row.xmax);
+    mbr_y_mins->push_back(row.ymin);
+    mbr_y_maxs->push_back(row.ymax);
+    master_counts->push_back(row.masters);
+    ghost_counts->push_back(row.ghosts);
+  }
+}
+
+bool ExperimentalManifestSyncFanoutEnabled() {
+  const char* v = std::getenv("ROCKSDB_EXPERIMENTAL_MANIFEST_SYNC_FANOUT");
+  if (v == nullptr || *v == '\0') {
+    return false;
+  }
+  return std::string(v) == "1" || std::string(v) == "true";
+}
+
+const FileMetaData* FindFileMetaByNumberInVersions(
+    const autovector<Version*>& versions, uint64_t file_number) {
+  for (Version* version : versions) {
+    if (version == nullptr) {
+      continue;
+    }
+    VersionStorageInfo* storage = version->storage_info();
+    if (storage == nullptr) {
+      continue;
+    }
+    for (int level = 0; level < storage->num_levels(); ++level) {
+      for (FileMetaData* f : storage->LevelFiles(level)) {
+        if (f != nullptr && f->fd.GetNumber() == file_number) {
+          return f;
+        }
+      }
+    }
+  }
+  return nullptr;
+}
+
+void CollectCalendarBucketsForTimeRange(uint64_t tmin, uint64_t tmax,
+                                      uint32_t bucket_width,
+                                      std::set<uint64_t>* buckets) {
+  if (buckets == nullptr || bucket_width == 0 || tmax < tmin) {
+    return;
+  }
+  const uint64_t b0 = tmin / bucket_width;
+  const uint64_t b1 = tmax / bucket_width;
+  for (uint64_t b = b0; b <= b1; ++b) {
+    buckets->insert(b);
+  }
+}
+
+void BuildPerBucketManifestSyncEdits(
+    const autovector<VersionEdit*>& batch_edits,
+    const autovector<Version*>& versions, uint32_t bucket_width,
+    uint64_t primary_host_bucket,
+    const std::unordered_map<uint64_t, std::unordered_set<uint64_t>>*
+        file_shard_index,
+    std::map<uint64_t, VersionEdit>* per_bucket_edits) {
+  if (per_bucket_edits == nullptr || bucket_width == 0) {
+    return;
+  }
+  per_bucket_edits->clear();
+  auto& edits = *per_bucket_edits;
+  uint32_t column_family_id = 0;
+  for (const VersionEdit* edit : batch_edits) {
+    if (edit != nullptr) {
+      column_family_id = edit->GetColumnFamily();
+      break;
+    }
+  }
+  for (const VersionEdit* edit : batch_edits) {
+    if (edit == nullptr) {
+      continue;
+    }
+    for (const auto& nf : edit->GetNewFiles()) {
+      const int level = nf.first;
+      const FileMetaData& meta = nf.second;
+      if (!meta.has_st_file_meta) {
+        continue;
+      }
+      const uint64_t tmin = static_cast<uint64_t>(meta.st_file_meta.t_min);
+      const uint64_t tmax = static_cast<uint64_t>(meta.st_file_meta.t_max);
+      std::set<uint64_t> buckets;
+      CollectCalendarBucketsForTimeRange(tmin, tmax, bucket_width, &buckets);
+      for (uint64_t bucket : buckets) {
+        if (bucket == primary_host_bucket) {
+          continue;
+        }
+        VersionEdit& shard_edit = edits[bucket];
+        shard_edit.SetColumnFamily(column_family_id);
+        shard_edit.AddFile(level, meta);
+      }
+    }
+    for (const auto& deleted : edit->GetDeletedFiles()) {
+      const int level = deleted.first;
+      const uint64_t file_number = deleted.second;
+      std::set<uint64_t> delete_buckets;
+      if (file_shard_index != nullptr) {
+        const auto it = file_shard_index->find(file_number);
+        if (it != file_shard_index->end()) {
+          delete_buckets.insert(it->second.begin(), it->second.end());
+        }
+      }
+      const FileMetaData* live =
+          FindFileMetaByNumberInVersions(versions, file_number);
+      if (live != nullptr && live->has_st_file_meta) {
+        CollectCalendarBucketsForTimeRange(
+            static_cast<uint64_t>(live->st_file_meta.t_min),
+            static_cast<uint64_t>(live->st_file_meta.t_max), bucket_width,
+            &delete_buckets);
+      }
+      if (delete_buckets.empty() &&
+          primary_host_bucket != kManifestHostBucketUnknown) {
+        delete_buckets.insert(primary_host_bucket);
+      }
+      for (uint64_t bucket : delete_buckets) {
+        if (bucket == primary_host_bucket) {
+          continue;
+        }
+        VersionEdit& shard_edit = edits[bucket];
+        shard_edit.SetColumnFamily(column_family_id);
+        shard_edit.DeleteFile(level, file_number);
+      }
+    }
+  }
+}
+
+IOStatus AppendEncodedRecordsToManifestFile(
+    const std::string& dbname, FileSystem* fs,
+    const ImmutableDBOptions& db_options, const FileOptions& file_options,
+    SystemClock* clock,
+    const WriteOptions& write_options, uint64_t manifest_file_number,
+    const std::vector<std::string>& encoded_records) {
+  if (encoded_records.empty()) {
+    return IOStatus::OK();
+  }
+  const std::string descriptor_fname =
+      DescriptorFileName(dbname, manifest_file_number);
+  FileOptions opt_file_opts = fs->OptimizeForManifestWrite(file_options);
+  if (file_options.temperature != Temperature::kUnknown) {
+    opt_file_opts.temperature = file_options.temperature;
+  }
+  std::unique_ptr<FSWritableFile> descriptor_file;
+  IOStatus io_s = fs->ReuseWritableFile(descriptor_fname, descriptor_fname,
+                                        opt_file_opts, &descriptor_file,
+                                        nullptr);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  FileTypeSet tmp_set = db_options.checksum_handoff_file_types;
+  std::unique_ptr<WritableFileWriter> file_writer(new WritableFileWriter(
+      std::move(descriptor_file), descriptor_fname, opt_file_opts, clock,
+      /*io_tracer=*/nullptr, nullptr,
+      Histograms::HISTOGRAM_ENUM_MAX /* hist_type */, db_options.listeners,
+      nullptr, tmp_set.Contains(FileType::kDescriptorFile),
+      tmp_set.Contains(FileType::kDescriptorFile)));
+  log::Writer writer(std::move(file_writer), /*dest_bytes=*/0,
+                     /*do_fsync=*/false);
+  for (const std::string& record : encoded_records) {
+    io_s = writer.AddRecord(write_options, record);
+    if (!io_s.ok()) {
+      return io_s;
+    }
+  }
+  io_s = SyncManifest(&db_options, write_options, writer.file());
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  return writer.Close(write_options);
+}
+
+static IOStatus DeleteStaleMManagerFilesExcept(
+    const std::string& dbname, FileSystem* fs, uint64_t keep_manager_number) {
+  if (keep_manager_number == 0) {
+    return IOStatus::OK();
+  }
+  IOOptions opts;
+  std::vector<std::string> children;
+  IOStatus io_s = fs->GetChildren(dbname, opts, &children, nullptr);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  for (const std::string& child : children) {
+    uint64_t num = 0;
+    if (!ParseMManagerFileNumber(child, &num) || num == keep_manager_number) {
+      continue;
+    }
+    const std::string path = dbname + "/" + child;
+    io_s = fs->DeleteFile(path, opts, nullptr);
+    if (!io_s.ok() && !io_s.IsNotFound()) {
+      return io_s;
+    }
+  }
+  return IOStatus::OK();
+}
+
+IOStatus FanOutManifestSyncToIntersectingShards(
+    const std::string& dbname, FileSystem* fs,
+    const ImmutableDBOptions& db_options, const FileOptions& file_options,
+    SystemClock* clock,
+    const WriteOptions& write_options, uint32_t bucket_width,
+    uint64_t primary_host_bucket, uint64_t primary_manifest_number,
+    const autovector<VersionEdit*>& batch_edits,
+    const autovector<Version*>& versions,
+    const std::unordered_map<uint64_t, std::unordered_set<uint64_t>>*
+        file_shard_index,
+    VersionSet* version_set_for_index,
+    std::optional<size_t> edit_ts_sz) {
+  if (!ExperimentalManifestSyncFanoutEnabled() ||
+      !ExperimentalManifestShardRouteEnabled() || bucket_width == 0) {
+    return IOStatus::OK();
+  }
+  std::map<uint64_t, VersionEdit> per_bucket_edits;
+  BuildPerBucketManifestSyncEdits(batch_edits, versions, bucket_width,
+                                  primary_host_bucket, file_shard_index,
+                                  &per_bucket_edits);
+  if (per_bucket_edits.empty()) {
+    return IOStatus::OK();
+  }
+  std::vector<std::string> prev_paths;
+  std::vector<uint64_t> prev_numbers;
+  std::vector<uint64_t> prev_time_mins;
+  std::vector<uint64_t> prev_time_maxs;
+  std::vector<uint64_t> prev_host_buckets;
+  const Status read_s = GetCurrentManifestPaths(
+      dbname, fs, /*is_retry=*/false, &prev_paths, &prev_numbers,
+      /*manifest_set_generation=*/nullptr, &prev_time_mins, &prev_time_maxs,
+      /*manifest_x_mins=*/nullptr, /*manifest_x_maxs=*/nullptr,
+      /*manifest_y_mins=*/nullptr, /*manifest_y_maxs=*/nullptr,
+      /*master_counts=*/nullptr, /*ghost_counts=*/nullptr, &prev_host_buckets);
+  if (!read_s.ok()) {
+    return IOStatus::IOError(read_s.ToString());
+  }
+  IOStatus io_s;
+  for (const auto& kv : per_bucket_edits) {
+    const uint64_t bucket = kv.first;
+    const VersionEdit& shard_edit = kv.second;
+    if (shard_edit.GetNewFiles().empty() &&
+        shard_edit.GetDeletedFiles().empty()) {
+      continue;
+    }
+    const size_t idx = FindManifestIndexForHostBucket(
+        prev_numbers, prev_host_buckets, prev_time_mins, prev_time_maxs,
+        bucket_width, bucket);
+    if (idx >= prev_numbers.size()) {
+      continue;
+    }
+    const uint64_t manifest_number = prev_numbers[idx];
+    if (manifest_number == primary_manifest_number) {
+      continue;
+    }
+    std::string record;
+    if (!shard_edit.EncodeTo(&record, edit_ts_sz)) {
+      return IOStatus::Corruption("Manifest sync fan-out encode failed");
+    }
+    io_s = AppendEncodedRecordsToManifestFile(
+        dbname, fs, db_options, file_options, clock, write_options,
+        manifest_number, {record});
+    if (!io_s.ok()) {
+      return io_s;
+    }
+    if (version_set_for_index != nullptr) {
+      version_set_for_index->StManifestRecordFanoutShardEdit(bucket, shard_edit);
+    }
+    ROCKS_LOG_INFO(db_options.info_log,
+                   "MANIFEST_SYNC_FANOUT bucket=%" PRIu64 " manifest=%" PRIu64
+                   " add_files=%zu del_files=%zu",
+                   bucket, manifest_number, shard_edit.GetNewFiles().size(),
+                   shard_edit.GetDeletedFiles().size());
+  }
+  return io_s;
+}
+
+void ExpandMManagerShardsForCrossBucketMerge(
+    uint64_t merged_tmin, uint64_t merged_tmax, uint32_t bucket_width,
+    std::vector<uint64_t>* time_mins, std::vector<uint64_t>* time_maxs) {
+  if (bucket_width == 0 ||
+      !StPendingTimeRangeCrossesBuckets(merged_tmin, merged_tmax, bucket_width)) {
+    return;
+  }
+  constexpr uint64_t kTimeUnknownMin = 0;
+  constexpr uint64_t kTimeUnknownMax = std::numeric_limits<uint64_t>::max();
+  for (size_t i = 0; i < time_mins->size(); ++i) {
+    if ((*time_mins)[i] == kTimeUnknownMin &&
+        (*time_maxs)[i] == kTimeUnknownMax) {
+      continue;
+    }
+    if (StManifestTimeRangesIntersect((*time_mins)[i], (*time_maxs)[i], merged_tmin,
+                                      merged_tmax)) {
+      (*time_mins)[i] = std::min((*time_mins)[i], merged_tmin);
+      (*time_maxs)[i] = std::max((*time_maxs)[i], merged_tmax);
+    }
+  }
+}
+
 void BuildManifestSetDescriptorsForCurrent(
     const std::string& dbname, FileSystem* fs,
     uint64_t pending_manifest_file_number, bool pending_has_time_bounds,
     uint64_t pending_tmin, uint64_t pending_tmax, bool pending_has_mbr_bounds,
     float pending_xmin, float pending_xmax, float pending_ymin, float pending_ymax,
     bool pending_has_global_counts, uint64_t pending_masters,
-    uint64_t pending_ghosts,
-    std::vector<uint64_t>* descriptor_numbers, std::vector<uint64_t>* time_mins,
-    std::vector<uint64_t>* time_maxs, std::vector<float>* mbr_x_mins,
+    uint64_t pending_ghosts, uint32_t manifest_shard_bucket_width,
+    uint64_t pending_host_bucket, bool pending_crosses_buckets,
+    std::vector<uint64_t>* descriptor_numbers,
+    std::vector<uint64_t>* time_mins, std::vector<uint64_t>* time_maxs,
+    std::vector<uint64_t>* host_buckets, std::vector<float>* mbr_x_mins,
     std::vector<float>* mbr_x_maxs, std::vector<float>* mbr_y_mins,
     std::vector<float>* mbr_y_maxs, std::vector<uint64_t>* master_counts,
     std::vector<uint64_t>* ghost_counts) {
   assert(descriptor_numbers != nullptr);
   assert(time_mins != nullptr);
   assert(time_maxs != nullptr);
+  assert(host_buckets != nullptr);
   assert(mbr_x_mins != nullptr);
   assert(mbr_x_maxs != nullptr);
   assert(mbr_y_mins != nullptr);
@@ -7105,6 +7869,7 @@ void BuildManifestSetDescriptorsForCurrent(
   descriptor_numbers->clear();
   time_mins->clear();
   time_maxs->clear();
+  host_buckets->clear();
   mbr_x_mins->clear();
   mbr_x_maxs->clear();
   mbr_y_mins->clear();
@@ -7116,6 +7881,7 @@ void BuildManifestSetDescriptorsForCurrent(
   std::vector<uint64_t> prev_numbers;
   std::vector<uint64_t> prev_time_mins;
   std::vector<uint64_t> prev_time_maxs;
+  std::vector<uint64_t> prev_host_buckets;
   std::vector<float> prev_x_mins;
   std::vector<float> prev_x_maxs;
   std::vector<float> prev_y_mins;
@@ -7126,36 +7892,112 @@ void BuildManifestSetDescriptorsForCurrent(
       dbname, fs, /*is_retry=*/false, &prev_paths, &prev_numbers,
       /*manifest_set_generation=*/nullptr, &prev_time_mins, &prev_time_maxs,
       &prev_x_mins, &prev_x_maxs, &prev_y_mins, &prev_y_maxs, &prev_masters,
-      &prev_ghosts);
+      &prev_ghosts, &prev_host_buckets);
   (void)prev_paths;
   constexpr uint64_t kTimeUnknownMin = 0;
   constexpr uint64_t kTimeUnknownMax = std::numeric_limits<uint64_t>::max();
-  bool fallback_preserved = false;
+  const bool strict_per_bucket_index =
+      manifest_shard_bucket_width > 0 &&
+      ExperimentalManifestShardRouteEnabled();
+  if (pending_host_bucket == kManifestHostBucketUnknown && pending_has_time_bounds &&
+      manifest_shard_bucket_width > 0) {
+    if (!TryDeriveSingleHostBucketFromTimeRange(
+            pending_tmin, pending_tmax, manifest_shard_bucket_width,
+            &pending_host_bucket) &&
+        strict_per_bucket_index) {
+      pending_host_bucket = pending_tmin / manifest_shard_bucket_width;
+    }
+  }
+  if (!pending_crosses_buckets && pending_host_bucket != kManifestHostBucketUnknown &&
+      manifest_shard_bucket_width > 0 && !pending_has_time_bounds) {
+    pending_tmin = pending_host_bucket * manifest_shard_bucket_width;
+    pending_tmax =
+        pending_tmin + static_cast<uint64_t>(manifest_shard_bucket_width) - 1;
+    pending_has_time_bounds = true;
+  }
+  // M2 uses meta union for the host row; do not clamp to a single calendar hour.
+  const bool strict_bucket_update = false;
+  (void)strict_per_bucket_index;
+  (void)pending_crosses_buckets;
+  uint64_t replaced_shard_tmin = 0;
+  uint64_t replaced_shard_tmax = 0;
+  bool merged_replaced_shard_bounds = false;
   if (read_s.ok() && prev_numbers.size() == prev_time_mins.size() &&
       prev_numbers.size() == prev_time_maxs.size()) {
     IOOptions io_opts;
     for (size_t i = 0; i < prev_numbers.size(); ++i) {
-      if (prev_numbers[i] == pending_manifest_file_number) {
+      const bool drop_same_manifest =
+          (prev_numbers[i] == pending_manifest_file_number);
+      const uint64_t prev_hb_for_drop =
+          i < prev_host_buckets.size() ? prev_host_buckets[i]
+                                       : kManifestHostBucketUnknown;
+      const bool drop_for_host_bucket =
+          (pending_host_bucket != kManifestHostBucketUnknown &&
+           manifest_shard_bucket_width > 0 &&
+           ((prev_hb_for_drop != kManifestHostBucketUnknown &&
+             prev_hb_for_drop == pending_host_bucket) ||
+            (prev_hb_for_drop == kManifestHostBucketUnknown &&
+             i < prev_time_mins.size() && i < prev_time_maxs.size() &&
+             ManifestShardEntryCoversHostBucket(
+                 prev_time_mins[i], prev_time_maxs[i],
+                 manifest_shard_bucket_width, pending_host_bucket))));
+      // Drop bootstrap MANIFEST rows (unknown bucket + unknown time span) from
+      // DB::Open; do not drop real bucket rows that still have unknown times.
+      const bool drop_unknown_legacy_shard =
+          strict_per_bucket_index &&
+          pending_host_bucket != kManifestHostBucketUnknown &&
+          prev_hb_for_drop == kManifestHostBucketUnknown &&
+          i < prev_time_mins.size() && i < prev_time_maxs.size() &&
+          prev_time_mins[i] == kTimeUnknownMin &&
+          prev_time_maxs[i] == kTimeUnknownMax;
+      // Replace placeholder rows (bucket set, times still unknown) so we do not
+      // reuse a bootstrap MANIFEST that lacks VersionEditParams.
+      const bool drop_unknown_time_for_same_host_bucket =
+          strict_per_bucket_index &&
+          pending_host_bucket != kManifestHostBucketUnknown &&
+          prev_hb_for_drop == pending_host_bucket &&
+          i < prev_time_mins.size() && i < prev_time_maxs.size() &&
+          prev_time_mins[i] == kTimeUnknownMin &&
+          prev_time_maxs[i] == kTimeUnknownMax;
+      if (drop_for_host_bucket || drop_same_manifest ||
+          drop_unknown_legacy_shard || drop_unknown_time_for_same_host_bucket) {
+        if (drop_for_host_bucket && i < prev_time_mins.size() &&
+            i < prev_time_maxs.size()) {
+          if (!merged_replaced_shard_bounds) {
+            replaced_shard_tmin = prev_time_mins[i];
+            replaced_shard_tmax = prev_time_maxs[i];
+            merged_replaced_shard_bounds = true;
+          } else {
+            replaced_shard_tmin =
+                std::min(replaced_shard_tmin, prev_time_mins[i]);
+            replaced_shard_tmax =
+                std::max(replaced_shard_tmax, prev_time_maxs[i]);
+          }
+        }
         continue;
+      }
+      if (strict_bucket_update) {
+        const uint64_t prev_hb =
+            i < prev_host_buckets.size() ? prev_host_buckets[i]
+                                         : kManifestHostBucketUnknown;
+        if (prev_hb == kManifestHostBucketUnknown) {
+          continue;
+        }
       }
       const std::string prev_manifest_path = DescriptorFileName(dbname, prev_numbers[i]);
       IOStatus exists_s = fs->FileExists(prev_manifest_path, io_opts, nullptr);
       if (!exists_s.ok()) {
-        // Drop stale entries so we never persist dangling MANIFEST references.
         continue;
       }
-      const bool is_unknown_range = (prev_time_mins[i] == kTimeUnknownMin &&
-                                     prev_time_maxs[i] == kTimeUnknownMax);
-      if (is_unknown_range && !pending_has_time_bounds) {
-        // Keep only one fallback shard when pending shard is also fallback.
-        if (fallback_preserved) {
-          continue;
-        }
-        fallback_preserved = true;
-      }
+      const uint64_t prev_hb =
+          i < prev_host_buckets.size() ? prev_host_buckets[i]
+                                       : kManifestHostBucketUnknown;
+      const uint64_t entry_tmin = prev_time_mins[i];
+      const uint64_t entry_tmax = prev_time_maxs[i];
       descriptor_numbers->push_back(prev_numbers[i]);
-      time_mins->push_back(prev_time_mins[i]);
-      time_maxs->push_back(prev_time_maxs[i]);
+      time_mins->push_back(entry_tmin);
+      time_maxs->push_back(entry_tmax);
+      host_buckets->push_back(prev_hb);
       const float nanf = std::numeric_limits<float>::quiet_NaN();
       mbr_x_mins->push_back(i < prev_x_mins.size() ? prev_x_mins[i] : nanf);
       mbr_x_maxs->push_back(i < prev_x_maxs.size() ? prev_x_maxs[i] : nanf);
@@ -7167,13 +8009,31 @@ void BuildManifestSetDescriptorsForCurrent(
   }
 
   descriptor_numbers->push_back(pending_manifest_file_number);
-  if (pending_has_time_bounds) {
-    time_mins->push_back(pending_tmin);
-    time_maxs->push_back(pending_tmax);
+  uint64_t pending_entry_tmin = pending_tmin;
+  uint64_t pending_entry_tmax = pending_tmax;
+  if (merged_replaced_shard_bounds) {
+    if (pending_has_time_bounds) {
+      pending_entry_tmin = std::min(pending_entry_tmin, replaced_shard_tmin);
+      pending_entry_tmax = std::max(pending_entry_tmax, replaced_shard_tmax);
+    } else {
+      pending_entry_tmin = replaced_shard_tmin;
+      pending_entry_tmax = replaced_shard_tmax;
+    }
+  }
+  if (pending_has_time_bounds || merged_replaced_shard_bounds) {
+    time_mins->push_back(pending_entry_tmin);
+    time_maxs->push_back(pending_entry_tmax);
+    if (pending_crosses_buckets ||
+        pending_host_bucket == kManifestHostBucketUnknown) {
+      ExpandMManagerShardsForCrossBucketMerge(
+          pending_entry_tmin, pending_entry_tmax, manifest_shard_bucket_width,
+          time_mins, time_maxs);
+    }
   } else {
     time_mins->push_back(kTimeUnknownMin);
     time_maxs->push_back(kTimeUnknownMax);
   }
+  host_buckets->push_back(pending_host_bucket);
   if (pending_has_mbr_bounds) {
     mbr_x_mins->push_back(pending_xmin);
     mbr_x_maxs->push_back(pending_xmax);
@@ -7186,19 +8046,6 @@ void BuildManifestSetDescriptorsForCurrent(
     mbr_y_mins->push_back(nanf);
     mbr_y_maxs->push_back(nanf);
   }
-
-  constexpr size_t kMaxManifestSetShards = 8;
-  if (descriptor_numbers->size() > kMaxManifestSetShards) {
-    const size_t drop = descriptor_numbers->size() - kMaxManifestSetShards;
-    descriptor_numbers->erase(descriptor_numbers->begin(),
-                              descriptor_numbers->begin() + drop);
-    time_mins->erase(time_mins->begin(), time_mins->begin() + drop);
-    time_maxs->erase(time_maxs->begin(), time_maxs->begin() + drop);
-    mbr_x_mins->erase(mbr_x_mins->begin(), mbr_x_mins->begin() + drop);
-    mbr_x_maxs->erase(mbr_x_maxs->begin(), mbr_x_maxs->begin() + drop);
-    mbr_y_mins->erase(mbr_y_mins->begin(), mbr_y_mins->begin() + drop);
-    mbr_y_maxs->erase(mbr_y_maxs->begin(), mbr_y_maxs->begin() + drop);
-  }
   if (pending_has_global_counts) {
     master_counts->push_back(pending_masters);
     ghost_counts->push_back(pending_ghosts);
@@ -7206,9 +8053,164 @@ void BuildManifestSetDescriptorsForCurrent(
     master_counts->push_back(0);
     ghost_counts->push_back(0);
   }
+
+  if (strict_bucket_update || strict_per_bucket_index) {
+    DedupeMManagerEntriesByHostBucket(descriptor_numbers, time_mins, time_maxs,
+                                      host_buckets, mbr_x_mins, mbr_x_maxs,
+                                      mbr_y_mins, mbr_y_maxs, master_counts,
+                                      ghost_counts);
+  }
+
+  if (descriptor_numbers->empty() && pending_manifest_file_number != 0) {
+    descriptor_numbers->push_back(pending_manifest_file_number);
+    time_mins->push_back(pending_has_time_bounds ? pending_tmin : kTimeUnknownMin);
+    time_maxs->push_back(pending_has_time_bounds ? pending_tmax : kTimeUnknownMax);
+    host_buckets->push_back(pending_host_bucket);
+    const float nanf = std::numeric_limits<float>::quiet_NaN();
+    mbr_x_mins->push_back(nanf);
+    mbr_x_maxs->push_back(nanf);
+    mbr_y_mins->push_back(nanf);
+    mbr_y_maxs->push_back(nanf);
+    master_counts->push_back(pending_has_global_counts ? pending_masters : 0);
+    ghost_counts->push_back(pending_has_global_counts ? pending_ghosts : 0);
+  }
+
+  auto max_manifest_shards = []() -> size_t {
+    constexpr size_t kDefaultMaxManifestShards = 8192;
+    const char* v = std::getenv("ROCKSDB_EXPERIMENTAL_MANIFEST_SHARD_MAX");
+    if (v == nullptr || *v == '\0') {
+      return kDefaultMaxManifestShards;
+    }
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(v, &end, 10);
+    if (end == v || *end != '\0' || parsed < 8) {
+      return kDefaultMaxManifestShards;
+    }
+    return static_cast<size_t>(parsed);
+  };
+  const size_t kMaxManifestSetShards = max_manifest_shards();
+  if (descriptor_numbers->size() > kMaxManifestSetShards) {
+    const size_t drop = descriptor_numbers->size() - kMaxManifestSetShards;
+    auto erase_oldest_prefix = [drop](auto* vec) {
+      if (vec->size() > drop) {
+        vec->erase(vec->begin(), vec->begin() + static_cast<std::ptrdiff_t>(drop));
+      } else {
+        vec->clear();
+      }
+    };
+    erase_oldest_prefix(descriptor_numbers);
+    erase_oldest_prefix(time_mins);
+    erase_oldest_prefix(time_maxs);
+    erase_oldest_prefix(host_buckets);
+    erase_oldest_prefix(mbr_x_mins);
+    erase_oldest_prefix(mbr_x_maxs);
+    erase_oldest_prefix(mbr_y_mins);
+    erase_oldest_prefix(mbr_y_maxs);
+    erase_oldest_prefix(master_counts);
+    erase_oldest_prefix(ghost_counts);
+  }
 }
 
 }  // namespace
+
+void VersionSet::SetNextManifestHostBucket(uint64_t host_bucket) {
+  next_manifest_host_bucket_ = host_bucket;
+}
+
+uint64_t VersionSet::ConsumeNextManifestHostBucket() {
+  const uint64_t b = next_manifest_host_bucket_;
+  next_manifest_host_bucket_ = std::numeric_limits<uint64_t>::max();
+  return b;
+}
+
+void VersionSet::StManifestIndexRegister(uint64_t file_number,
+                                         uint64_t host_bucket) {
+  if (file_number == 0 ||
+      host_bucket == std::numeric_limits<uint64_t>::max()) {
+    return;
+  }
+  st_manifest_file_shard_index_[file_number].insert(host_bucket);
+}
+
+void VersionSet::StManifestIndexUnregisterShard(uint64_t file_number,
+                                                uint64_t host_bucket) {
+  if (file_number == 0 ||
+      host_bucket == std::numeric_limits<uint64_t>::max()) {
+    return;
+  }
+  const auto it = st_manifest_file_shard_index_.find(file_number);
+  if (it == st_manifest_file_shard_index_.end()) {
+    return;
+  }
+  it->second.erase(host_bucket);
+  if (it->second.empty()) {
+    st_manifest_file_shard_index_.erase(it);
+  }
+}
+
+void VersionSet::StManifestIndexUnregisterFile(uint64_t file_number) {
+  if (file_number == 0) {
+    return;
+  }
+  st_manifest_file_shard_index_.erase(file_number);
+}
+
+void VersionSet::StManifestIndexGetBuckets(uint64_t file_number,
+                                           std::set<uint64_t>* buckets) const {
+  if (buckets == nullptr) {
+    return;
+  }
+  buckets->clear();
+  const auto it = st_manifest_file_shard_index_.find(file_number);
+  if (it != st_manifest_file_shard_index_.end()) {
+    buckets->insert(it->second.begin(), it->second.end());
+  }
+}
+
+void VersionSet::StManifestRecordFanoutShardEdit(uint64_t host_bucket,
+                                               const VersionEdit& shard_edit) {
+  for (const auto& nf : shard_edit.GetNewFiles()) {
+    StManifestIndexRegister(nf.second.fd.GetNumber(), host_bucket);
+  }
+  for (const auto& del : shard_edit.GetDeletedFiles()) {
+    StManifestIndexUnregisterShard(del.second, host_bucket);
+  }
+}
+
+void VersionSet::StManifestIndexApplyBatchAdds(
+    const autovector<VersionEdit*>& batch_edits, uint64_t primary_host_bucket) {
+  for (const VersionEdit* edit : batch_edits) {
+    if (edit == nullptr) {
+      continue;
+    }
+    for (const auto& nf : edit->GetNewFiles()) {
+      const FileMetaData& meta = nf.second;
+      const uint64_t fn = meta.fd.GetNumber();
+      if (fn == 0) {
+        continue;
+      }
+      if (primary_host_bucket != std::numeric_limits<uint64_t>::max()) {
+        StManifestIndexRegister(fn, primary_host_bucket);
+      }
+      if (meta.has_st_file_meta && column_family_set_ != nullptr) {
+        const uint32_t w =
+            ResolveManifestShardBucketWidth(column_family_set_.get());
+        if (w > 0) {
+          std::set<uint64_t> buckets;
+          CollectCalendarBucketsForTimeRange(
+              static_cast<uint64_t>(meta.st_file_meta.t_min),
+              static_cast<uint64_t>(meta.st_file_meta.t_max), w, &buckets);
+          for (uint64_t b : buckets) {
+            StManifestIndexRegister(fn, b);
+          }
+        }
+      }
+    }
+    for (const auto& del : edit->GetDeletedFiles()) {
+      StManifestIndexUnregisterFile(del.second);
+    }
+  }
+}
 
 Status VersionSet::ProcessManifestWrites(
     std::deque<ManifestWriter>& writers, InstrumentedMutex* mu,
@@ -7427,25 +8429,128 @@ Status VersionSet::ProcessManifestWrites(
 
   uint64_t prev_manifest_file_size = manifest_file_size_;
   assert(pending_manifest_file_number_ == 0);
+  uint64_t pending_tmin = 0;
+  uint64_t pending_tmax = std::numeric_limits<uint64_t>::max();
+  bool pending_has_time_bounds =
+      TryBuildPendingManifestTimeBounds(column_family_set_.get(), versions,
+                                        batch_edits, &pending_tmin, &pending_tmax);
+  const uint32_t manifest_shard_bucket_width =
+      ResolveManifestShardBucketWidth(column_family_set_.get());
+  const bool shard_route =
+      ExperimentalManifestShardRouteEnabled(column_family_set_.get());
+  uint32_t shard_bucket_width = manifest_shard_bucket_width;
+  if (shard_bucket_width == 0) {
+    shard_bucket_width = ExperimentalManifestShardBucketWidthSec();
+  }
+  const bool pending_crosses_buckets =
+      pending_has_time_bounds && shard_bucket_width > 0 &&
+      StPendingTimeRangeCrossesBuckets(pending_tmin, pending_tmax,
+                                       shard_bucket_width);
+
+  uint64_t pending_host_bucket = this->ConsumeNextManifestHostBucket();
+  if (pending_host_bucket == kManifestHostBucketUnknown && shard_route &&
+      shard_bucket_width > 0 &&
+      TryResolvePendingHostBucket(versions, batch_edits, shard_bucket_width,
+                                &pending_host_bucket)) {
+    if (!pending_crosses_buckets && !pending_has_time_bounds) {
+      pending_tmin = pending_host_bucket * shard_bucket_width;
+      pending_tmax =
+          pending_tmin + static_cast<uint64_t>(shard_bucket_width) - 1;
+      pending_has_time_bounds = true;
+    }
+  } else if (shard_route && shard_bucket_width > 0 && pending_has_time_bounds &&
+             !pending_crosses_buckets) {
+    if (TryDeriveSingleHostBucketFromTimeRange(
+            pending_tmin, pending_tmax, shard_bucket_width,
+            &pending_host_bucket)) {
+      // Keep batch-derived pending_tmin/pending_tmax for M2 union (Mind.md).
+    } else {
+      pending_host_bucket = pending_tmin / shard_bucket_width;
+      if (!pending_has_time_bounds) {
+        pending_tmin = pending_host_bucket * shard_bucket_width;
+        pending_tmax =
+            pending_tmin + static_cast<uint64_t>(shard_bucket_width) - 1;
+        pending_has_time_bounds = true;
+      }
+    }
+  } else if (shard_route && shard_bucket_width > 0 && pending_has_time_bounds &&
+             pending_crosses_buckets &&
+             pending_host_bucket == kManifestHostBucketUnknown) {
+    pending_host_bucket = pending_tmin / shard_bucket_width;
+  }
+
+  bool create_new_manifest_file = false;
   if (!skip_manifest_write &&
       (!descriptor_log_ ||
        prev_manifest_file_size >= tuned_max_manifest_file_size_)) {
     TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:BeforeNewManifest");
-    new_descriptor_log = true;
-  } else {
+    create_new_manifest_file = true;
+  } else if (!skip_manifest_write) {
     pending_manifest_file_number_ = manifest_file_number_;
   }
+
+  bool write_manifest_db_snapshot = false;
+  bool switched_shard_descriptor_log = false;
+
+  if (!skip_manifest_write && shard_route && shard_bucket_width > 0 &&
+      pending_host_bucket != kManifestHostBucketUnknown) {
+    std::vector<std::string> prev_paths;
+    std::vector<uint64_t> prev_numbers;
+    std::vector<uint64_t> prev_time_mins;
+    std::vector<uint64_t> prev_time_maxs;
+    std::vector<uint64_t> prev_host_buckets;
+    const Status read_s = GetCurrentManifestPaths(
+        dbname_, fs_.get(), /*is_retry=*/false, &prev_paths, &prev_numbers,
+        /*manifest_set_generation=*/nullptr, &prev_time_mins, &prev_time_maxs,
+        /*manifest_x_mins=*/nullptr, /*manifest_x_maxs=*/nullptr,
+        /*manifest_y_mins=*/nullptr, /*manifest_y_maxs=*/nullptr,
+        /*master_counts=*/nullptr, /*ghost_counts=*/nullptr, &prev_host_buckets);
+    const size_t bucket_idx =
+        read_s.ok() ? FindManifestIndexForHostBucket(
+                          prev_numbers, prev_host_buckets, prev_time_mins,
+                          prev_time_maxs, shard_bucket_width, pending_host_bucket)
+                    : prev_numbers.size();
+    const bool bucket_manifest_exists = bucket_idx < prev_numbers.size();
+    const bool size_rotate =
+        create_new_manifest_file && bucket_manifest_exists &&
+        prev_numbers[bucket_idx] == manifest_file_number_;
+    if (bucket_manifest_exists && !size_rotate) {
+      pending_manifest_file_number_ = prev_numbers[bucket_idx];
+      create_new_manifest_file = false;
+      new_descriptor_log = false;
+    } else if (bucket_manifest_exists && size_rotate) {
+      pending_manifest_file_number_ = NewFileNumber();
+      create_new_manifest_file = true;
+      new_descriptor_log = true;
+      write_manifest_db_snapshot = true;
+    } else {
+      pending_manifest_file_number_ = NewFileNumber();
+      while (pending_manifest_file_number_ == manifest_file_number_) {
+        pending_manifest_file_number_ = NewFileNumber();
+      }
+      create_new_manifest_file = true;
+      new_descriptor_log = true;
+      // Incremental-only records on a brand-new MANIFEST-b are not replayable;
+      // write a per-bucket filtered snapshot (Mind.md M1).
+      write_manifest_db_snapshot = true;
+    }
+  } else if (!skip_manifest_write && create_new_manifest_file) {
+    new_descriptor_log = true;
+    pending_manifest_file_number_ = NewFileNumber();
+    write_manifest_db_snapshot = true;
+  }
+
   // Local cached copy of state variable(s). WriteCurrentStateToManifest()
   // reads its content after releasing db mutex to avoid race with
   // SwitchMemtable().
   std::unordered_map<uint32_t, MutableCFState> curr_state;
   VersionEdit wal_additions;
-  if (new_descriptor_log) {
-    pending_manifest_file_number_ = NewFileNumber();
+  if (create_new_manifest_file && write_manifest_db_snapshot) {
+    if (pending_manifest_file_number_ == 0) {
+      pending_manifest_file_number_ = NewFileNumber();
+    }
     batch_edits.back()->SetNextFile(next_file_number_.load());
 
-    // if we are writing out new snapshot make sure to persist max column
-    // family.
     if (column_family_set_->GetMaxColumnFamily() > 0) {
       first_writer.edit_list.front()->SetMaxColumnFamily(
           column_family_set_->GetMaxColumnFamily());
@@ -7460,6 +8565,8 @@ Status VersionSet::ProcessManifestWrites(
     for (const auto& wal : wals_.GetWals()) {
       wal_additions.AddWal(wal.first, wal.second);
     }
+  } else if (create_new_manifest_file && pending_manifest_file_number_ == 0) {
+    pending_manifest_file_number_ = NewFileNumber();
   }
 
   uint64_t new_manifest_file_size = 0;
@@ -7510,10 +8617,50 @@ Status VersionSet::ProcessManifestWrites(
     }
 
     log::Writer* raw_desc_log_ptr = descriptor_log_.get();
-    if (s.ok() && new_descriptor_log) {
-      // This is fine because everything inside of this block is serialized --
-      // only one thread can be here at the same time
-      // create new manifest file
+    const bool switch_to_other_shard =
+        s.ok() && pending_manifest_file_number_ != 0 &&
+        pending_manifest_file_number_ != manifest_file_number_ &&
+        !create_new_manifest_file;
+    if (switch_to_other_shard) {
+      if (descriptor_log_) {
+        io_s = SyncManifest(db_options_, write_options,
+                            descriptor_log_->file());
+        if (io_s.ok()) {
+          io_s = descriptor_log_->Close(write_options);
+        }
+        descriptor_log_.reset();
+      }
+      std::string descriptor_fname =
+          DescriptorFileName(dbname_, pending_manifest_file_number_);
+      std::unique_ptr<FSWritableFile> descriptor_file;
+      io_s = fs_->ReuseWritableFile(descriptor_fname, descriptor_fname,
+                                    opt_file_opts, &descriptor_file, nullptr);
+      if (io_s.ok()) {
+        FileTypeSet tmp_set = db_options_->checksum_handoff_file_types;
+        std::unique_ptr<WritableFileWriter> file_writer(new WritableFileWriter(
+            std::move(descriptor_file), descriptor_fname, opt_file_opts, clock_,
+            io_tracer_, nullptr, Histograms::HISTOGRAM_ENUM_MAX /* hist_type */,
+            db_options_->listeners, nullptr,
+            tmp_set.Contains(FileType::kDescriptorFile),
+            tmp_set.Contains(FileType::kDescriptorFile)));
+        new_desc_log_ptr.reset(
+            new log::Writer(std::move(file_writer), 0, false));
+        raw_desc_log_ptr = new_desc_log_ptr.get();
+        switched_shard_descriptor_log = true;
+      }
+      if (!io_s.ok()) {
+        manifest_io_status = io_s;
+        s = io_s;
+      }
+    } else if (s.ok() && create_new_manifest_file) {
+      if (descriptor_log_) {
+        io_s = SyncManifest(db_options_, write_options,
+                            descriptor_log_->file());
+        if (io_s.ok()) {
+          io_s = descriptor_log_->Close(write_options);
+        }
+        descriptor_log_.reset();
+      }
       std::string descriptor_fname =
           DescriptorFileName(dbname_, pending_manifest_file_number_);
       std::unique_ptr<FSWritableFile> descriptor_file;
@@ -7531,32 +8678,48 @@ Status VersionSet::ProcessManifestWrites(
         new_desc_log_ptr.reset(
             new log::Writer(std::move(file_writer), 0, false));
         raw_desc_log_ptr = new_desc_log_ptr.get();
-        std::vector<uint64_t> manifest_set_tmin_seed;
-        std::vector<uint64_t> manifest_set_tmax_seed;
-        std::vector<float> manifest_set_xmin_seed;
-        std::vector<float> manifest_set_xmax_seed;
-        std::vector<float> manifest_set_ymin_seed;
-        std::vector<float> manifest_set_ymax_seed;
-        std::vector<uint64_t> manifest_set_master_counts_seed;
-        std::vector<uint64_t> manifest_set_ghost_counts_seed;
-        BuildManifestSetDescriptorsForCurrent(
-            dbname_, fs_.get(), pending_manifest_file_number_,
-            /*pending_has_time_bounds=*/false, /*pending_tmin=*/0,
-            /*pending_tmax=*/std::numeric_limits<uint64_t>::max(),
-            /*pending_has_mbr_bounds=*/false,
-            /*pending_xmin=*/0.0f, /*pending_xmax=*/0.0f,
-            /*pending_ymin=*/0.0f, /*pending_ymax=*/0.0f,
-            /*pending_has_global_counts=*/false, /*pending_masters=*/0,
-            /*pending_ghosts=*/0,
-            &manifest_set_descriptors_for_current, &manifest_set_tmin_seed,
-            &manifest_set_tmax_seed, &manifest_set_xmin_seed,
-            &manifest_set_xmax_seed, &manifest_set_ymin_seed,
-            &manifest_set_ymax_seed, &manifest_set_master_counts_seed,
-            &manifest_set_ghost_counts_seed);
-        if (s.ok()) {
-          s = WriteCurrentStateToManifest(write_options, curr_state,
-                                          wal_additions, raw_desc_log_ptr, io_s);
-          assert(s == io_s);
+        if (write_manifest_db_snapshot) {
+          if (shard_route) {
+            std::vector<uint64_t> manifest_set_tmin_seed;
+            std::vector<uint64_t> manifest_set_tmax_seed;
+            std::vector<uint64_t> manifest_set_host_buckets_seed;
+            std::vector<float> manifest_set_xmin_seed;
+            std::vector<float> manifest_set_xmax_seed;
+            std::vector<float> manifest_set_ymin_seed;
+            std::vector<float> manifest_set_ymax_seed;
+            std::vector<uint64_t> manifest_set_master_counts_seed;
+            std::vector<uint64_t> manifest_set_ghost_counts_seed;
+            BuildManifestSetDescriptorsForCurrent(
+                dbname_, fs_.get(), pending_manifest_file_number_,
+                /*pending_has_time_bounds=*/false, /*pending_tmin=*/0,
+                /*pending_tmax=*/std::numeric_limits<uint64_t>::max(),
+                /*pending_has_mbr_bounds=*/false,
+                /*pending_xmin=*/0.0f, /*pending_xmax=*/0.0f,
+                /*pending_ymin=*/0.0f, /*pending_ymax=*/0.0f,
+                /*pending_has_global_counts=*/false, /*pending_masters=*/0,
+                /*pending_ghosts=*/0, manifest_shard_bucket_width,
+                kManifestHostBucketUnknown,
+                /*pending_crosses_buckets=*/false,
+                &manifest_set_descriptors_for_current,
+                &manifest_set_tmin_seed, &manifest_set_tmax_seed,
+                &manifest_set_host_buckets_seed, &manifest_set_xmin_seed,
+                &manifest_set_xmax_seed, &manifest_set_ymin_seed,
+                &manifest_set_ymax_seed, &manifest_set_master_counts_seed,
+                &manifest_set_ghost_counts_seed);
+          }
+          if (s.ok()) {
+            if (shard_route && shard_bucket_width > 0 &&
+                pending_host_bucket != kManifestHostBucketUnknown) {
+              manifest_write_host_bucket_filter_ = pending_host_bucket;
+            } else {
+              manifest_write_host_bucket_filter_ = kManifestHostBucketUnknown;
+            }
+            s = WriteCurrentStateToManifest(write_options, curr_state,
+                                            wal_additions, raw_desc_log_ptr,
+                                            io_s);
+            manifest_write_host_bucket_filter_ = kManifestHostBucketUnknown;
+            assert(s == io_s);
+          }
         }
       }
       if (!io_s.ok()) {
@@ -7622,6 +8785,32 @@ Status VersionSet::ProcessManifestWrites(
         ROCKS_LOG_ERROR(db_options_->info_log, "MANIFEST write %s\n",
                         s.ToString().c_str());
       }
+      if (s.ok() && shard_route && shard_bucket_width > 0 &&
+          pending_manifest_file_number_ != 0 &&
+          pending_host_bucket != kManifestHostBucketUnknown) {
+        std::optional<size_t> fanout_ts_sz = std::nullopt;
+        if (!versions.empty() && versions[0] != nullptr &&
+            versions[0]->cfd() != nullptr &&
+            versions[0]->cfd()->user_comparator() != nullptr) {
+          fanout_ts_sz = versions[0]->cfd()->user_comparator()->timestamp_size();
+        }
+        io_s = FanOutManifestSyncToIntersectingShards(
+            dbname_, fs_.get(), *db_options_, file_options_, clock_,
+            write_options, shard_bucket_width, pending_host_bucket,
+            pending_manifest_file_number_, batch_edits, versions,
+            &st_manifest_file_shard_index_, this, fanout_ts_sz);
+        if (!io_s.ok()) {
+          s = io_s;
+          manifest_io_status = io_s;
+          ROCKS_LOG_ERROR(db_options_->info_log,
+                          "MANIFEST sync fan-out failed: %s\n",
+                          s.ToString().c_str());
+        }
+      }
+      if (s.ok() && shard_route && shard_bucket_width > 0 &&
+          pending_host_bucket != kManifestHostBucketUnknown) {
+        StManifestIndexApplyBatchAdds(batch_edits, pending_host_bucket);
+      }
     }
 
     // If we just created a new descriptor file, install it by writing a
@@ -7630,116 +8819,113 @@ Status VersionSet::ProcessManifestWrites(
       assert(manifest_io_status.ok());
     }
     if (s.ok()) {
-      const uint64_t manifest_set_generation_to_write =
-          manifest_set_generation_ == 0 ? pending_manifest_file_number_
-                                        : manifest_set_generation_;
-      uint64_t pending_tmin = 0;
-      uint64_t pending_tmax = std::numeric_limits<uint64_t>::max();
-      const bool pending_has_time_bounds =
-          TryBuildPendingManifestTimeBounds(column_family_set_.get(), versions,
-                                            batch_edits, &pending_tmin,
-                                            &pending_tmax);
-      float pending_xmin = 0.0f, pending_xmax = 0.0f;
-      float pending_ymin = 0.0f, pending_ymax = 0.0f;
-      const bool pending_has_mbr_bounds = TryBuildPendingManifestSpatialBounds(
-          column_family_set_.get(), versions, batch_edits, &pending_xmin,
-          &pending_xmax, &pending_ymin, &pending_ymax);
-      uint64_t pending_masters = 0;
-      uint64_t pending_ghosts = 0;
-      bool pending_verify_ghost = false;
-      const bool pending_has_global_counts = TryBuildPendingManifestGlobalCounts(
-          column_family_set_.get(), batch_edits, &pending_masters,
-          &pending_ghosts, &pending_verify_ghost);
-      if (pending_has_global_counts) {
-        uint64_t retained_masters = 0;
-        uint64_t retained_ghosts = 0;
-        uint64_t referenced_masters = 0;
-        uint64_t referenced_ghosts = 0;
-        GetCurrentManifestRetainedAndReferencedGlobalCounts(
-            dbname_, fs_.get(), &retained_masters, &retained_ghosts,
-            &referenced_masters, &referenced_ghosts);
-        if (referenced_masters > retained_masters) {
-          pending_masters += (referenced_masters - retained_masters);
+      if (shard_route) {
+        if (m_manager_file_number_ == 0) {
+          IOOptions current_opts;
+          std::string current_name;
+          IOStatus read_current = ReadFileToString(
+              fs_.get(), CurrentFileName(dbname_), current_opts, &current_name);
+          if (read_current.ok() && !current_name.empty() &&
+              current_name.back() == '\n') {
+            current_name.pop_back();
+          }
+          uint64_t parsed_manager = 0;
+          if (read_current.ok() &&
+              ParseMManagerFileNumber(current_name, &parsed_manager) &&
+              parsed_manager != 0) {
+            m_manager_file_number_ = parsed_manager;
+          } else {
+            m_manager_file_number_ = NewFileNumber();
+          }
         }
-        if (referenced_ghosts > retained_ghosts) {
-          pending_ghosts += (referenced_ghosts - retained_ghosts);
+        const uint64_t manager_generation_to_write = manifest_set_generation_ + 1;
+        std::vector<uint64_t> manager_tmin_write;
+        std::vector<uint64_t> manager_tmax_write;
+        std::vector<float> manager_xmin_write;
+        std::vector<float> manager_xmax_write;
+        std::vector<float> manager_ymin_write;
+        std::vector<float> manager_ymax_write;
+        std::vector<uint64_t> manager_master_counts_write;
+        std::vector<uint64_t> manager_ghost_counts_write;
+        std::vector<uint64_t> manager_host_buckets_write;
+        BuildManifestSetDescriptorsForCurrent(
+            dbname_, fs_.get(), pending_manifest_file_number_,
+            pending_has_time_bounds, pending_tmin, pending_tmax,
+            /*pending_has_mbr_bounds=*/false,
+            /*pending_xmin=*/0.0f, /*pending_xmax=*/0.0f,
+            /*pending_ymin=*/0.0f, /*pending_ymax=*/0.0f,
+            /*pending_has_global_counts=*/false, /*pending_masters=*/0,
+            /*pending_ghosts=*/0, manifest_shard_bucket_width, pending_host_bucket,
+            pending_crosses_buckets, &manifest_set_descriptors_for_current,
+            &manager_tmin_write,
+            &manager_tmax_write, &manager_host_buckets_write, &manager_xmin_write,
+            &manager_xmax_write, &manager_ymin_write, &manager_ymax_write,
+            &manager_master_counts_write, &manager_ghost_counts_write);
+        if (pending_has_time_bounds && manifest_shard_bucket_width > 0 &&
+            StPendingTimeRangeCrossesBuckets(pending_tmin, pending_tmax,
+                                             manifest_shard_bucket_width)) {
+          ROCKS_LOG_INFO(db_options_->info_log,
+                         "M_manager: cross-bucket compaction batch tmin=%" PRIu64
+                         " tmax=%" PRIu64 " bucket_width=%" PRIu32
+                         " (expanded overlapping shard entries)",
+                         pending_tmin, pending_tmax, manifest_shard_bucket_width);
         }
-      }
-      if (pending_has_global_counts) {
-        ROCKS_LOG_INFO(
-            db_options_->info_log,
-            "GlobalManifest pending stats: masters=%" PRIu64
-            " ghosts=%" PRIu64 " verify_ghost=%d",
-            pending_masters, pending_ghosts,
-            static_cast<int>(pending_verify_ghost));
-      }
-      std::vector<uint64_t> manifest_set_tmin_write;
-      std::vector<uint64_t> manifest_set_tmax_write;
-      std::vector<float> manifest_set_xmin_write;
-      std::vector<float> manifest_set_xmax_write;
-      std::vector<float> manifest_set_ymin_write;
-      std::vector<float> manifest_set_ymax_write;
-      std::vector<uint64_t> manifest_set_master_counts_write;
-      std::vector<uint64_t> manifest_set_ghost_counts_write;
-      BuildManifestSetDescriptorsForCurrent(
-          dbname_, fs_.get(), pending_manifest_file_number_,
-          pending_has_time_bounds, pending_tmin, pending_tmax,
-          pending_has_mbr_bounds, pending_xmin, pending_xmax, pending_ymin,
-          pending_ymax, pending_has_global_counts, pending_masters,
-          pending_ghosts,
-          &manifest_set_descriptors_for_current, &manifest_set_tmin_write,
-          &manifest_set_tmax_write, &manifest_set_xmin_write,
-          &manifest_set_xmax_write, &manifest_set_ymin_write,
-          &manifest_set_ymax_write, &manifest_set_master_counts_write,
-          &manifest_set_ghost_counts_write);
-      if (pending_verify_ghost && pending_ghosts > 0 && pending_masters == 0) {
-        s = Status::Corruption(
-            "experimental_global_verify_ghost: ghosts>0 but masters=0");
-      }
-      if (!s.ok()) {
-        io_s = IOStatus::IOError(s.ToString());
-      } else {
-        io_s = SetCurrentFileToManifestSet(
-            write_options, fs_.get(), dbname_, pending_manifest_file_number_,
-            manifest_set_descriptors_for_current,
-            manifest_set_generation_to_write, file_options_.temperature,
-            dir_contains_current_file, &manifest_set_tmin_write,
-            &manifest_set_tmax_write, &manifest_set_xmin_write,
-            &manifest_set_xmax_write, &manifest_set_ymin_write,
-            &manifest_set_ymax_write, &manifest_set_master_counts_write,
-            &manifest_set_ghost_counts_write);
-      }
-      if (!io_s.ok()) {
-        s = io_s;
-        // Quarantine old manifest file in case new manifest file's CURRENT
-        // file wasn't created successfully and the old manifest is needed.
-        limbo_descriptor_log_file_number.push_back(manifest_file_number_);
-        files_to_quarantine_if_commit_fail.push_back(
-            &limbo_descriptor_log_file_number);
-      }
-      if (s.ok()) {
-        // Guardrail: if a MANIFEST is still referenced by the newly written
-        // MANIFEST_SET, it must not be purged as obsolete.
-        std::set<std::string> referenced_manifest_names;
-        for (size_t i = 0; i < manifest_set_descriptors_for_current.size(); ++i) {
-          referenced_manifest_names.insert(
-              DescriptorFileName("", manifest_set_descriptors_for_current[i]));
+        if (!s.ok()) {
+          io_s = IOStatus::IOError(s.ToString());
+        } else {
+          io_s = SetCurrentFileToMManager(
+              write_options, fs_.get(), dbname_, m_manager_file_number_,
+              manifest_set_descriptors_for_current, manager_generation_to_write,
+              file_options_.temperature, dir_contains_current_file,
+              &manager_tmin_write, &manager_tmax_write, &manager_host_buckets_write);
         }
-        obsolete_manifests_.erase(
-            std::remove_if(
-                obsolete_manifests_.begin(), obsolete_manifests_.end(),
-                [&referenced_manifest_names](const std::string& name) {
-                  return referenced_manifest_names.find(name) !=
-                         referenced_manifest_names.end();
-                }),
-            obsolete_manifests_.end());
+        if (!io_s.ok()) {
+          s = io_s;
+          limbo_descriptor_log_file_number.push_back(manifest_file_number_);
+          files_to_quarantine_if_commit_fail.push_back(
+              &limbo_descriptor_log_file_number);
+        }
+        if (s.ok()) {
+          manifest_set_generation_ = manager_generation_to_write;
+          IOStatus del_stale = DeleteStaleMManagerFilesExcept(
+              dbname_, fs_.get(), m_manager_file_number_);
+          if (!del_stale.ok()) {
+            ROCKS_LOG_WARN(db_options_->info_log,
+                           "Delete stale M_manager files failed: %s",
+                           del_stale.ToString().c_str());
+          }
+          std::set<std::string> referenced_manifest_names;
+          for (size_t i = 0; i < manifest_set_descriptors_for_current.size(); ++i) {
+            referenced_manifest_names.insert(
+                DescriptorFileName("", manifest_set_descriptors_for_current[i]));
+          }
+          obsolete_manifests_.erase(
+              std::remove_if(
+                  obsolete_manifests_.begin(), obsolete_manifests_.end(),
+                  [&referenced_manifest_names](const std::string& name) {
+                    return referenced_manifest_names.find(name) !=
+                           referenced_manifest_names.end();
+                  }),
+              obsolete_manifests_.end());
+        }
+      } else if (new_descriptor_log) {
+        io_s = SetCurrentFile(write_options, fs_.get(), dbname_,
+                              pending_manifest_file_number_,
+                              file_options_.temperature,
+                              dir_contains_current_file);
+        if (!io_s.ok()) {
+          s = io_s;
+          limbo_descriptor_log_file_number.push_back(manifest_file_number_);
+          files_to_quarantine_if_commit_fail.push_back(
+              &limbo_descriptor_log_file_number);
+        }
       }
     }
 
     if (s.ok()) {
       // find offset in manifest file where this version is stored.
       new_manifest_file_size = raw_desc_log_ptr->file()->GetFileSize();
-      if (new_descriptor_log) {
+      if (create_new_manifest_file) {
         ROCKS_LOG_INFO(db_options_->info_log,
                        "Created manifest %" PRIu64
                        ", compacted+appended from %" PRIu64 " to %" PRIu64 "\n",
@@ -7790,7 +8976,7 @@ Status VersionSet::ProcessManifestWrites(
 
   // Append the old manifest file to the obsolete_manifest_ list to be deleted
   // by PurgeObsoleteFiles later.
-  if (s.ok() && new_descriptor_log) {
+  if (s.ok() && (create_new_manifest_file || switched_shard_descriptor_log)) {
     descriptor_log_ = std::move(new_desc_log_ptr);
     const bool old_manifest_still_referenced =
         std::find(manifest_set_descriptors_for_current.begin(),
@@ -7859,7 +9045,6 @@ Status VersionSet::ProcessManifestWrites(
       assert(max_last_sequence >= descriptor_last_sequence_);
       descriptor_last_sequence_ = max_last_sequence;
       manifest_file_number_ = pending_manifest_file_number_;
-      manifest_set_generation_ = pending_manifest_file_number_;
       manifest_file_size_ = new_manifest_file_size;
       prev_log_number_ = first_writer.edit_list.front()->GetPrevLogNumber();
     }
@@ -7905,7 +9090,7 @@ Status VersionSet::ProcessManifestWrites(
     // a) CURRENT points to the new MANIFEST, and the new MANIFEST is present.
     // b) CURRENT points to the original MANIFEST, and the original MANIFEST
     //    also exists.
-    if (!manifest_io_status.ok() && new_descriptor_log) {
+    if (!manifest_io_status.ok() && create_new_manifest_file) {
       ROCKS_LOG_INFO(db_options_->info_log,
                      "Deleting manifest %" PRIu64 " current manifest %" PRIu64
                      "\n",
@@ -8129,8 +9314,8 @@ Status VersionSet::Recover(
     std::string* db_id, bool no_error_if_files_missing, bool is_retry,
     Status* log_status) {
   const ReadOptions read_options(Env::IOActivity::kDBOpen);
-  // Read "CURRENT" file, which must point to a MANIFEST_SET file listing
-  // MANIFESTs in replay order.
+  // Read "CURRENT" file, which must point to M_manager (or legacy MANIFEST_SET)
+  // listing MANIFEST shards in replay order.
   std::vector<std::string> manifest_paths;
   std::vector<uint64_t> manifest_file_numbers;
   uint64_t manifest_set_generation = 0;
@@ -8146,7 +9331,24 @@ Status VersionSet::Recover(
   assert(!manifest_file_numbers.empty());
   manifest_file_number_ = manifest_file_numbers.back();
   manifest_set_generation_ = manifest_set_generation;
-  // Light holistic mode: replay manifests in the order listed by MANIFEST_SET.
+  {
+    IOOptions current_opts;
+    std::string current_name;
+    Status read_current =
+        ReadFileToString(fs_.get(), CurrentFileName(dbname_), current_opts,
+                         &current_name);
+    if (read_current.ok() && !current_name.empty() &&
+        current_name.back() == '\n') {
+      current_name.pop_back();
+    }
+    uint64_t parsed_manager = 0;
+    if (read_current.ok() &&
+        ParseMManagerFileNumber(current_name, &parsed_manager) &&
+        parsed_manager != 0) {
+      m_manager_file_number_ = parsed_manager;
+    }
+  }
+  // Light holistic mode: replay manifests in the order listed by M_manager.
   // (A stronger protocol can be layered later if needed.)
   std::vector<size_t> replay_order(manifest_paths.size(), 0);
   for (size_t i = 0; i < replay_order.size(); ++i) {
@@ -8169,13 +9371,23 @@ Status VersionSet::Recover(
     VersionSet::LogReporter reporter;
     Status log_read_status;
     reporter.status = &log_read_status;
+    const bool multi_shard_manifest_replay = manifest_paths.size() > 1;
+    const bool idempotent_manifest_shard_replay =
+        multi_shard_manifest_replay ||
+        (ExperimentalManifestShardRouteEnabled() &&
+         manifest_paths.size() > 1);
     VersionEditHandler handler(
         read_only, column_families, const_cast<VersionSet*>(this),
-        /*track_found_and_missing_files=*/false, no_error_if_files_missing,
+        /*track_found_and_missing_files=*/false,
+        no_error_if_files_missing || multi_shard_manifest_replay,
         io_tracer_, read_options, /*allow_incomplete_valid_version=*/false,
         EpochNumberRequirement::kMightMissing,
-        /*skip_load_table_files=*/db_options_->open_files_async);
+        /*skip_load_table_files=*/db_options_->open_files_async,
+        idempotent_manifest_shard_replay);
+    handler.SetMultiShardManifestReplay(multi_shard_manifest_replay);
     for (size_t i = 0; i < replay_order.size(); ++i) {
+      handler.SetFinalShardInReplay(!multi_shard_manifest_replay ||
+                                  (i + 1 == replay_order.size()));
       const size_t ridx = replay_order[i];
       const std::string& manifest_path = manifest_paths[ridx];
       std::unique_ptr<SequentialFileReader> manifest_file_reader;
@@ -8409,8 +9621,8 @@ void VersionSet::RecoverEpochNumbers() {
 Status VersionSet::ListColumnFamilies(std::vector<std::string>* column_families,
                                       const std::string& dbname,
                                       FileSystem* fs) {
-  // Read "CURRENT" file, which must point to a MANIFEST_SET file listing
-  // MANIFESTs in replay order.
+  // Read "CURRENT" file, which must point to M_manager (or legacy MANIFEST_SET)
+  // listing MANIFEST shards in replay order.
   std::vector<std::string> manifest_paths;
   std::vector<uint64_t> manifest_file_numbers;
   Status s = GetCurrentManifestPaths(dbname, fs, /*is_retry=*/false,
@@ -8466,7 +9678,7 @@ Status VersionSet::ListColumnFamiliesByTimeRange(
     return s;
   }
   if (manifest_paths.empty()) {
-    return Status::Corruption("MANIFEST_SET filtered to empty shard list");
+    return Status::Corruption("M_manager filtered to empty shard list");
   }
   if (manifest_paths.size() == 1) {
     return ListColumnFamiliesFromManifest(manifest_paths.front(), fs,
@@ -8885,11 +10097,29 @@ Status VersionSet::WriteCurrentStateToManifest(
       const auto* vstorage = current->storage_info();
       assert(vstorage);
 
+      const uint32_t manifest_shard_bucket_width =
+          ResolveManifestShardBucketWidth(column_family_set_.get());
+      const bool filter_snapshot_files =
+          ExperimentalManifestShardRouteEnabled() &&
+          manifest_shard_bucket_width > 0 &&
+          manifest_write_host_bucket_filter_ != kManifestHostBucketUnknown;
+
       for (int level = 0; level < cfd->NumberLevels(); level++) {
         const auto& level_files = vstorage->LevelFiles(level);
 
         for (const auto& f : level_files) {
           assert(f);
+          if (filter_snapshot_files) {
+            if (!f->has_st_file_meta) {
+              continue;
+            }
+            if (!ManifestShardEntryCoversHostBucket(
+                    f->st_file_meta.t_min, f->st_file_meta.t_max,
+                    manifest_shard_bucket_width,
+                    manifest_write_host_bucket_filter_)) {
+              continue;
+            }
+          }
           edit.AddFile(level, f->fd.GetNumber(), f->fd.GetPathId(),
                        f->fd.GetFileSize(), f->smallest, f->largest,
                        f->fd.smallest_seqno, f->fd.largest_seqno,
@@ -8942,6 +10172,8 @@ Status VersionSet::WriteCurrentStateToManifest(
       }
 
       edit.SetLastSequence(descriptor_last_sequence_);
+      edit.SetNextFile(next_file_number_.load());
+      edit.SetPrevLogNumber(prev_log_number_);
 
       const Comparator* ucmp = cfd->user_comparator();
       assert(ucmp);

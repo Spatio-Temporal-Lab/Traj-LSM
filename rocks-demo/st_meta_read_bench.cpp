@@ -40,14 +40,23 @@
 #include "table/st_meta_user_key.h"
 #include "util/hash.h"
 
+#include "st_meta_read_bench_batch.h"
+
 namespace {
 
 using ROCKSDB_NAMESPACE::UserKeySpatioTemporalInWindow;
 using ROCKSDB_NAMESPACE::Hash64;
+using ROCKSDB_NAMESPACE::StQuerySegmentUidDedup;
 
 constexpr unsigned char kMagicPointKey = 0xE5;
-constexpr unsigned char kMagicSegmentKey = 0xE6;
+constexpr unsigned char kMagicSegmentLegacyKey = 0xE6;
 constexpr unsigned char kMagicSegmentTzidKey = 0xE7;
+
+static uint32_t CfEventTimeBucketWidthSec(rocksdb::DB* db) {
+  const rocksdb::Options opts = db->GetOptions();
+  const uint32_t w = opts.experimental_compaction_event_time_bucket_width;
+  return w == 0 ? ROCKSDB_NAMESPACE::kSpatioTemporalE7DefaultBucketSeconds : w;
+}
 
 // Default RocksDB internal key: <user_key | 8-byte seq+type>.
 inline rocksdb::Slice UserKeyFromInternalKey(const rocksdb::Slice& internal_key) {
@@ -57,6 +66,44 @@ inline rocksdb::Slice UserKeyFromInternalKey(const rocksdb::Slice& internal_key)
   }
   return rocksdb::Slice(internal_key.data(),
                         internal_key.size() - kFooter);
+}
+
+inline bool LooksLikeStUserKey(const rocksdb::Slice& user_key) {
+  if (user_key.size() < 1) {
+    return false;
+  }
+  const unsigned char magic = static_cast<unsigned char>(user_key.data()[0]);
+  if (magic == kMagicPointKey) {
+    return user_key.size() >= 13;
+  }
+  if (magic == kMagicSegmentLegacyKey) {
+    return user_key.size() >= 25;
+  }
+  if (magic == kMagicSegmentTzidKey) {
+    return user_key.size() >= 31;
+  }
+  return false;
+}
+
+using ROCKSDB_NAMESPACE::UserKeyFromIteratorKey;
+
+bool HasLegacyE6Keys(rocksdb::DB* db, size_t sample_limit = 100000) {
+  if (db == nullptr) {
+    return false;
+  }
+  rocksdb::ReadOptions ro;
+  ro.total_order_seek = true;
+  ro.fill_cache = false;
+  std::unique_ptr<rocksdb::Iterator> it(db->NewIterator(ro));
+  size_t seen = 0;
+  for (it->SeekToFirst(); it->Valid() && seen < sample_limit; it->Next(), ++seen) {
+    const rocksdb::Slice uk = UserKeyFromIteratorKey(it->key());
+    if (uk.size() > 0 &&
+        static_cast<unsigned char>(uk.data()[0]) == kMagicSegmentLegacyKey) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bool ParseU32(const char* s, uint32_t* out) {
@@ -122,13 +169,13 @@ PointTruthEval EvalPointTruthInWindow(rocksdb::DB* db,
                                                   x_max, y_min, y_max);
     return out;
   }
-  if (magic != kMagicSegmentKey && magic != kMagicSegmentTzidKey) {
+  if (magic != kMagicSegmentLegacyKey && magic != kMagicSegmentTzidKey) {
     return out;
   }
 
   out.supported = true;
   segval::MaterializedSegmentValue materialized{};
-  if (!segval::DecodeAndMaterializeSegmentValue(db, read_options, value,
+  if (!segval::DecodeAndMaterializeSegmentValue(db, read_options, user_key, value,
                                                 &materialized)) {
     out.decode_failed = true;
     return out;
@@ -160,6 +207,10 @@ PointTruthEval EvalPointTruthInWindow(rocksdb::DB* db,
     }
   }
   return out;
+}
+
+inline bool IsSegmentUserKeyMagic(unsigned char magic) {
+  return magic == kMagicSegmentLegacyKey || magic == kMagicSegmentTzidKey;
 }
 
 rocksdb::Options BenchOpenOptions(int block_cache_mb, bool large_cache,
@@ -206,6 +257,51 @@ void IoStatsDiff(const IoSnap& before, const char* label) {
             << " read_nanos=" << rn << "\n";
 }
 
+bool ComputeGlobalCountsFromRawKv(
+    const std::string& db_path, int block_cache_mb, bool large_cache,
+    uint32_t t_min, uint32_t t_max, float x_min, float x_max, float y_min,
+    float y_max, uint64_t* masters, uint64_t* ghosts) {
+  if (masters == nullptr || ghosts == nullptr) {
+    return false;
+  }
+  *masters = 0;
+  *ghosts = 0;
+
+  rocksdb::Options raw_opt =
+      BenchOpenOptions(block_cache_mb, large_cache,
+                       /*experimental_global_master_ghost=*/false,
+                       /*experimental_global_verify_ghost=*/false);
+  std::unique_ptr<rocksdb::DB> raw_db;
+  rocksdb::Status s = rocksdb::DB::OpenForReadOnly(raw_opt, db_path, &raw_db);
+  if (!s.ok()) {
+    return false;
+  }
+
+  rocksdb::ReadOptions ro(rocksdb::Env::IOActivity::kDBIterator);
+  ro.total_order_seek = true;
+  ro.fill_cache = false;
+  std::unique_ptr<rocksdb::Iterator> it(raw_db->NewIterator(ro));
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    const rocksdb::Slice uk = UserKeyFromIteratorKey(it->key());
+    const rocksdb::Slice v = it->value();
+    PointTruthEval pe = EvalPointTruthInWindow(raw_db.get(), ro, uk, v, t_min,
+                                               t_max, x_min, x_max, y_min, y_max);
+    if (!pe.supported || !pe.in_window) {
+      continue;
+    }
+    segval::DecodedSegmentValue decoded{};
+    if (!segval::DecodeSegmentValue(std::string(v.data(), v.size()), &decoded)) {
+      continue;
+    }
+    if (decoded.is_ghost) {
+      ++(*ghosts);
+    } else {
+      ++(*masters);
+    }
+  }
+  return it->status().ok();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -234,8 +330,16 @@ int main(int argc, char** argv) {
   // (legacy Phase-A: whole column family).
   std::string full_scan_mode = "window";
   bool verify_kv_results = false;
+  bool verify_kv_results_strict_exit = false;
+  bool query_segment_uid_dedup = true;
+  // External reference from segments_meta (time+MBR) / spatial-only window CSV.
+  uint64_t ref_meta_st_segments = 0;
+  uint64_t ref_spatial_segments = 0;
+  float ref_segment_kv_min_ratio = 0.25f;
+  float ref_segment_kv_max_ratio = 8.0f;
   bool experimental_global_master_ghost = false;
   bool experimental_global_verify_ghost = false;
+  bool global_manifest_counts_fallback_scan = false;
   bool sst_manifest_key_level = true;
   bool sst_manifest_adaptive_key_gate = false;
   bool sst_manifest_adaptive_block_gate = false;
@@ -254,12 +358,14 @@ int main(int argc, char** argv) {
   // disjoint/eligible < threshold, skip BVH and use linear disjoint only.
   bool file_level_rtree_skip_ratio_gate = false;
   float file_level_rtree_min_skip_ratio = 0.2f;
+  bool allow_legacy_e6 = false;
   // Same DB + same ReadOptions: repeat NewIterator + full prune scan to amortize
   // Version-level ST meta cache (LevelIterator compact arrays) across iterators.
   int iterator_repeat = 1;
   // Scheme B (bench-only): stop after N distinct SST opens per level iterator
   // (forward SeekToFirst+Next). 0 = unlimited. Results are incomplete when hit.
   uint32_t debug_max_distinct_sst_files = 0;
+  std::string query_batch_file;
 
   for (int i = 1; i < argc; ++i) {
     const char* a = argv[i];
@@ -343,12 +449,63 @@ int main(int argc, char** argv) {
       verify_kv_results = true;
       continue;
     }
+    if (std::strcmp(a, "--verify-kv-results-strict-exit") == 0) {
+      verify_kv_results = true;
+      verify_kv_results_strict_exit = true;
+      continue;
+    }
+    if (std::strcmp(a, "--no-query-segment-uid-dedup") == 0) {
+      query_segment_uid_dedup = false;
+      continue;
+    }
+    if (std::strcmp(a, "--ref-meta-st-segments") == 0 && i + 1 < argc) {
+      char* end = nullptr;
+      errno = 0;
+      const unsigned long v = std::strtoul(argv[++i], &end, 10);
+      if (end == argv[i] || *end != '\0' || errno != 0) {
+        std::cerr << "Invalid --ref-meta-st-segments\n";
+        return 1;
+      }
+      ref_meta_st_segments = static_cast<uint64_t>(v);
+      continue;
+    }
+    if (std::strcmp(a, "--ref-spatial-segments") == 0 && i + 1 < argc) {
+      char* end = nullptr;
+      errno = 0;
+      const unsigned long v = std::strtoul(argv[++i], &end, 10);
+      if (end == argv[i] || *end != '\0' || errno != 0) {
+        std::cerr << "Invalid --ref-spatial-segments\n";
+        return 1;
+      }
+      ref_spatial_segments = static_cast<uint64_t>(v);
+      continue;
+    }
+    if (std::strcmp(a, "--ref-segment-kv-min-ratio") == 0 && i + 1 < argc) {
+      if (!ParseFloat(argv[++i], &ref_segment_kv_min_ratio) ||
+          ref_segment_kv_min_ratio < 0.f) {
+        std::cerr << "Invalid --ref-segment-kv-min-ratio\n";
+        return 1;
+      }
+      continue;
+    }
+    if (std::strcmp(a, "--ref-segment-kv-max-ratio") == 0 && i + 1 < argc) {
+      if (!ParseFloat(argv[++i], &ref_segment_kv_max_ratio) ||
+          ref_segment_kv_max_ratio < ref_segment_kv_min_ratio) {
+        std::cerr << "Invalid --ref-segment-kv-max-ratio\n";
+        return 1;
+      }
+      continue;
+    }
     if (std::strcmp(a, "--experimental-global-master-ghost") == 0) {
       experimental_global_master_ghost = true;
       continue;
     }
     if (std::strcmp(a, "--experimental-global-verify-ghost") == 0) {
       experimental_global_verify_ghost = true;
+      continue;
+    }
+    if (std::strcmp(a, "--global-manifest-counts-fallback-scan") == 0) {
+      global_manifest_counts_fallback_scan = true;
       continue;
     }
     if (std::strcmp(a, "--sst-manifest-key-level") == 0 && i + 1 < argc) {
@@ -472,6 +629,14 @@ int main(int argc, char** argv) {
       }
       continue;
     }
+    if (std::strcmp(a, "--allow-legacy-e6") == 0) {
+      allow_legacy_e6 = true;
+      continue;
+    }
+    if (std::strcmp(a, "--query-batch-file") == 0 && i + 1 < argc) {
+      query_batch_file = argv[++i];
+      continue;
+    }
     if (std::strcmp(a, "-h") == 0 || std::strcmp(a, "--help") == 0) {
       std::cout
           << "st_meta_read_bench --db <existing_dir> [options]\n"
@@ -495,8 +660,10 @@ int main(int argc, char** argv) {
              "  --block-cache-mb N       LRU block cache size (default 8)\n"
              "  --large-cache            use at least 64MB block cache\n"
              "  --verify-kv-results     full vs prune: compare in-window (key,value) set\n"
+             "  --verify-kv-results-strict-exit  return non-zero when verify result is FAIL\n"
              "  --experimental-global-master-ghost  preserve Global master/ghost options when reopening DB\n"
              "  --experimental-global-verify-ghost  reopen with Global ghost verification (requires master-ghost)\n"
+             "  --global-manifest-counts-fallback-scan  when manifest counts are 0, compute in-window master/ghost from raw KV scan\n"
              "  --sst-manifest-key-level <0|1>  in sst_manifest mode, enable/disable key-level (default 1)\n"
              "  --sst-manifest-adaptive-key-gate  in sst_manifest mode, auto-disable key-level for high-overlap files\n"
              "  --sst-manifest-adaptive-block-gate  in sst_manifest mode, auto-disable block+key for very high-overlap files\n"
@@ -516,7 +683,11 @@ int main(int argc, char** argv) {
              "                             stresses Version-level ST meta cache vs cold per-iterator build)\n"
              "  --debug-max-distinct-sst-files N  bench-only: cap SST file opens per level (0=off).\n"
              "                             Stops iteration early — incomplete results; for locality A/B.\n"
-             "  When prune runs: one-line BENCH_CONTRIB ... for grep/log (file/block/key counters).\n";
+             "  --allow-legacy-e6  allow running on legacy E6-key DBs (default: reject E6).\n"
+             "  When prune runs: one-line BENCH_CONTRIB ... for grep/log (file/block/key counters).\n"
+             "  --query-batch-file <path>  TMan-style batch: one DB::Open, many MBR queries\n"
+             "                             (query_conditions.txt: ';'-separated or one/line).\n"
+             "                             Use with --no-full-scan; per-query spatial_batch_query lines.\n";
       return 0;
     }
     std::cerr << "Unknown: " << a << "\n";
@@ -561,14 +732,59 @@ int main(int argc, char** argv) {
                  "Table options must include ST index tail.\n";
     return 1;
   }
+  if (!allow_legacy_e6 && HasLegacyE6Keys(db.get())) {
+    std::cerr
+        << "Detected legacy E6 keys in DB. This benchmark now defaults to E7-only "
+           "experiments.\n"
+        << "If you intentionally need legacy compatibility, rerun with "
+           "--allow-legacy-e6.\n";
+    return 2;
+  }
+  const uint32_t cf_bucket_width_sec = CfEventTimeBucketWidthSec(db.get());
+
+  if (!query_batch_file.empty()) {
+    StMetaReadBenchBatchConfig bcfg;
+    bcfg.query_batch_file = query_batch_file;
+    bcfg.envelope_t_min = prune_t_min;
+    bcfg.envelope_t_max = prune_t_max;
+    bcfg.prune_mode = prune_mode;
+    bcfg.query_segment_uid_dedup = query_segment_uid_dedup;
+    bcfg.verify_kv_results = verify_kv_results;
+    bcfg.time_bucket_count = time_bucket_count;
+    bcfg.rtree_leaf_size = rtree_leaf_size;
+    bcfg.sst_manifest_key_level = sst_manifest_key_level;
+    bcfg.sst_manifest_adaptive_key_gate = sst_manifest_adaptive_key_gate;
+    bcfg.sst_manifest_adaptive_block_gate = sst_manifest_adaptive_block_gate;
+    bcfg.sst_manifest_key_level_boundary_only = sst_manifest_key_level_boundary_only;
+    bcfg.vm_contains_batch_prewarm = vm_contains_batch_prewarm;
+    bcfg.adaptive_overlap_threshold = adaptive_overlap_threshold;
+    bcfg.adaptive_block_overlap_threshold = adaptive_block_overlap_threshold;
+    bcfg.virtual_merge_enable = virtual_merge_enable;
+    bcfg.virtual_merge_auto = virtual_merge_auto;
+    bcfg.vm_time_span_sec_threshold = vm_time_span_sec_threshold;
+    bcfg.manifest_linear_file_skip_only = manifest_linear_file_skip_only;
+    bcfg.file_level_rtree_skip_ratio_gate = file_level_rtree_skip_ratio_gate;
+    bcfg.file_level_rtree_min_skip_ratio = file_level_rtree_min_skip_ratio;
+    bcfg.debug_max_distinct_sst_files = debug_max_distinct_sst_files;
+    run_full = false;
+    run_prune = false;
+    rocksdb::SetPerfLevel(rocksdb::PerfLevel::kEnableTimeExceptForMutex);
+    return RunStMetaReadBenchSpatialBatch(db.get(), bcfg);
+  }
 
   rocksdb::SetPerfLevel(rocksdb::PerfLevel::kEnableTimeExceptForMutex);
+
+  StQuerySegmentUidDedup query_dedup_full;
+  StQuerySegmentUidDedup query_dedup_prune;
+  query_dedup_full.bucket_width_sec = cf_bucket_width_sec;
+  query_dedup_prune.bucket_width_sec = cf_bucket_width_sec;
 
   int64_t count_full = 0;
   int64_t count_full_scanned_total = 0;
   uint64_t br_full = 0;
   double us_full = 0;
   int64_t full_inwindow_kv = 0;
+  int64_t full_inwindow_segment_kv = 0;
   uint64_t full_hash1 = 0;
   uint64_t full_hash2 = 0;
   uint64_t verify_full_decode_failed = 0;
@@ -582,6 +798,7 @@ int main(int argc, char** argv) {
   uint64_t verify_full_ghost_master_meta_mismatch = 0;
 
   if (run_full) {
+    query_dedup_full.Reset();
     rocksdb::ReadOptions base(rocksdb::Env::IOActivity::kDBIterator);
     base.total_order_seek = true;
     base.fill_cache = false;
@@ -603,7 +820,7 @@ int main(int argc, char** argv) {
         if (full_scan_mode == "all_cf") {
           ++count_full;
         } else {
-          uk = UserKeyFromInternalKey(it->key());
+          uk = UserKeyFromIteratorKey(it->key());
           inwindow =
               UserKeySpatioTemporalInWindow(uk, prune_t_min, prune_t_max, prune_x_min,
                                              prune_x_max, prune_y_min, prune_y_max);
@@ -613,7 +830,7 @@ int main(int argc, char** argv) {
         }
         if (verify_kv_results) {
           if (uk.size() == 0) {
-            uk = UserKeyFromInternalKey(it->key());
+            uk = UserKeyFromIteratorKey(it->key());
           }
           const rocksdb::Slice v = it->value();
           const PointTruthEval pe = EvalPointTruthInWindow(
@@ -647,6 +864,10 @@ int main(int argc, char** argv) {
             ++verify_full_ghost_master_meta_mismatch;
           }
           if (pe.in_window) {
+            if (query_segment_uid_dedup &&
+                !query_dedup_full.AcceptEmitUserKey(uk)) {
+              continue;
+            }
             const rocksdb::Slice v = it->value();
             // Use stable Hash64 in two independent seeds to avoid hash collisions.
             constexpr uint64_t kSeed1 = 0x123456789abcdef0ULL;
@@ -656,6 +877,10 @@ int main(int argc, char** argv) {
             uint64_t h2 = Hash64(uk.data(), uk.size(), kSeed2);
             h2 = Hash64(v.data(), v.size(), h2);
             ++full_inwindow_kv;
+            if (uk.size() > 0 &&
+                IsSegmentUserKeyMagic(static_cast<unsigned char>(uk.data()[0]))) {
+              ++full_inwindow_segment_kv;
+            }
             full_hash1 += h1;
             full_hash2 += h2;
           }
@@ -683,6 +908,7 @@ int main(int argc, char** argv) {
   uint64_t br_prune = 0;
   double us_prune = 0;
   int64_t prune_inwindow_kv = 0;
+  int64_t prune_inwindow_segment_kv = 0;
   uint64_t prune_hash1 = 0;
   uint64_t prune_hash2 = 0;
   uint64_t verify_prune_decode_failed = 0;
@@ -714,6 +940,22 @@ int main(int argc, char** argv) {
         std::cout << "global_manifest_counts generation="
                   << global_manifest_set_generation << " masters="
                   << global_masters << " ghosts=" << global_ghosts << "\n";
+        if (global_manifest_counts_fallback_scan && global_masters == 0 &&
+            global_ghosts == 0) {
+          uint64_t fb_masters = 0;
+          uint64_t fb_ghosts = 0;
+          const bool fb_ok = ComputeGlobalCountsFromRawKv(
+              db_path, block_cache_mb, large_cache, prune_t_min, prune_t_max,
+              prune_x_min, prune_x_max, prune_y_min, prune_y_max, &fb_masters,
+              &fb_ghosts);
+          if (fb_ok) {
+            std::cout << "global_manifest_counts_fallback from_raw_kv masters="
+                      << fb_masters << " ghosts=" << fb_ghosts
+                      << " (point-in-window only; not \"ghost rows scanned\")\n";
+          } else {
+            std::cout << "global_manifest_counts_fallback status=FAILED\n";
+          }
+        }
       } else {
         std::cout << "global_manifest_counts status=" << gs.ToString() << "\n";
       }
@@ -723,6 +965,13 @@ int main(int argc, char** argv) {
     prune.total_order_seek = true;
     prune.fill_cache = false;
     prune.experimental_st_prune_scan.enable = true;
+    const bool prune_iterator_segment_uid_dedup = query_segment_uid_dedup;
+    if (prune_iterator_segment_uid_dedup) {
+      prune.experimental_st_prune_scan.query_dedup_by_segment_uid_enable = true;
+      prune.experimental_st_prune_scan.query_segment_uid_dedup = &query_dedup_prune;
+    }
+    prune.experimental_st_prune_scan.event_time_bucket_width_sec =
+        cf_bucket_width_sec;
     prune.experimental_st_prune_scan.t_min = prune_t_min;
     prune.experimental_st_prune_scan.t_max = prune_t_max;
     prune.experimental_st_prune_scan.x_min = prune_x_min;
@@ -916,6 +1165,7 @@ int main(int argc, char** argv) {
       prune_key_skipped_disjoint = 0;
       if (verify_kv_results) {
         prune_inwindow_kv = 0;
+        prune_inwindow_segment_kv = 0;
         prune_hash1 = 0;
         prune_hash2 = 0;
         verify_prune_decode_failed = 0;
@@ -931,7 +1181,7 @@ int main(int argc, char** argv) {
       std::unique_ptr<rocksdb::Iterator> it(db->NewIterator(prune));
       for (it->SeekToFirst(); it->Valid(); it->Next()) {
         ++count_prune;
-        const rocksdb::Slice uk = UserKeyFromInternalKey(it->key());
+        const rocksdb::Slice uk = UserKeyFromIteratorKey(it->key());
         const bool in_window =
             UserKeySpatioTemporalInWindow(uk, prune_t_min, prune_t_max,
                                           prune_x_min, prune_x_max, prune_y_min,
@@ -974,6 +1224,12 @@ int main(int argc, char** argv) {
           if (!pe.in_window) {
             continue;
           }
+          // Iterator already dedupes by segment_uid when enabled; do not call
+          // AcceptEmitUserKey again or every emitted key is treated as duplicate.
+          if (query_segment_uid_dedup && !prune_iterator_segment_uid_dedup &&
+              !query_dedup_prune.AcceptEmitUserKey(uk)) {
+            continue;
+          }
           constexpr uint64_t kSeed1 = 0x123456789abcdef0ULL;
           constexpr uint64_t kSeed2 = 0x0fedcba987654321ULL;
           uint64_t h1 = Hash64(uk.data(), uk.size(), kSeed1);
@@ -981,6 +1237,10 @@ int main(int argc, char** argv) {
           uint64_t h2 = Hash64(uk.data(), uk.size(), kSeed2);
           h2 = Hash64(v.data(), v.size(), h2);
           ++prune_inwindow_kv;
+          if (uk.size() > 0 &&
+              IsSegmentUserKeyMagic(static_cast<unsigned char>(uk.data()[0]))) {
+            ++prune_inwindow_segment_kv;
+          }
           prune_hash1 += h1;
           prune_hash2 += h2;
         }
@@ -1070,11 +1330,125 @@ int main(int argc, char** argv) {
               << prune_y_max << "]\n";
   }
 
+  if (query_segment_uid_dedup && run_prune) {
+    std::cout << "query_result_dedup_count full_skipped="
+              << query_dedup_full.dedup_skipped
+              << " prune_skipped=" << query_dedup_prune.dedup_skipped
+              << " full_unique_kv=" << full_inwindow_kv
+              << " prune_unique_kv=" << prune_inwindow_kv << "\n";
+  }
+
+  if (verify_kv_results && run_prune && !run_full) {
+    bool ref_ok = true;
+    double ref_segment_ratio = 0.0;
+    if (ref_meta_st_segments > 0) {
+      ref_segment_ratio =
+          static_cast<double>(prune_inwindow_segment_kv) /
+          static_cast<double>(ref_meta_st_segments);
+      const double min_allowed =
+          static_cast<double>(ref_meta_st_segments) *
+          static_cast<double>(ref_segment_kv_min_ratio);
+      const double max_allowed =
+          static_cast<double>(ref_meta_st_segments) *
+          static_cast<double>(ref_segment_kv_max_ratio);
+      if (static_cast<double>(prune_inwindow_segment_kv) < min_allowed ||
+          static_cast<double>(prune_inwindow_segment_kv) > max_allowed) {
+        ref_ok = false;
+      }
+    }
+    const bool trivial_zero =
+        (prune_inwindow_kv == 0 && ref_meta_st_segments > 0);
+    if (trivial_zero) {
+      ref_ok = false;
+    }
+    const bool strict_ok =
+        ref_ok && verify_prune_decode_failed == 0 &&
+        verify_prune_legacy_segment_value == 0 &&
+        verify_prune_ghost_missing_master_key == 0 &&
+        verify_prune_ghost_master_lookup_failed == 0 &&
+        verify_prune_ghost_master_decode_failed == 0 &&
+        verify_prune_ghost_master_is_ghost == 0 &&
+        verify_prune_ghost_master_meta_mismatch == 0;
+    std::cout << "verify_kv_results mode=prune_only correctness="
+              << (strict_ok ? "OK" : "FAIL")
+              << " ref_ok=" << (ref_ok ? "OK" : "FAIL")
+              << " prune_inwindow_kv=" << prune_inwindow_kv
+              << " prune_inwindow_segment_kv=" << prune_inwindow_segment_kv
+              << " ref_meta_st_segments=" << ref_meta_st_segments
+              << " ref_spatial_segments=" << ref_spatial_segments
+              << " trivial_zero=" << (trivial_zero ? 1 : 0)
+              << " ref_segment_ratio=" << std::fixed << std::setprecision(4)
+              << ref_segment_ratio
+              << " prune_decode_failed=" << verify_prune_decode_failed
+              << " prune_legacy_segment_value=" << verify_prune_legacy_segment_value
+              << " prune_unsupported_key=" << verify_prune_unsupported_key
+              << "\n";
+    if (verify_kv_results_strict_exit && !strict_ok) {
+      return 2;
+    }
+  }
+
+  if (verify_kv_results && run_full && !run_prune) {
+    bool ref_ok = true;
+    double ref_segment_ratio = 0.0;
+    if (ref_meta_st_segments > 0) {
+      ref_segment_ratio =
+          static_cast<double>(full_inwindow_segment_kv) /
+          static_cast<double>(ref_meta_st_segments);
+      const double min_allowed =
+          static_cast<double>(ref_meta_st_segments) *
+          static_cast<double>(ref_segment_kv_min_ratio);
+      const double max_allowed =
+          static_cast<double>(ref_meta_st_segments) *
+          static_cast<double>(ref_segment_kv_max_ratio);
+      if (static_cast<double>(full_inwindow_segment_kv) < min_allowed ||
+          static_cast<double>(full_inwindow_segment_kv) > max_allowed) {
+        ref_ok = false;
+      }
+    }
+  std::cout << "verify_kv_results mode=full_only correctness="
+            << (ref_ok ? "OK" : "FAIL")
+            << " ref_ok=" << (ref_ok ? "OK" : "FAIL")
+            << " full_inwindow_kv=" << full_inwindow_kv
+            << " full_inwindow_segment_kv=" << full_inwindow_segment_kv
+            << " ref_meta_st_segments=" << ref_meta_st_segments
+            << " ref_spatial_segments=" << ref_spatial_segments
+            << " ref_segment_ratio=" << std::fixed << std::setprecision(4)
+            << ref_segment_ratio
+            << " full_decode_failed=" << verify_full_decode_failed
+            << " full_legacy_segment_value=" << verify_full_legacy_segment_value
+            << "\n";
+  }
+
   if (verify_kv_results && run_full && run_prune) {
     const bool ok = (full_inwindow_kv == prune_inwindow_kv) &&
+                     (full_inwindow_segment_kv == prune_inwindow_segment_kv) &&
                      (full_hash1 == prune_hash1) &&
                      (full_hash2 == prune_hash2);
-    const bool strict_ok = ok && verify_full_decode_failed == 0 &&
+    bool ref_ok = true;
+    const bool trivial_zero =
+        (full_inwindow_kv == 0 && prune_inwindow_kv == 0);
+    if (trivial_zero &&
+        (ref_meta_st_segments > 0 || ref_spatial_segments > 0)) {
+      ref_ok = false;
+    }
+    double ref_segment_ratio = 0.0;
+    if (ref_meta_st_segments > 0) {
+      ref_segment_ratio =
+          static_cast<double>(full_inwindow_segment_kv) /
+          static_cast<double>(ref_meta_st_segments);
+      const double min_allowed =
+          static_cast<double>(ref_meta_st_segments) *
+          static_cast<double>(ref_segment_kv_min_ratio);
+      const double max_allowed =
+          static_cast<double>(ref_meta_st_segments) *
+          static_cast<double>(ref_segment_kv_max_ratio);
+      if (static_cast<double>(full_inwindow_segment_kv) < min_allowed ||
+          static_cast<double>(full_inwindow_segment_kv) > max_allowed) {
+        ref_ok = false;
+      }
+    }
+    const bool strict_ok = ok && ref_ok && verify_full_decode_failed == 0 &&
                            verify_prune_decode_failed == 0 &&
                            verify_full_legacy_segment_value == 0 &&
                            verify_prune_legacy_segment_value == 0 &&
@@ -1090,8 +1464,16 @@ int main(int argc, char** argv) {
                            verify_prune_ghost_master_meta_mismatch == 0;
     std::cout << "verify_kv_results correctness="
               << (strict_ok ? "OK" : "FAIL")
+              << " ref_ok=" << (ref_ok ? "OK" : "FAIL")
               << " full_inwindow_kv=" << full_inwindow_kv
               << " prune_inwindow_kv=" << prune_inwindow_kv
+              << " full_inwindow_segment_kv=" << full_inwindow_segment_kv
+              << " prune_inwindow_segment_kv=" << prune_inwindow_segment_kv
+              << " ref_meta_st_segments=" << ref_meta_st_segments
+              << " ref_spatial_segments=" << ref_spatial_segments
+              << " trivial_zero=" << (trivial_zero ? 1 : 0)
+              << " ref_segment_ratio=" << std::fixed << std::setprecision(4)
+              << ref_segment_ratio
               << " full_decode_failed=" << verify_full_decode_failed
               << " prune_decode_failed=" << verify_prune_decode_failed
               << " full_legacy_segment_value=" << verify_full_legacy_segment_value
@@ -1121,7 +1503,21 @@ int main(int argc, char** argv) {
               << " full_unsupported_key=" << verify_full_unsupported_key
               << " prune_unsupported_key=" << verify_prune_unsupported_key
               << "\n";
-    if (!strict_ok && ok &&
+    if (!ref_ok) {
+      if (trivial_zero &&
+          (ref_meta_st_segments > 0 || ref_spatial_segments > 0)) {
+        std::cout << "verify_kv_results detail: trivial zero in-window KV while "
+                     "ref_meta_st_segments or ref_spatial_segments > 0 "
+                     "(full and prune both empty; not validated against source).\n";
+      } else if (ref_meta_st_segments > 0) {
+        std::cout << "verify_kv_results detail: in-window segment KV count "
+                  << full_inwindow_segment_kv
+                  << " outside [" << ref_segment_kv_min_ratio << ","
+                  << ref_segment_kv_max_ratio << "] * ref_meta_st_segments="
+                  << ref_meta_st_segments << ".\n";
+      }
+    }
+    if (!strict_ok && ok && ref_ok &&
         (verify_full_decode_failed > 0 || verify_prune_decode_failed > 0 ||
          verify_full_legacy_segment_value > 0 ||
          verify_prune_legacy_segment_value > 0 ||
@@ -1140,6 +1536,9 @@ int main(int argc, char** argv) {
                    "or ghost follow-up failures/mismatches; rebuild segment DB "
                    "with Global master/ghost-compatible segment values for strict "
                    "correctness.\n";
+    }
+    if (verify_kv_results_strict_exit && !strict_ok) {
+      return 2;
     }
   }
 
@@ -1171,7 +1570,7 @@ int main(int argc, char** argv) {
               << (static_cast<double>(count_prune_in_window) /
                   static_cast<double>(count_full_scanned_total)) << "\n";
   }
-  if (run_full && run_prune && full_scan_mode == "window") {
+  if (run_full && run_prune && full_scan_mode == "window" && !verify_kv_results) {
     if (count_prune_in_window != count_full) {
       std::cout << "WARNING: prune keys_in_window=" << count_prune_in_window
                 << " != baseline window keys=" << count_full << "\n";

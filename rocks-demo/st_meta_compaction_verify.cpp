@@ -14,13 +14,22 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
+
+#include <cmath>
+#include <limits>
 
 #include <rocksdb/db.h>
 #include <rocksdb/metadata.h>
 #include <rocksdb/options.h>
+#include <rocksdb/sst_file_reader.h>
 #include <rocksdb/table.h>
+
+#include "table/index_value_codec.h"
+#include "table/st_meta_index_extension.h"
+#include "table/st_meta_user_key.h"
 
 #include "st_user_key.hpp"
 
@@ -109,6 +118,155 @@ void ReportSstByLevel(rocksdb::DB* db, const char* label) {
   std::cout << std::endl;
 }
 
+bool FileBoundsCoverScanned(const rocksdb::SpatioTemporalBlockMeta& f,
+                             const rocksdb::SpatioTemporalBlockMeta& s,
+                             float eps) {
+  if (f.t_min > s.t_min || f.t_max < s.t_max) {
+    return false;
+  }
+  const double el = static_cast<double>(eps);
+  auto axis_ok = [&](float fl, float fh, float sl, float sh) -> bool {
+    const double sd_lo = static_cast<double>(sl);
+    const double sd_hi = static_cast<double>(sh);
+    if (!std::isfinite(sd_lo) || !std::isfinite(sd_hi)) {
+      return true;
+    }
+    const double fd_lo = static_cast<double>(fl);
+    const double fd_hi = static_cast<double>(fh);
+    const bool lo_ok = !std::isfinite(fd_lo) || fd_lo <= sd_lo + el;
+    const bool hi_ok = !std::isfinite(fd_hi) || fd_hi >= sd_hi - el;
+    return lo_ok && hi_ok;
+  };
+  return axis_ok(f.x_min, f.x_max, s.x_min, s.x_max) &&
+         axis_ok(f.y_min, f.y_max, s.y_min, s.y_max);
+}
+
+// Phase-1 compaction check: SST table property `rocksdb.experimental.st_file_bounds`
+// must envelop the union of decoded ST summaries from actual KV (same semantics as
+// MergeSpatioTemporalMetaFromKeyValue). Bitmap is not recomputed here.
+bool VerifyLiveSstsKvVsFileStBounds(rocksdb::DB* db,
+                                    const rocksdb::Options& options,
+                                    std::string* first_error) {
+  std::vector<rocksdb::LiveFileMetaData> files;
+  db->GetLiveFilesMetaData(&files);
+  rocksdb::SstFileReader reader(options);
+
+  constexpr float kAxisEps =
+      1e-5f * 8.f;  // permissive vs float round-trip in SST aggregation
+
+  size_t checked = 0;
+  size_t skipped_no_st = 0;
+  size_t processed = 0;
+  {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+                  "VerifyLiveSstsKvVsFileStBounds: start live_files_total=%llu",
+                  static_cast<unsigned long long>(files.size()));
+    Log(buf);
+  }
+  for (const rocksdb::LiveFileMetaData& f : files) {
+    ++processed;
+    if (processed == 1 || (processed % 50) == 0) {
+      char buf[192];
+      std::snprintf(buf, sizeof(buf),
+                    "VerifyLiveSstsKvVsFileStBounds: progress processed=%llu/%llu "
+                    "checked_ST_sst=%llu skipped_no_decodable_st=%llu",
+                    static_cast<unsigned long long>(processed),
+                    static_cast<unsigned long long>(files.size()),
+                    static_cast<unsigned long long>(checked),
+                    static_cast<unsigned long long>(skipped_no_st));
+      Log(buf);
+    }
+    std::filesystem::path full = std::filesystem::path(f.directory) / f.relative_filename;
+    rocksdb::Status os = reader.Open(full.string());
+    if (!os.ok()) {
+      if (first_error) {
+        *first_error = "Open SST " + full.string() + ": " + os.ToString();
+      }
+      return false;
+    }
+    std::shared_ptr<const rocksdb::TableProperties> tp = reader.GetTableProperties();
+    if (!tp) {
+      if (first_error) {
+        *first_error = "No table properties: " + full.string();
+      }
+      return false;
+    }
+    auto pit = tp->user_collected_properties.find(
+        rocksdb::kExperimentalStFileBoundsPropertyName());
+    if (pit == tp->user_collected_properties.end()) {
+      if (first_error) {
+        *first_error = "Missing " +
+                       std::string(rocksdb::kExperimentalStFileBoundsPropertyName()) +
+                       " in " + full.string();
+      }
+      return false;
+    }
+    rocksdb::Slice prop_slice(pit->second);
+    rocksdb::SpatioTemporalBlockMeta file_bounds{};
+    rocksdb::Status ds =
+        rocksdb::DecodeSpatioTemporalIndexTail(&prop_slice, &file_bounds);
+    if (!ds.ok() || !prop_slice.empty()) {
+      if (first_error) {
+        *first_error = "Decode file ST bounds " + full.string() + ": " +
+                       ds.ToString();
+      }
+      return false;
+    }
+
+    rocksdb::SpatioTemporalBlockMeta scanned{};
+    bool scanned_valid = false;
+
+    std::unique_ptr<rocksdb::Iterator> it(reader.NewIterator(rocksdb::ReadOptions()));
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      const rocksdb::Slice uk = it->key();
+      const rocksdb::Slice val = it->value();
+      rocksdb::MergeSpatioTemporalMetaFromKeyValue(uk,
+                                                   std::make_optional(val),
+                                                   &scanned, &scanned_valid);
+    }
+    if (!it->status().ok()) {
+      if (first_error) {
+        *first_error = "SST KV scan failed " + full.string() + ": " +
+                       it->status().ToString();
+      }
+      return false;
+    }
+    if (!scanned_valid) {
+      ++skipped_no_st;
+      continue;
+    }
+    ++checked;
+    if (!FileBoundsCoverScanned(file_bounds, scanned, kAxisEps)) {
+      if (first_error) {
+        std::ostringstream o;
+        o << "KV union not covered by rocksdb.experimental.st_file_bounds "
+          << full.string() << " file_bounds t[" << file_bounds.t_min << ","
+          << file_bounds.t_max << "] x[" << file_bounds.x_min << ","
+          << file_bounds.x_max << "] y[" << file_bounds.y_min << ","
+          << file_bounds.y_max << "] scanned t[" << scanned.t_min << ","
+          << scanned.t_max << "] x[" << scanned.x_min << "," << scanned.x_max
+          << "] y[" << scanned.y_min << "," << scanned.y_max << "]";
+        *first_error = o.str();
+      }
+      return false;
+    }
+  }
+
+  {
+    char summary[192];
+    std::snprintf(
+        summary, sizeof(summary),
+        "VerifyLiveSstsKvVsFileStBounds: ok  checked_ST_sst=%llu  "
+        "skipped_no_decodable_st=%llu  live_files_total=%llu",
+        static_cast<unsigned long long>(checked),
+        static_cast<unsigned long long>(skipped_no_st),
+        static_cast<unsigned long long>(files.size()));
+    Log(summary);
+  }
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -133,6 +291,8 @@ int main(int argc, char** argv) {
   bool no_clean = false;
   bool no_st_meta = false;
   bool minimal = false;
+  bool verify_kv_vs_file_bounds = false;
+  bool verify_only = false;
   int num_keys = 50000;
   uint32_t event_max_span = 80;
   uint32_t event_bucket_width = 0;
@@ -141,10 +301,14 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--split") == 0) {
       split = true;
+    } else if (std::strcmp(argv[i], "--verify-only") == 0) {
+      verify_only = true;
     } else if (std::strcmp(argv[i], "--no-st-meta") == 0) {
       no_st_meta = true;
     } else if (std::strcmp(argv[i], "--minimal") == 0) {
       minimal = true;
+    } else if (std::strcmp(argv[i], "--verify-kv-vs-file-meta") == 0) {
+      verify_kv_vs_file_bounds = true;
     } else if (std::strcmp(argv[i], "--no-clean") == 0) {
       no_clean = true;
     } else if (std::strcmp(argv[i], "--db") == 0 && i + 1 < argc) {
@@ -186,14 +350,19 @@ int main(int argc, char** argv) {
       std::cout
           << "st_meta_compaction_verify [--split] [--db <dir>] [--num N] "
              "[--no-clean] [--no-st-meta] [--minimal]\n"
+             "            [--verify-kv-vs-file-meta] [--verify-only]\n"
              "            [--max-span N] [--bucket-width N] [--max-point-keys N]\n"
              "  Default --num=50000. Use --num 5000 for a quick run.\n"
              "  Cleans db dir via std::filesystem::remove_all (not DestroyDB) "
              "to avoid Windows hangs; --no-clean skips removal.\n"
+             "  --verify-only: do NOT delete or write the DB; just open the\n"
+             "    existing DB and run --verify-kv-vs-file-meta (read-only).\n"
              "  --minimal: only create_if_missing + disable_auto_compactions "
              "(default table factory); for diagnosing Open crashes.\n"
              "  --no-st-meta: plain BlockBasedTable (no ST index tail); use if "
              "Open crashes with experimental_spatio_temporal_meta_in_index_value.\n"
+             "  --verify-kv-vs-file-meta: after compaction, check each live SST's "
+             "`rocksdb.experimental.st_file_bounds` envelops the KV union (E5/E7).\n"
              "  Without --split: CompactRange (may trivial-move SSTs).\n"
              "  With --split: event-time split; default --max-span 80; compaction "
              "uses CompactFiles (real merge, no optional codecs). Keys sort by t "
@@ -238,6 +407,23 @@ int main(int argc, char** argv) {
       ROCKS_DEMO_STR(ROCKS_DEMO_BT));
   std::fflush(stderr);
 
+  if (verify_only && !verify_kv_vs_file_bounds) {
+    std::fprintf(stderr,
+                 "ERROR: --verify-only requires --verify-kv-vs-file-meta\n");
+    return 1;
+  }
+  if (verify_only && split) {
+    std::fprintf(
+        stderr,
+        "ERROR: --verify-only is incompatible with --split (no compaction)\n");
+    return 1;
+  }
+  if (verify_only && !no_clean) {
+    // Be explicit: this tool used to delete db_path by default.
+    Log("NOTE: --verify-only implies --no-clean (safety)");
+    no_clean = true;
+  }
+
   try {
     const std::filesystem::path p(db_path);
     if (p.has_parent_path()) {
@@ -269,16 +455,18 @@ int main(int argc, char** argv) {
     Log("--no-clean: skip directory removal");
   }
 
-  try {
-    std::filesystem::create_directories(std::filesystem::path(db_path));
-  } catch (const std::exception& e) {
-    std::fprintf(stderr, "create_directories(db): %s\n", e.what());
-    return 1;
+  if (!verify_only) {
+    try {
+      std::filesystem::create_directories(std::filesystem::path(db_path));
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "create_directories(db): %s\n", e.what());
+      return 1;
+    }
+    Log("db directory ready (empty or new)");
   }
-  Log("db directory ready (empty or new)");
 
   rocksdb::Options opt;
-  opt.create_if_missing = true;
+  opt.create_if_missing = !verify_only;
   opt.disable_auto_compactions = true;
   if (minimal) {
     Log("Options: --minimal (default table factory, no custom sizes)");
@@ -317,7 +505,11 @@ int main(int argc, char** argv) {
   rocksdb::Status s;
   const auto t_open0 = std::chrono::steady_clock::now();
   try {
-    s = rocksdb::DB::Open(opt, db_path, &db);
+    if (verify_only) {
+      s = rocksdb::DB::OpenForReadOnly(opt, db_path, &db);
+    } else {
+      s = rocksdb::DB::Open(opt, db_path, &db);
+    }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "DB::Open std::exception: %s\n", e.what());
     return 1;
@@ -340,6 +532,18 @@ int main(int argc, char** argv) {
   }
   if (!s.ok()) {
     return 1;
+  }
+
+  if (verify_only) {
+    if (verify_kv_vs_file_bounds) {
+      std::string err;
+      const bool ok = VerifyLiveSstsKvVsFileStBounds(db.get(), opt, &err);
+      if (!ok) {
+        std::cerr << err << "\n";
+        return 1;
+      }
+    }
+    return 0;
   }
 
   if (split) {
@@ -423,6 +627,22 @@ int main(int argc, char** argv) {
 
   Log("--- result ---");
   ReportSstByLevel(db.get(), split ? "split_ON" : "split_OFF");
+
+  if (verify_kv_vs_file_bounds) {
+    if (minimal || no_st_meta) {
+      std::fprintf(
+          stderr,
+          "--verify-kv-vs-file-meta requires ST-enabled table (--no-st-meta and "
+          "--minimal are incompatible).\n");
+      return 2;
+    }
+    std::string verr;
+    if (!VerifyLiveSstsKvVsFileStBounds(db.get(), db->GetOptions(), &verr)) {
+      std::fprintf(stderr, "VERIFY FAILED: %s\n", verr.c_str());
+      return 3;
+    }
+  }
+
   Log("exit 0");
   return 0;
 }

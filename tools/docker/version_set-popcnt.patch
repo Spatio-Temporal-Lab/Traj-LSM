@@ -1,0 +1,15 @@
+--- a/db/version_set.cc
++++ b/db/version_set.cc
+@@ -1832,11 +1832,11 @@
+   }
+   if (q.file_level_files_time_disjoint != nullptr) {
+     *q.file_level_files_time_disjoint +=
+-        static_cast<uint64_t>(__popcnt(static_cast<unsigned int>(time_mask)));
++        static_cast<uint64_t>(__builtin_popcount(static_cast<unsigned int>(time_mask)));
+   }
+   if (q.file_level_files_space_disjoint != nullptr) {
+     *q.file_level_files_space_disjoint +=
+-        static_cast<uint64_t>(__popcnt(static_cast<unsigned int>(space_mask)));
++        static_cast<uint64_t>(__builtin_popcount(static_cast<unsigned int>(space_mask)));
+   }
+   if (q.file_level_files_skipped != nullptr) {

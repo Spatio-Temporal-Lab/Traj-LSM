@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cinttypes>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -186,6 +187,39 @@ std::string ManifestSetFileName(uint64_t number) {
 
 std::string ManifestSetFileName(const std::string& dbname, uint64_t number) {
   return dbname + "/" + ManifestSetFileName(number);
+}
+
+std::string MManagerFileName(uint64_t number) {
+  assert(number > 0);
+  char buf[100];
+  snprintf(buf, sizeof(buf), "M_manager-%06llu",
+           static_cast<unsigned long long>(number));
+  return buf;
+}
+
+std::string MManagerFileName(const std::string& dbname, uint64_t number) {
+  return dbname + "/" + MManagerFileName(number);
+}
+
+bool ParseMManagerFileNumber(const std::string& fname, uint64_t* number) {
+  if (number == nullptr) {
+    return false;
+  }
+  Slice rest(fname);
+  if (rest.size() > 1 && rest[0] == '/') {
+    rest.remove_prefix(1);
+  }
+  const char kPrefix[] = "M_manager-";
+  if (!rest.starts_with(kPrefix)) {
+    return false;
+  }
+  rest.remove_prefix(sizeof(kPrefix) - 1);
+  uint64_t num = 0;
+  if (!ConsumeDecimalNumber(&rest, &num) || !rest.empty()) {
+    return false;
+  }
+  *number = num;
+  return true;
 }
 
 std::string CurrentFileName(const std::string& dbname) {
@@ -443,16 +477,153 @@ IOStatus SetCurrentFile(const WriteOptions& write_options, FileSystem* fs,
                         const std::string& dbname, uint64_t descriptor_number,
                         Temperature temp,
                         FSDirectory* dir_contains_current_file) {
-  // Multi-manifest only: CURRENT must always point to a MANIFEST_SET.
-  // Use a single-entry MANIFEST_SET for bootstrap.
-  const std::vector<uint64_t> descriptors = {descriptor_number};
-  const uint64_t generation = 0;
-  return SetCurrentFileToManifestSet(write_options, fs, dbname,
-                                     /*manifest_set_number=*/descriptor_number,
-                                     descriptors, generation, temp,
-                                     dir_contains_current_file,
-                                     /*manifest_time_mins=*/nullptr,
-                                     /*manifest_time_maxs=*/nullptr);
+  // Single MANIFEST chain (Mind.md): CURRENT points directly at MANIFEST-*.
+  std::string manifest = DescriptorFileName(dbname, descriptor_number);
+  Slice contents = manifest;
+  assert(contents.starts_with(dbname + "/"));
+  contents.remove_prefix(dbname.size() + 1);
+  std::string tmp = TempFileName(dbname, descriptor_number);
+  IOOptions opts;
+  IOStatus s = PrepareIOFromWriteOptions(write_options, opts);
+  FileOptions file_opts;
+  file_opts.temperature = temp;
+  if (s.ok()) {
+    s = WriteStringToFile(fs, contents.ToString() + "\n", tmp, true, opts,
+                          file_opts);
+  }
+  TEST_SYNC_POINT_CALLBACK("SetCurrentFile:BeforeRename", &s);
+  if (s.ok()) {
+    TEST_KILL_RANDOM_WITH_WEIGHT("SetCurrentFile:0", REDUCE_ODDS2);
+    s = fs->RenameFile(tmp, CurrentFileName(dbname), opts, nullptr);
+    TEST_KILL_RANDOM_WITH_WEIGHT("SetCurrentFile:1", REDUCE_ODDS2);
+    TEST_SYNC_POINT_CALLBACK("SetCurrentFile:AfterRename", &s);
+  }
+  if (s.ok()) {
+    if (dir_contains_current_file != nullptr) {
+      s = dir_contains_current_file->FsyncWithDirOptions(
+          opts, nullptr, DirFsyncOptions(CurrentFileName(dbname)));
+    }
+  } else {
+    fs->DeleteFile(tmp, opts, nullptr).PermitUncheckedError();
+  }
+  return s;
+}
+
+IOStatus SetCurrentFileToMManager(
+    const WriteOptions& write_options, FileSystem* fs, const std::string& dbname,
+    uint64_t manager_number, const std::vector<uint64_t>& descriptor_numbers,
+    uint64_t generation, Temperature temp,
+    FSDirectory* dir_contains_current_file,
+    const std::vector<uint64_t>* manifest_time_mins,
+    const std::vector<uint64_t>* manifest_time_maxs,
+    const std::vector<uint64_t>* manifest_host_buckets) {
+  if (descriptor_numbers.empty()) {
+    return IOStatus::InvalidArgument("descriptor_numbers is empty");
+  }
+  if (manifest_time_mins == nullptr || manifest_time_maxs == nullptr) {
+    return IOStatus::InvalidArgument(
+        "manifest_time_mins and manifest_time_maxs are required for M_manager");
+  }
+  if (manifest_time_mins->size() != descriptor_numbers.size() ||
+      manifest_time_maxs->size() != descriptor_numbers.size()) {
+    return IOStatus::InvalidArgument(
+        "manifest time bounds size must match descriptor_numbers");
+  }
+  if (manifest_host_buckets != nullptr &&
+      manifest_host_buckets->size() != descriptor_numbers.size()) {
+    return IOStatus::InvalidArgument(
+        "manifest_host_buckets size must match descriptor_numbers");
+  }
+
+  IOOptions exists_opts;
+  std::vector<uint64_t> filtered_descriptors;
+  std::vector<uint64_t> filtered_tmins;
+  std::vector<uint64_t> filtered_tmaxs;
+  std::vector<uint64_t> filtered_host_buckets;
+  filtered_descriptors.reserve(descriptor_numbers.size());
+  filtered_tmins.reserve(descriptor_numbers.size());
+  filtered_tmaxs.reserve(descriptor_numbers.size());
+  if (manifest_host_buckets != nullptr) {
+    filtered_host_buckets.reserve(descriptor_numbers.size());
+  }
+  for (size_t i = 0; i < descriptor_numbers.size(); ++i) {
+    const uint64_t num = descriptor_numbers[i];
+    if (num == 0) {
+      return IOStatus::InvalidArgument("descriptor number must be > 0");
+    }
+    const std::string descriptor_path = DescriptorFileName(dbname, num);
+    IOStatus exists_s = fs->FileExists(descriptor_path, exists_opts, nullptr);
+    if (!exists_s.ok()) {
+      continue;
+    }
+    filtered_descriptors.push_back(num);
+    filtered_tmins.push_back((*manifest_time_mins)[i]);
+    filtered_tmaxs.push_back((*manifest_time_maxs)[i]);
+    if (manifest_host_buckets != nullptr) {
+      filtered_host_buckets.push_back((*manifest_host_buckets)[i]);
+    }
+  }
+  if (filtered_descriptors.empty()) {
+    return IOStatus::NotFound(
+        "all descriptor_numbers are missing; cannot write M_manager");
+  }
+
+  std::string manager_content;
+  manager_content.reserve(filtered_descriptors.size() * 48 + 64);
+  manager_content.append("version=1\n");
+  if (generation != 0) {
+    manager_content.append("generation=");
+    manager_content.append(std::to_string(generation));
+    manager_content.push_back('\n');
+  }
+  for (size_t i = 0; i < filtered_descriptors.size(); ++i) {
+    manager_content.append("entry=");
+    manager_content.append(DescriptorFileName(filtered_descriptors[i]));
+    if (!filtered_host_buckets.empty() &&
+        filtered_host_buckets[i] != std::numeric_limits<uint64_t>::max()) {
+      manager_content.append(",bucket=");
+      manager_content.append(std::to_string(filtered_host_buckets[i]));
+    }
+    manager_content.append(",tmin=");
+    manager_content.append(std::to_string(filtered_tmins[i]));
+    manager_content.append(",tmax=");
+    manager_content.append(std::to_string(filtered_tmaxs[i]));
+    manager_content.push_back('\n');
+  }
+
+  IOOptions opts;
+  IOStatus s = PrepareIOFromWriteOptions(write_options, opts);
+  FileOptions file_opts;
+  file_opts.temperature = temp;
+
+  const std::string manager_path = MManagerFileName(dbname, manager_number);
+  const std::string tmp_manager_path = TempFileName(dbname, manager_number);
+  if (s.ok()) {
+    s = WriteStringToFile(fs, manager_content, tmp_manager_path, true, opts,
+                          file_opts);
+  }
+  if (s.ok()) {
+    s = fs->RenameFile(tmp_manager_path, manager_path, opts, nullptr);
+  }
+  if (s.ok()) {
+    const std::string manager_name = MManagerFileName(manager_number);
+    const std::string tmp_current = TempFileName(dbname, manager_number + 1);
+    s = WriteStringToFile(fs, manager_name + "\n", tmp_current, true, opts,
+                          file_opts);
+    if (s.ok()) {
+      s = fs->RenameFile(tmp_current, CurrentFileName(dbname), opts, nullptr);
+    } else {
+      fs->DeleteFile(tmp_current, opts, nullptr).PermitUncheckedError();
+    }
+  }
+  if (s.ok() && dir_contains_current_file != nullptr) {
+    s = dir_contains_current_file->FsyncWithDirOptions(
+        opts, nullptr, DirFsyncOptions(CurrentFileName(dbname)));
+  }
+  if (!s.ok()) {
+    fs->DeleteFile(tmp_manager_path, opts, nullptr).PermitUncheckedError();
+  }
+  return s;
 }
 
 IOStatus SetCurrentFileToManifestSet(

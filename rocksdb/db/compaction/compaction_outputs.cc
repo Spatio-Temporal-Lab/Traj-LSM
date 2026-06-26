@@ -11,12 +11,66 @@
 #include "db/compaction/compaction_outputs.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 #include "db/builder.h"
 #include "logging/logging.h"
+#include "db/compaction/st_event_split_policy.h"
 #include "table/st_meta_user_key.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+bool ExperimentalStUidMergeEnabled() {
+  const char* v = std::getenv("ROCKSDB_EXPERIMENTAL_ST_UID_MERGE");
+  if (v == nullptr || *v == '\0') {
+    return true;
+  }
+  return std::string(v) == "1";
+}
+
+}  // namespace
+
+bool CompactionOutputs::ShouldDropDuplicateSegmentUid(const Slice& user_key,
+                                                      const Slice& value) {
+  if (!st_uid_merge_enabled_ || !IsE7SegmentUserKey(user_key)) {
+    return false;
+  }
+  StSegmentUid uid;
+  if (!TryDecodeE7SegmentUid(user_key, &uid)) {
+    return false;
+  }
+  uint32_t cur_bucket = 0;
+  if (!TryDecodeE7HostBucketId(user_key, &cur_bucket)) {
+    return false;
+  }
+  const uint32_t bw =
+      compaction_->mutable_cf_options()
+                  .experimental_compaction_event_time_bucket_width > 0
+          ? compaction_->mutable_cf_options()
+                .experimental_compaction_event_time_bucket_width
+          : kSpatioTemporalE7DefaultBucketSeconds;
+  uint32_t host_bucket = 0;
+  bool cur_is_host = false;
+  if (TryDecodeE7HostBucketFromValue(value, bw, &host_bucket)) {
+    cur_is_host = (cur_bucket == host_bucket);
+  }
+  auto it = st_uid_merge_seen_.find(uid);
+  if (it == st_uid_merge_seen_.end()) {
+    st_uid_merge_seen_.emplace(uid, StUidMergeEntry{cur_bucket, cur_is_host});
+    return false;
+  }
+  if (it->second.kept_is_host) {
+    ++st_compaction_uid_dropped_;
+    return true;
+  }
+  if (cur_is_host) {
+    return false;
+  }
+  ++st_compaction_uid_dropped_;
+  return true;
+}
 
 void CompactionOutputs::NewBuilder(const TableBuilderOptions& tboptions) {
   builder_.reset(NewTableBuilder(tboptions, file_writer_.get()));
@@ -247,12 +301,15 @@ double CompactionOutputs::ComputeSpatialArea(const SpatioTemporalBlockMeta& m) {
 
 bool CompactionOutputs::ShouldStopBeforeEventTime(
     const CompactionIterator& c_iter) {
+  st_event_last_cut_reason_ = StEventCutReason::kNone;
+  st_event_last_cut_bucket_span_ = 0;
   const auto& mopt = compaction_->mutable_cf_options();
   const bool time_split_enabled = mopt.experimental_compaction_event_time_split;
-  const bool spatial_split_enabled =
-      mopt.experimental_compaction_spatial_soft_expansion_ratio > 0.0 ||
-      mopt.experimental_compaction_spatial_hard_expansion_ratio > 0.0;
-  if (!time_split_enabled && !spatial_split_enabled) {
+  if (!time_split_enabled) {
+    return false;
+  }
+  // Never split outputs to L0.
+  if (compaction_->output_level() == 0) {
     return false;
   }
   if (c_iter.IsDeleteRangeSentinelKey()) {
@@ -272,7 +329,20 @@ bool CompactionOutputs::ShouldStopBeforeEventTime(
   const uint32_t bucket_w = mopt.experimental_compaction_event_time_bucket_width;
   const uint32_t min_keys =
       mopt.experimental_compaction_event_time_min_keys_per_file;
-  const uint32_t max_keys = mopt.experimental_compaction_event_time_max_point_keys;
+
+  const int out_level = compaction_->output_level();
+  const auto policy = ComputeStEventSplitLevelPolicy(out_level, max_span);
+  const uint32_t max_bucket_span = policy.max_bucket_span;
+  const uint32_t effective_max_span = policy.effective_max_time_span;
+  // Level-aware key cap (from policy); global explicit setting can override
+  // downward (minimum wins).
+  const uint32_t global_max_keys =
+      mopt.experimental_compaction_event_time_max_point_keys;
+  uint32_t effective_max_keys = policy.effective_max_keys;
+  if (global_max_keys > 0 && global_max_keys < effective_max_keys) {
+    effective_max_keys = global_max_keys;
+  }
+
   if (time_split_enabled && bucket_w > 0) {
     const uint32_t b = t / bucket_w;
     if (b != st_event_last_bucket_) {
@@ -282,69 +352,64 @@ bool CompactionOutputs::ShouldStopBeforeEventTime(
           " curr_bucket=%" PRIu32 " st_keys_in_output=%" PRIu32
           " min_keys=%" PRIu32,
           st_event_last_bucket_, b, st_event_st_keys_in_output_, min_keys);
-      if (min_keys == 0 || st_event_st_keys_in_output_ >= min_keys) {
+      const uint32_t span =
+          (b >= st_event_first_bucket_) ? (b - st_event_first_bucket_ + 1) : 1;
+      if (span > max_bucket_span) {
+        if (min_keys == 0 || st_event_st_keys_in_output_ >= min_keys) {
+          st_event_last_cut_reason_ = StEventCutReason::kBucketSpan;
+          st_event_last_cut_bucket_span_ = span;
+          ROCKS_LOG_INFO(
+              compaction_->immutable_options().info_log,
+              "ST_EVENT_SPLIT cut_on_bucket_span: first_bucket=%" PRIu32
+              " curr_bucket=%" PRIu32 " span=%" PRIu32 " max_span=%" PRIu32
+              " st_keys_in_output=%" PRIu32,
+              st_event_first_bucket_, b, span, max_bucket_span,
+              st_event_st_keys_in_output_);
+          return true;
+        }
         ROCKS_LOG_INFO(
             compaction_->immutable_options().info_log,
-            "ST_EVENT_SPLIT cut_on_bucket_change: prev_bucket=%" PRIu32
-            " curr_bucket=%" PRIu32 " st_keys_in_output=%" PRIu32,
-            st_event_last_bucket_, b, st_event_st_keys_in_output_);
-        return true;
+            "ST_EVENT_SPLIT span_exceeded_blocked_by_min_keys: first_bucket=%" PRIu32
+            " curr_bucket=%" PRIu32 " span=%" PRIu32 " max_span=%" PRIu32
+            " st_keys_in_output=%" PRIu32 " min_keys=%" PRIu32,
+            st_event_first_bucket_, b, span, max_bucket_span,
+            st_event_st_keys_in_output_, min_keys);
+      } else if (min_keys == 0 || st_event_st_keys_in_output_ >= min_keys) {
+        ROCKS_LOG_INFO(compaction_->immutable_options().info_log,
+                       "ST_EVENT_SPLIT keep_on_bucket_change_within_span:"
+                       " prev_bucket=%" PRIu32 " curr_bucket=%" PRIu32
+                       " span=%" PRIu32 " max_bucket_span=%" PRIu32,
+                       st_event_last_bucket_, b, span, max_bucket_span);
       }
-      ROCKS_LOG_INFO(
-          compaction_->immutable_options().info_log,
-          "ST_EVENT_SPLIT blocked_by_min_keys: prev_bucket=%" PRIu32
-          " curr_bucket=%" PRIu32 " st_keys_in_output=%" PRIu32
-          " min_keys=%" PRIu32,
-          st_event_last_bucket_, b, st_event_st_keys_in_output_, min_keys);
     }
   }
-  if (time_split_enabled && max_span > 0) {
+  if (time_split_enabled && effective_max_span > 0) {
     const uint32_t new_min = std::min(st_event_out_min_t_, t);
     const uint32_t new_max = std::max(st_event_out_max_t_, t);
-    if (new_max - new_min > max_span) {
+    if (new_max - new_min > effective_max_span) {
+      // Hard constraint: must cut to keep per-file time range bounded.
+      st_event_last_cut_reason_ = StEventCutReason::kTimeSpan;
+      ROCKS_LOG_INFO(
+          compaction_->immutable_options().info_log,
+          "ST_EVENT_SPLIT cut_on_time_span: new_min=%" PRIu32
+          " new_max=%" PRIu32 " span=%" PRIu32 " max_span=%" PRIu32
+          " st_keys_in_output=%" PRIu32 " min_keys=%" PRIu32 " level=%d",
+          new_min, new_max, (new_max - new_min), effective_max_span,
+          st_event_st_keys_in_output_, min_keys, out_level);
       return true;
     }
   }
-  if (time_split_enabled && max_keys > 0 &&
-      st_event_st_keys_in_output_ >= max_keys) {
+  if (time_split_enabled && effective_max_keys > 0 &&
+      st_event_st_keys_in_output_ >= effective_max_keys) {
+    // Hard constraint: bound per-file work. Level-aware: L1=10K, L2=40K,
+    // L3=160K, L4+ unlimited — SST size pyramid.
+    st_event_last_cut_reason_ = StEventCutReason::kMaxKeys;
+    ROCKS_LOG_INFO(compaction_->immutable_options().info_log,
+                   "ST_EVENT_SPLIT cut_on_max_keys: st_keys_in_output=%" PRIu32
+                   " max_keys=%" PRIu32 " min_keys=%" PRIu32 " level=%d",
+                   st_event_st_keys_in_output_, effective_max_keys, min_keys,
+                   out_level);
     return true;
-  }
-  if (spatial_split_enabled && st_event_out_spatial_valid_) {
-    SpatioTemporalBlockMeta merged = st_event_out_spatial_;
-    bool merged_valid = st_event_out_spatial_valid_;
-    MergeSpatioTemporalMetaFromUserKey(c_iter.user_key(), &merged, &merged_valid);
-    if (merged_valid) {
-      constexpr double kEps = 1e-12;
-      const double old_area = ComputeSpatialArea(st_event_out_spatial_);
-      const double new_area = ComputeSpatialArea(merged);
-      const double expansion = (new_area - old_area) / std::max(old_area, kEps);
-      if (mopt.experimental_compaction_spatial_hard_expansion_ratio > 0.0 &&
-          expansion >=
-              mopt.experimental_compaction_spatial_hard_expansion_ratio &&
-          current_output_file_size_ >=
-              mopt.experimental_compaction_spatial_hard_min_file_size) {
-        ROCKS_LOG_INFO(
-            compaction_->immutable_options().info_log,
-            "ST_EVENT_SPLIT hard_spatial_cut expansion=%f old_area=%f new_area=%f"
-            " file_size=%" PRIu64 " min_file_size=%" PRIu64,
-            expansion, old_area, new_area, current_output_file_size_,
-            mopt.experimental_compaction_spatial_hard_min_file_size);
-        return true;
-      }
-      if (mopt.experimental_compaction_spatial_soft_expansion_ratio > 0.0 &&
-          expansion >=
-              mopt.experimental_compaction_spatial_soft_expansion_ratio) {
-        if (min_keys == 0 || st_event_st_keys_in_output_ >= min_keys) {
-          ROCKS_LOG_INFO(
-              compaction_->immutable_options().info_log,
-              "ST_EVENT_SPLIT soft_spatial_cut expansion=%f old_area=%f"
-              " new_area=%f st_keys_in_output=%" PRIu32 " min_keys=%" PRIu32,
-              expansion, old_area, new_area, st_event_st_keys_in_output_,
-              min_keys);
-          return true;
-        }
-      }
-    }
   }
   return false;
 }
@@ -498,6 +563,42 @@ Status CompactionOutputs::AddToOutput(
   }
   const Slice& key = c_iter.key();
   if (ShouldStopBefore(c_iter) && HasBuilder()) {
+    switch (st_event_last_cut_reason_) {
+      case StEventCutReason::kBucketSpan: {
+        if (st_event_last_cut_bucket_span_ > 1) {
+          ++st_event_metric_cross_bucket_cuts_;
+          const uint32_t clamped =
+              std::min<uint32_t>(16, st_event_last_cut_bucket_span_);
+          ++st_event_metric_bucket_span_hist_[clamped];
+          ROCKS_LOG_INFO(
+              compaction_->immutable_options().info_log,
+              "ST_EVENT_METRIC cross_bucket_compaction_count=%" PRIu64
+              " last_span=%" PRIu32
+              " bucket_span_histogram_by_level[output_level=%d].hist_span[%u]=%"
+              PRIu64,
+              st_event_metric_cross_bucket_cuts_, st_event_last_cut_bucket_span_,
+              compaction_->output_level(),
+              static_cast<unsigned>(clamped),
+              st_event_metric_bucket_span_hist_[clamped]);
+        }
+        break;
+      }
+      case StEventCutReason::kTimeSpan:
+        ++st_event_metric_time_span_cuts_;
+        break;
+      case StEventCutReason::kMaxKeys:
+        ++st_event_metric_max_keys_cuts_;
+        break;
+      case StEventCutReason::kHardSpatial:
+        ++st_event_metric_hard_spatial_cuts_;
+        break;
+      case StEventCutReason::kSoftSpatial:
+        ++st_event_metric_soft_spatial_cuts_;
+        break;
+      case StEventCutReason::kNone:
+      default:
+        break;
+    }
     s = close_file_func(c_iter.InputStatus(), prev_iter_output_internal_key,
                         key, &c_iter, *this);
     if (!s.ok()) {
@@ -518,6 +619,7 @@ Status CompactionOutputs::AddToOutput(
     st_event_out_min_t_ = 0;
     st_event_out_max_t_ = 0;
     st_event_st_keys_in_output_ = 0;
+    st_event_first_bucket_ = 0;
     st_event_last_bucket_ = 0;
     st_event_out_spatial_valid_ = false;
     st_event_out_spatial_ = {};
@@ -542,8 +644,12 @@ Status CompactionOutputs::AddToOutput(
     return s;
   }
 
-  assert(builder_ != nullptr);
   const Slice& value = c_iter.value();
+  if (ShouldDropDuplicateSegmentUid(c_iter.user_key(), value)) {
+    return s;
+  }
+
+  assert(builder_ != nullptr);
   s = current_output().validator.Add(key, value);
   if (!s.ok()) {
     return s;
@@ -574,9 +680,7 @@ Status CompactionOutputs::AddToOutput(
   }
 
   const auto& mopt = compaction_->mutable_cf_options();
-  if (mopt.experimental_compaction_event_time_split ||
-      mopt.experimental_compaction_spatial_soft_expansion_ratio > 0.0 ||
-      mopt.experimental_compaction_spatial_hard_expansion_ratio > 0.0) {
+  if (mopt.experimental_compaction_event_time_split) {
     uint32_t t = 0;
     if (TryDecodeSpatioTemporalUserKeyTime(c_iter.user_key(), &t)) {
       if (!st_event_diag_logged_first_decode_) {
@@ -596,6 +700,7 @@ Status CompactionOutputs::AddToOutput(
             mopt.experimental_compaction_event_time_bucket_width > 0
                 ? t / mopt.experimental_compaction_event_time_bucket_width
                 : 0;
+        st_event_first_bucket_ = st_event_last_bucket_;
         st_event_st_keys_in_output_ = 1;
         st_event_out_has_st_key_ = true;
       } else {
@@ -607,14 +712,13 @@ Status CompactionOutputs::AddToOutput(
         }
         st_event_st_keys_in_output_++;
       }
-      MergeSpatioTemporalMetaFromUserKey(c_iter.user_key(), &st_event_out_spatial_,
-                                         &st_event_out_spatial_valid_);
     } else if (!st_event_diag_logged_decode_fail_) {
       const Slice uk = c_iter.user_key();
       if (!uk.empty()) {
         const uint8_t magic = static_cast<uint8_t>(uk.data()[0]);
         if (magic == kSpatioTemporalUserKeyMagic ||
-            magic == kSpatioTemporalSegmentKeyMagic) {
+            magic == kSpatioTemporalSegmentKeyLegacyMagic ||
+            magic == kSpatioTemporalSegmentKeyTzidMagic) {
           ROCKS_LOG_INFO(
               compaction_->immutable_options().info_log,
               "ST_EVENT_SPLIT decode_failed_for_st_like_key: magic=%u size=%" PRIu64,
@@ -997,6 +1101,43 @@ CompactionOutputs::CompactionOutputs(const Compaction* compaction,
   }
 
   level_ptrs_ = std::vector<size_t>(compaction_->number_levels(), 0);
+
+  st_uid_merge_enabled_ =
+      ExperimentalStUidMergeEnabled() &&
+      StEventAllowsCrossBucketMerge(compaction_->output_level());
+  st_uid_merge_seen_.clear();
+  st_compaction_uid_dropped_ = 0;
+}
+
+CompactionOutputs::~CompactionOutputs() {
+  if (compaction_ == nullptr) {
+    return;
+  }
+  if (st_compaction_uid_dropped_ > 0) {
+    ROCKS_LOG_INFO(
+        compaction_->immutable_options().info_log,
+        "ST_UID_MERGE output_level=%d compaction_uid_dropped=%" PRIu64,
+        compaction_->output_level(), st_compaction_uid_dropped_);
+  }
+  if (st_event_metric_cross_bucket_cuts_ == 0 &&
+      st_event_metric_time_span_cuts_ == 0 && st_event_metric_max_keys_cuts_ == 0 &&
+      st_event_metric_hard_spatial_cuts_ == 0 &&
+      st_event_metric_soft_spatial_cuts_ == 0) {
+    return;
+  }
+  ROCKS_LOG_INFO(
+      compaction_->immutable_options().info_log,
+      "ST_EVENT_METRIC_SUMMARY output_level=%d "
+      "cross_bucket_compaction_count=%" PRIu64
+      " time_span_cut_count_by_level[output_level=%d]=%" PRIu64
+      " max_keys_cut_count_by_level[output_level=%d]=%" PRIu64
+      " hard_spatial_cut_count_by_level[output_level=%d]=%" PRIu64
+      " soft_spatial_cut_count_by_level[output_level=%d]=%" PRIu64,
+      compaction_->output_level(), st_event_metric_cross_bucket_cuts_,
+      compaction_->output_level(), st_event_metric_time_span_cuts_,
+      compaction_->output_level(), st_event_metric_max_keys_cuts_,
+      compaction_->output_level(), st_event_metric_hard_spatial_cuts_,
+      compaction_->output_level(), st_event_metric_soft_spatial_cuts_);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -293,9 +293,9 @@ struct BlockBasedTableOptions {
 
   // EXPERIMENTAL: After each primary index value (kBinarySearch /
   // kBinarySearchWithFirstKey), append a fixed-size spatio-temporal summary.
-  // Reader and writer must use the same value. Default false keeps the stock
-  // on-disk index format.
-  bool experimental_spatio_temporal_meta_in_index_value = false;
+  // Enabled by default for this fork so every newly flushed/compacted SSTable
+  // carries block-local spatio-temporal metadata in the index block value.
+  bool experimental_spatio_temporal_meta_in_index_value = true;
 
   // The index type that will be used for the data block.
   enum DataBlockIndexType : char {

@@ -20,6 +20,7 @@ namespace {
 rocksdb::Options OpenOptionsForRead() {
   rocksdb::Options o;
   o.create_if_missing = false;
+  o.disable_auto_compactions = true;
   rocksdb::BlockBasedTableOptions tb;
   tb.experimental_spatio_temporal_meta_in_index_value = true;
   o.table_factory.reset(rocksdb::NewBlockBasedTableFactory(tb));

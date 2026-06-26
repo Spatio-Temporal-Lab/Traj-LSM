@@ -1,17 +1,37 @@
-# Local datasets, DBs, and experiment outputs (often multi-GB)
+# Local datasets, DBs, and experiment outputs
 /data/
 /db_ingest/
 /Result/
+/dist/
 
 # Build trees
-**/build/
+/build/
 **/out/
 **/x64/
 **/Release/
 **/Debug/
 rocks-demo/build/
+rocksdb/build/
+rocksdb/build_vs/
+rocksdb_vanilla/build/
+rocksdb_vanilla/build_snappy3/
 
-# Visual Studio / IDE
+# Independent sub-projects (not part of ST-LSM engine)
+/TMan-spatial/
+/TMan-tsp/
+/Tman-RocksDB/
+
+# Unrelated
+/homework/
+/ST-RocksDB_TiDB_交付包/
+/web/
+
+# Archives
+*.zip
+*.7z
+*.tar.gz
+
+# IDE
 .vs/
 *.VC.db
 *.opendb
@@ -46,3 +66,7 @@ __pycache__/
 # OS
 Thumbs.db
 Desktop.ini
+
+# Temp / log files
+*.log
+hs_err_pid*.log

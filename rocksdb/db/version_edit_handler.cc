@@ -10,6 +10,7 @@
 #include "db/version_edit_handler.h"
 
 #include <cinttypes>
+#include <limits>
 #include <sstream>
 
 #include "db/blob/blob_file_reader.h"
@@ -97,6 +98,97 @@ void VersionEditHandlerBase::Iterate(log::Reader& reader,
                            &recovered_edits);
 }
 
+namespace {
+
+bool StFileMetaDisjointFromQuery(const FileMetaData& f, uint32_t query_t_min,
+                                 uint32_t query_t_max, float query_x_min,
+                                 float query_x_max, float query_y_min,
+                                 float query_y_max) {
+  if (!f.has_st_file_meta) {
+    return false;
+  }
+  const auto& m = f.st_file_meta;
+  return m.t_max < query_t_min || m.t_min > query_t_max ||
+         m.x_max < query_x_min || m.x_min > query_x_max ||
+         m.y_max < query_y_min || m.y_min > query_y_max;
+}
+
+}  // namespace
+
+Status ManifestSstPruneStatsHandler::ApplyVersionEdit(
+    VersionEdit& edit, ColumnFamilyData** /*unused*/) {
+  const uint32_t cf_id = edit.GetColumnFamily();
+  if (column_family_id_filter_ != std::numeric_limits<uint32_t>::max() &&
+      cf_id != column_family_id_filter_) {
+    return Status::OK();
+  }
+  auto& live = live_files_by_cf_[cf_id];
+  for (const auto& deleted_file : edit.GetDeletedFiles()) {
+    live.erase(deleted_file.second);
+  }
+  for (const auto& new_file : edit.GetNewFiles()) {
+    live[new_file.second.fd.GetNumber()] =
+        std::make_pair(new_file.first, new_file.second);
+  }
+  return Status::OK();
+}
+
+void ManifestSstPruneStatsHandler::ComputeStats(
+    uint32_t query_t_min, uint32_t query_t_max, float query_x_min,
+    float query_x_max, float query_y_min, float query_y_max,
+    bool enable_spatial_window, ManifestSstPruneStats* out) const {
+  if (out == nullptr) {
+    return;
+  }
+  *out = ManifestSstPruneStats{};
+  for (const auto& cf_entry : live_files_by_cf_) {
+    if (column_family_id_filter_ != std::numeric_limits<uint32_t>::max() &&
+        cf_entry.first != column_family_id_filter_) {
+      continue;
+    }
+    for (const auto& file_entry : cf_entry.second) {
+      const FileMetaData& f = file_entry.second.second;
+      ++out->live_files;
+      if (!f.has_st_file_meta) {
+        ++out->missing_st_meta;
+        ++out->kept_intersect;
+        continue;
+      }
+      ++out->with_st_meta;
+      if (f.num_range_deletions > 0) {
+        ++out->range_del_blocked;
+        ++out->kept_intersect;
+        continue;
+      }
+      const bool disjoint = StFileMetaDisjointFromQuery(
+          f, query_t_min, query_t_max, query_x_min, query_x_max, query_y_min,
+          query_y_max);
+      if (disjoint) {
+        ++out->pruned_disjoint;
+      } else {
+        ++out->kept_intersect;
+      }
+    }
+  }
+  (void)enable_spatial_window;
+}
+
+void ManifestSstPruneStatsHandler::ForEachLiveFile(
+    const std::function<void(int level, const FileMetaData&)>& fn) const {
+  if (!fn) {
+    return;
+  }
+  for (const auto& cf_entry : live_files_by_cf_) {
+    if (column_family_id_filter_ != std::numeric_limits<uint32_t>::max() &&
+        cf_entry.first != column_family_id_filter_) {
+      continue;
+    }
+    for (const auto& file_entry : cf_entry.second) {
+      fn(file_entry.second.first, file_entry.second.second);
+    }
+  }
+}
+
 Status ListColumnFamiliesHandler::ApplyVersionEdit(
     VersionEdit& edit, ColumnFamilyData** /*unused*/) {
   Status s;
@@ -176,7 +268,8 @@ VersionEditHandler::VersionEditHandler(
     bool no_error_if_files_missing, const std::shared_ptr<IOTracer>& io_tracer,
     const ReadOptions& read_options, bool skip_load_table_files,
     bool allow_incomplete_valid_version,
-    EpochNumberRequirement epoch_number_requirement)
+    EpochNumberRequirement epoch_number_requirement,
+    bool idempotent_manifest_file_edits)
     : VersionEditHandlerBase(read_options),
       read_only_(read_only),
       column_families_(std::move(column_families)),
@@ -187,7 +280,8 @@ VersionEditHandler::VersionEditHandler(
       skip_load_table_files_(skip_load_table_files),
       initialized_(false),
       allow_incomplete_valid_version_(allow_incomplete_valid_version),
-      epoch_number_requirement_(epoch_number_requirement) {
+      epoch_number_requirement_(epoch_number_requirement),
+      idempotent_manifest_file_edits_(idempotent_manifest_file_edits) {
   assert(version_set_ != nullptr);
 }
 
@@ -373,6 +467,8 @@ void VersionEditHandler::CheckIterationResult(const log::Reader& reader,
   assert(s != nullptr);
   if (!s->ok()) {
     // Do nothing here.
+  } else if (multi_shard_manifest_replay_ && !final_shard_in_replay_) {
+    // Intermediate M_manager shard: edits only; no LoadTables or Version install.
   } else if (!version_edit_params_.HasLogNumber() ||
              !version_edit_params_.HasNextFile() ||
              !version_edit_params_.HasLastSequence()) {
@@ -498,7 +594,8 @@ ColumnFamilyData* VersionEditHandler::CreateCfAndInit(
   assert(builders_.find(cf_id) == builders_.end());
   builders_.emplace(cf_id, VersionBuilderUPtr(new BaseReferencedVersionBuilder(
                                cfd, this, track_found_and_missing_files_,
-                               allow_incomplete_valid_version_)));
+                               allow_incomplete_valid_version_,
+                               idempotent_manifest_file_edits_)));
   return cfd;
 }
 
@@ -1039,7 +1136,7 @@ Status ManifestTailer::Initialize() {
     base_version->Ref();
     VersionBuilderUPtr new_builder(new BaseReferencedVersionBuilder(
         default_cfd, base_version, this, track_found_and_missing_files_,
-        allow_incomplete_valid_version_));
+        allow_incomplete_valid_version_, idempotent_manifest_file_edits_));
     builder_iter->second = std::move(new_builder);
 
     initialized_ = true;

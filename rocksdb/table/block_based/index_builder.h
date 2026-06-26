@@ -13,6 +13,7 @@
 #include <list>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "db/dbformat.h"
 #include "rocksdb/comparator.h"
@@ -541,6 +542,8 @@ class ShortenedIndexBuilder : public IndexBuilder {
   RelaxedAtomic<uint64_t> estimated_index_size_{0};
   bool block_st_meta_accumulator_valid_ = false;
   SpatioTemporalBlockMeta block_st_meta_accumulator_{};
+  bool block_st_bitmap_precise_ = true;
+  std::vector<SpatioTemporalPoint> block_st_points_{};
   bool file_st_meta_accumulator_valid_ = false;
   SpatioTemporalBlockMeta file_st_meta_accumulator_{};
 };

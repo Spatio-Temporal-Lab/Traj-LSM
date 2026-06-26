@@ -27,6 +27,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -1323,6 +1324,13 @@ class VersionSet {
 
   void WakeUpWaitingManifestWriters();
 
+  // ST manifest shard route: explicit host bucket for the next manifest write
+  // (e.g. from FlushOptions). UINT64_MAX clears to "unset".
+  void SetNextManifestHostBucket(uint64_t host_bucket);
+  // Updates file->shard index after M1 fan-out append to a sibling MANIFEST-b.
+  void StManifestRecordFanoutShardEdit(uint64_t host_bucket,
+                                       const VersionEdit& shard_edit);
+
   // Recover the last saved descriptor (MANIFEST) from persistent storage.
   // Unlike `unchanging` on the VersionSet, `read_only` here and in other
   // functions below refers to the CF receiving no writes or modifications
@@ -1759,9 +1767,29 @@ class VersionSet {
   uint64_t options_file_number_;
   uint64_t options_file_size_;
   uint64_t pending_manifest_file_number_;
+  // When != kManifestHostBucketUnknown, WriteCurrentStateToManifest only lists
+  // SSTs whose st_file_meta intersects this host bucket (per-bucket MANIFEST-b).
+  uint64_t manifest_write_host_bucket_filter_ =
+      std::numeric_limits<uint64_t>::max();
   // Manifest-set protocol state (for generation + commit_seq metadata).
   // generation == 0 means legacy/single-manifest mode.
   uint64_t manifest_set_generation_;
+  // Stable on-disk id for M_manager-NNNNNN (from CURRENT). Per-bucket MANIFEST-b
+  // shard ids must never be reused as manager file numbers.
+  uint64_t m_manager_file_number_;
+  // Explicit host bucket for the upcoming ProcessManifestWrites (ingest flush).
+  uint64_t next_manifest_host_bucket_ = std::numeric_limits<uint64_t>::max();
+  // file_number -> host buckets that list this file in their MANIFEST-b (M1).
+  std::unordered_map<uint64_t, std::unordered_set<uint64_t>>
+      st_manifest_file_shard_index_;
+  uint64_t ConsumeNextManifestHostBucket();
+  void StManifestIndexRegister(uint64_t file_number, uint64_t host_bucket);
+  void StManifestIndexUnregisterShard(uint64_t file_number, uint64_t host_bucket);
+  void StManifestIndexUnregisterFile(uint64_t file_number);
+  void StManifestIndexGetBuckets(uint64_t file_number,
+                                 std::set<uint64_t>* buckets) const;
+  void StManifestIndexApplyBatchAdds(
+      const autovector<VersionEdit*>& batch_edits, uint64_t primary_host_bucket);
   // The last seq visible to reads. It normally indicates the last sequence in
   // the memtable but when using two write queues it could also indicate the
   // last sequence in the WAL visible to reads.

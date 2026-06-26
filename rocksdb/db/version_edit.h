@@ -336,6 +336,8 @@ struct FileMetaData {
   // EXPERIMENTAL: whole-SST spatiotemporal bounds (from index-tail aggregate).
   bool has_st_file_meta = false;
   SpatioTemporalBlockMeta st_file_meta{};
+  // EXPERIMENTAL: number of trajectory segments in this SST.
+  uint32_t st_segment_count = 0;
 
   FileMetaData() = default;
 
@@ -354,7 +356,8 @@ struct FileMetaData {
                const std::string& _max_timestamp,
                bool _has_st_file_meta = false,
                const SpatioTemporalBlockMeta& _st_file_meta =
-                   SpatioTemporalBlockMeta{})
+                   SpatioTemporalBlockMeta{},
+               uint32_t _st_segment_count = 0)
       : fd(file, file_path_id, file_size, smallest_seq, largest_seq),
         smallest(smallest_key),
         largest(largest_key),
@@ -373,7 +376,8 @@ struct FileMetaData {
         min_timestamp(_min_timestamp),
         max_timestamp(_max_timestamp),
         has_st_file_meta(_has_st_file_meta),
-        st_file_meta(_st_file_meta) {
+        st_file_meta(_st_file_meta),
+        st_segment_count(_st_segment_count) {
     TEST_SYNC_POINT_CALLBACK("FileMetaData::FileMetaData", this);
   }
 
@@ -814,7 +818,8 @@ class VersionEdit {
                const std::string& max_timestamp = "",
                bool has_st_file_meta = false,
                const SpatioTemporalBlockMeta& st_file_meta =
-                   SpatioTemporalBlockMeta{}) {
+                   SpatioTemporalBlockMeta{},
+               uint32_t st_segment_count = 0) {
     assert(smallest_seqno <= largest_seqno);
     new_files_.emplace_back(
         level,
@@ -825,7 +830,7 @@ class VersionEdit {
             epoch_number, file_checksum, file_checksum_func_name, unique_id,
             compensated_range_deletion_size, tail_size,
             user_defined_timestamps_persisted, min_timestamp, max_timestamp,
-            has_st_file_meta, st_file_meta));
+            has_st_file_meta, st_file_meta, st_segment_count));
     files_to_quarantine_.push_back(file);
     if (!HasLastSequence() || largest_seqno > GetLastSequence()) {
       SetLastSequence(largest_seqno);

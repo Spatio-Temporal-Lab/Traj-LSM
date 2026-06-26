@@ -1953,12 +1953,15 @@ class DBImpl : public DB {
           flush_reason_(FlushReason::kOthers) {}
     BGFlushArg(ColumnFamilyData* cfd, uint64_t max_memtable_id,
                SuperVersionContext* superversion_context,
-               FlushReason flush_reason, bool atomic_flush)
+               FlushReason flush_reason, bool atomic_flush,
+               uint64_t st_manifest_host_bucket =
+                   std::numeric_limits<uint64_t>::max())
         : cfd_(cfd),
           max_memtable_id_(max_memtable_id),
           superversion_context_(superversion_context),
           flush_reason_(flush_reason),
-          atomic_flush_(atomic_flush) {}
+          atomic_flush_(atomic_flush),
+          st_manifest_host_bucket_(st_manifest_host_bucket) {}
 
     // Column family to flush.
     ColumnFamilyData* cfd_;
@@ -1972,6 +1975,7 @@ class DBImpl : public DB {
     FlushReason flush_reason_;
     // Whether this flush should use atomic flush code path.
     bool atomic_flush_ = false;
+    uint64_t st_manifest_host_bucket_ = std::numeric_limits<uint64_t>::max();
   };
 
   // Argument passed to flush thread.
@@ -2488,6 +2492,8 @@ class DBImpl : public DB {
     // flush is considered complete.
     std::unordered_map<ColumnFamilyData*, uint64_t>
         cfd_to_max_mem_id_to_persist;
+    // ST manifest shard route: host bucket for this flush (UINT64_MAX = unset).
+    uint64_t st_manifest_host_bucket = std::numeric_limits<uint64_t>::max();
 
 #ifndef NDEBUG
     int reschedule_count = 1;

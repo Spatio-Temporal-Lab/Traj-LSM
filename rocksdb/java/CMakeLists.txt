@@ -165,6 +165,7 @@ set(JAVA_MAIN_CLASSES
   src/main/java/org/rocksdb/EnvOptions.java
   src/main/java/org/rocksdb/EventListener.java
   src/main/java/org/rocksdb/Experimental.java
+  src/main/java/org/rocksdb/ExperimentalStPruneScan.java
   src/main/java/org/rocksdb/ExportImportFilesMetaData.java
   src/main/java/org/rocksdb/ExternalFileIngestionInfo.java
   src/main/java/org/rocksdb/FileOperationInfo.java
@@ -608,7 +609,7 @@ if(NOT EXISTS ${PROJECT_SOURCE_DIR}/java/classes)
 endif()
 
 if(NOT EXISTS ${JAVA_TEST_LIBDIR})
-  file(MAKE_DIRECTORY mkdir ${JAVA_TEST_LIBDIR})
+  file(MAKE_DIRECTORY ${JAVA_TEST_LIBDIR})
 endif()
 
 if (DEFINED CUSTOM_DEPS_URL)

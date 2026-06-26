@@ -719,6 +719,7 @@ Status ExternalSstFileIngestionJob::AssignLevelsForOneBatch(
     // This ensures ingested files have proper timestamp ranges in FileMetaData,
     // similar to files created by flush and compaction.
     ExtractTimestampFromTableProperties(file->table_properties, &f_metadata);
+    ExtractStFileBoundsFromTableProperties(file->table_properties, &f_metadata);
     edit_.AddFile(file->picked_level, f_metadata);
 
     *batch_uppermost_level =

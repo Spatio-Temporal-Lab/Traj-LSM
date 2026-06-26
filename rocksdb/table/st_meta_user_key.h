@@ -3,8 +3,14 @@
 
 #pragma once
 
+#include <climits>
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
@@ -22,11 +28,149 @@ namespace ROCKSDB_NAMESPACE {
 // Keys without this prefix are ignored for st-meta aggregation.
 
 constexpr unsigned char kSpatioTemporalUserKeyMagic = 0xE5;
-constexpr unsigned char kSpatioTemporalSegmentKeyMagic = 0xE6;
+// Legacy segment key schema kept for runtime compatibility with existing DBs.
+constexpr unsigned char kSpatioTemporalSegmentKeyLegacyMagic = 0xE6;
 constexpr unsigned char kSpatioTemporalSegmentKeyTzidMagic = 0xE7;
+constexpr uint8_t kSpatioTemporalE7TypeGhostBit = 0x01;
+constexpr size_t kSpatioTemporalE7KeyBytesV0 = 31;  // legacy E7 without type byte
+constexpr size_t kSpatioTemporalE7KeyBytesV1 = 32;  // current E7 with type byte
+constexpr uint32_t kSpatioTemporalE7DefaultBucketSeconds = 3600;
+// event_time_bucket_lookback == this value => bucket_id 0 (maximally conservative).
+constexpr uint32_t kSpatioTemporalE7PruneSeekLookbackAll = UINT32_MAX;
+
+// TMan-tsp ST primary RowKey (no magic): [2B period BE][8B spatial BE][tid...]
+constexpr size_t kTmanStKeyPrefixBytes = 10;
+
+// Runtime schema hint used by lower-bound seek construction and query-side
+// pruning. Default is tman_st unless ROCKSDB_ST_USER_KEY_SCHEMA=e7.
+bool StUserKeySchemaPrefersTmanSt();
+
+inline bool IsTmanStSegmentUserKey(const Slice& user_key) {
+  if (user_key.size() < kTmanStKeyPrefixBytes + 1) {
+    return false;
+  }
+  const unsigned char m = static_cast<unsigned char>(user_key.data()[0]);
+  if (m == kSpatioTemporalUserKeyMagic ||
+      m == kSpatioTemporalSegmentKeyLegacyMagic ||
+      m == kSpatioTemporalSegmentKeyTzidMagic) {
+    return false;
+  }
+  return true;
+}
+
+inline bool IsE7SegmentUserKey(const Slice& user_key) {
+  return user_key.size() >= kSpatioTemporalE7KeyBytesV0 &&
+         static_cast<unsigned char>(user_key.data()[0]) ==
+             kSpatioTemporalSegmentKeyTzidMagic;
+}
+
+// Mind.md / rocks-demo segment key (E7) or TMan ST RowKey.
+inline bool IsStDesignSegmentUserKey(const Slice& user_key) {
+  return IsE7SegmentUserKey(user_key) || IsTmanStSegmentUserKey(user_key);
+}
+
+inline bool TryDecodeE7TypeFlags(const Slice& user_key, uint8_t* out_flags) {
+  if (out_flags == nullptr || user_key.size() < 1 ||
+      static_cast<unsigned char>(user_key.data()[0]) !=
+          kSpatioTemporalSegmentKeyTzidMagic) {
+    return false;
+  }
+  if (user_key.size() >= kSpatioTemporalE7KeyBytesV1) {
+    *out_flags = static_cast<uint8_t>(user_key.data()[1]);
+    return true;
+  }
+  if (user_key.size() >= kSpatioTemporalE7KeyBytesV0) {
+    // Backward-compatible fallback for old E7 keys that had no type byte.
+    *out_flags = 0;
+    return true;
+  }
+  return false;
+}
+
+inline bool IsE7GhostByKeyType(const Slice& user_key) {
+  uint8_t flags = 0;
+  if (!TryDecodeE7TypeFlags(user_key, &flags)) {
+    return false;
+  }
+  return (flags & kSpatioTemporalE7TypeGhostBit) != 0;
+}
+
+// Logical segment id for cross-bucket dedup (Mind.md); excludes bucket_id.
+struct StSegmentUid {
+  uint64_t vehicle_id = 0;
+  uint32_t segment_seq = 0;
+  uint16_t chunk_seq = 0;
+
+  bool operator==(const StSegmentUid& other) const {
+    return vehicle_id == other.vehicle_id &&
+           segment_seq == other.segment_seq && chunk_seq == other.chunk_seq;
+  }
+};
+
+struct StSegmentUidHash {
+  size_t operator()(const StSegmentUid& u) const {
+    return std::hash<uint64_t>{}(u.vehicle_id) ^
+           (std::hash<uint32_t>{}(u.segment_seq) << 1) ^
+           (std::hash<uint16_t>{}(u.chunk_seq) << 2);
+  }
+};
+
+// Decodes segment_uid from E7 user key bytes [18:32). Ghost keys still decode.
+inline bool TryDecodeE7SegmentUid(const Slice& user_key, StSegmentUid* uid) {
+  if (uid == nullptr || !IsE7SegmentUserKey(user_key)) {
+    return false;
+  }
+  const char* p = user_key.data();
+  uint64_t vid = 0;
+  for (int i = 0; i < 8; ++i) {
+    vid = (vid << 8) | static_cast<unsigned char>(p[18 + i]);
+  }
+  const uint32_t seg =
+      (static_cast<uint32_t>(static_cast<unsigned char>(p[26])) << 24) |
+      (static_cast<uint32_t>(static_cast<unsigned char>(p[27])) << 16) |
+      (static_cast<uint32_t>(static_cast<unsigned char>(p[28])) << 8) |
+      static_cast<uint32_t>(static_cast<unsigned char>(p[29]));
+  const uint16_t chunk =
+      static_cast<uint16_t>(
+          (static_cast<unsigned char>(p[30]) << 8) |
+          static_cast<unsigned char>(p[31]));
+  uid->vehicle_id = vid;
+  uid->segment_seq = seg;
+  uid->chunk_seq = chunk;
+  return true;
+}
+
+// Per-query dedup: prefer host-bucket E7 key (floor(t_start/W) from value), else first
+// seen in iteration order (Mind.md P0).
+struct StQuerySegmentUidDedup {
+  struct Entry {
+    uint32_t kept_bucket_id = 0;
+    bool kept_is_host = false;
+  };
+  std::unordered_map<StSegmentUid, Entry, StSegmentUidHash> seen;
+  uint32_t bucket_width_sec = kSpatioTemporalE7DefaultBucketSeconds;
+  uint64_t dedup_skipped = 0;
+
+  // Returns true if the key should be emitted; false if duplicate segment_uid.
+  bool AcceptEmitUserKey(const Slice& user_key, const Slice& value);
+
+  inline bool AcceptEmitUserKey(const Slice& user_key) {
+    return AcceptEmitUserKey(user_key, Slice());
+  }
+
+  void Reset() {
+    seen.clear();
+    dedup_skipped = 0;
+  }
+};
+
+struct SpatioTemporalPoint {
+  float x = 0.f;
+  float y = 0.f;
+};
 
 // Merges one user key into per-data-block accumulator (same semantics as
-// widening t/MBR and OR-ing a coarse 8x8 world-grid bit in bitmap).
+// widening t/MBR and unioning the bitmap summary).
 void MergeSpatioTemporalMetaFromUserKey(const Slice& user_key,
                                         SpatioTemporalBlockMeta* acc,
                                         bool* acc_valid);
@@ -38,6 +182,28 @@ void MergeSpatioTemporalMetaFromKeyValue(const Slice& user_key,
                                          const std::optional<Slice>& value,
                                          SpatioTemporalBlockMeta* acc,
                                          bool* acc_valid);
+
+// Appends exact points used to build a block-local bitmap. Returns
+// *precise_points=false when this key/value can only provide coarse bounds, in
+// which case callers should disable bitmap-based rejection for the block.
+void CollectSpatioTemporalPointsFromKeyValue(
+    const Slice& user_key, const std::optional<Slice>& value,
+    std::vector<SpatioTemporalPoint>* out_points, bool* precise_points);
+
+void BuildBitmapFromPoints(const std::vector<SpatioTemporalPoint>& points,
+                           SpatioTemporalBlockMeta* meta);
+
+// bucket_width_sec==0 uses kSpatioTemporalE7DefaultBucketSeconds (3600).
+bool TryDecodeE7KeyStartTime(const Slice& user_key, uint32_t* t_start,
+                             uint32_t bucket_width_sec = 0);
+
+// E7 host calendar bucket_id from key bytes [2:6) big-endian.
+bool TryDecodeE7HostBucketId(const Slice& user_key, uint32_t* bucket_id);
+
+// Host calendar bucket floor(t_start / bucket_width) from segment value header.
+// bucket_width_sec==0 uses kSpatioTemporalE7DefaultBucketSeconds.
+bool TryDecodeE7HostBucketFromValue(const Slice& value, uint32_t bucket_width_sec,
+                                    uint32_t* host_bucket);
 
 // Decodes Event Time `t_sec` from a spatio-temporal user key (magic 0xE5).
 // Returns false if the key is too short or not an ST user key.
@@ -61,5 +227,60 @@ bool UserKeySpatioTemporalInWindow(const Slice& user_key, uint32_t t_min,
 // Manifest (min/max t, MBR union, bitmap OR). *acc_valid false => copy block.
 void UnionSpatioTemporalBlockMeta(SpatioTemporalBlockMeta* acc, bool* acc_valid,
                                   const SpatioTemporalBlockMeta& block);
+
+bool SpatioTemporalBitmapMayIntersectQuery(
+    const SpatioTemporalBlockMeta& meta,
+    const ReadOptions::ExperimentalSpatioTemporalPruneScan& q);
+
+// True iff at least one trajectory point in value lies inside the prune window.
+// Conservative on decode failure (returns true) to avoid false negatives.
+bool KeyValueHasPointInSpatioTemporalWindow(
+    const Slice& user_key, const Slice& value,
+    const ReadOptions::ExperimentalSpatioTemporalPruneScan& q);
+
+// Builds the minimum E7 user key (32B v1) for index Seek during prune scan:
+// bucket_id = max(0, floor(q_t_min / bucket_width) - lookback), zorder/ids zeroed.
+// Conservative: lookback covers cross-bucket replicas with host buckets before q_t_min.
+void AppendE7PruneSeekLowerBoundUserKey(uint32_t q_t_min,
+                                        uint32_t bucket_width_sec,
+                                        uint32_t bucket_lookback,
+                                        std::string* out_user_key);
+
+bool TryDecodeTmanStPeriod(const Slice& user_key, int16_t* period);
+
+// Conservative lower-bound start time (sec) from period field only.
+bool TryDecodeTmanStKeyStartTimeSec(const Slice& user_key, uint32_t* t_start_sec,
+                                    double time_bin, int time_bin_nums);
+
+// Index Seek lower bound for TMan ST keys: period = max(0, period(q_t_min) - lookback).
+void AppendTmanStPruneSeekLowerBoundUserKey(uint32_t q_t_min,
+                                            double time_bin, int time_bin_nums,
+                                            uint32_t period_lookback,
+                                            std::string* out_user_key);
+
+// Dispatches E7 vs TMan ST lower bound (auto-detect via time_bin / schema hint).
+void AppendStPruneSeekLowerBoundUserKey(
+    uint32_t q_t_min, uint32_t bucket_width_sec, uint32_t bucket_lookback,
+    double tman_time_bin, int tman_time_bin_nums, uint32_t tman_period_lookback,
+    bool prefer_tman_st_key, std::string* out_user_key);
+
+// Extract user key from an iterator key (either internal key or raw user key).
+// For DBs with index_key_is_user_key=1, index keys are already user keys.
+inline Slice UserKeyFromIteratorKey(const Slice& raw_key) {
+  // Try stripping 8-byte internal key footer first (seq+type).
+  constexpr size_t kInternalKeyFooter = 8;
+  if (raw_key.size() > kInternalKeyFooter) {
+    Slice uk(raw_key.data(), raw_key.size() - kInternalKeyFooter);
+    if (IsStDesignSegmentUserKey(uk)) {
+      return uk;
+    }
+  }
+  // Fallback: raw_key may already be a user key.
+  if (IsStDesignSegmentUserKey(raw_key)) {
+    return raw_key;
+  }
+  // Not an ST key: return best effort.
+  return raw_key;
+}
 
 }  // namespace ROCKSDB_NAMESPACE

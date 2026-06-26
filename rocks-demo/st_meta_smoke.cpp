@@ -16,6 +16,7 @@
 
 #include "segment_value_codec.hpp"
 #include "segment_value_global.hpp"
+#include "st_cross_bucket_ingest.hpp"
 #include "st_segment_key.hpp"
 #include "st_user_key.hpp"
 #include "trajectory_kv.hpp"
@@ -37,6 +38,85 @@ using trajkv::EncodeValue;
 using trajkv::MakeKey;
 using trajkv::PointValue;
 using trajkv::SplitCsvLine;
+
+uint64_t Fnv1a64SegmentId(const std::string& s) {
+  uint64_t h = 1469598103934665603ULL;
+  for (unsigned char c : s) {
+    h ^= static_cast<uint64_t>(c);
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+bool ParseUnsignedDecimal(const std::string& text, uint64_t* out) {
+  if (out == nullptr || text.empty()) {
+    return false;
+  }
+  uint64_t value = 0;
+  for (char ch : text) {
+    if (ch < '0' || ch > '9') {
+      return false;
+    }
+    value = value * 10 + static_cast<uint64_t>(ch - '0');
+  }
+  *out = value;
+  return true;
+}
+
+void ParseSegmentIdForE7(const std::string& segment_id, uint64_t* vehicle_id,
+                         uint32_t* segment_seq, uint16_t* chunk_seq) {
+  if (vehicle_id == nullptr || segment_seq == nullptr || chunk_seq == nullptr) {
+    return;
+  }
+  *vehicle_id = Fnv1a64SegmentId(segment_id);
+  *segment_seq = 0;
+  *chunk_seq = 0;
+
+  // Extract phone / vehicle-id from between the last two colons
+  const size_t last_colon = segment_id.rfind(':');
+  if (last_colon != std::string::npos) {
+    const size_t prev_colon = segment_id.rfind(':', last_colon - 1);
+    if (prev_colon != std::string::npos) {
+      const std::string phone =
+          segment_id.substr(prev_colon + 1, last_colon - prev_colon - 1);
+      uint64_t parsed_phone = 0;
+      if (ParseUnsignedDecimal(phone, &parsed_phone)) {
+        *vehicle_id = parsed_phone;
+      }
+    }
+  }
+
+  const std::string tail =
+      (last_colon == std::string::npos) ? segment_id
+                                        : segment_id.substr(last_colon + 1);
+  const size_t hash = tail.find('#');
+  const std::string main_part = tail.substr(0, hash);
+  const std::string chunk_part =
+      (hash == std::string::npos) ? std::string() : tail.substr(hash + 1);
+  bool chunk_parsed = false;
+  const size_t underscore = main_part.rfind('_');
+  if (underscore != std::string::npos) {
+    uint64_t parsed_seq = 0;
+    if (ParseUnsignedDecimal(main_part.substr(0, underscore), &parsed_seq)) {
+      *segment_seq = static_cast<uint32_t>(parsed_seq);
+    }
+    uint64_t parsed_chunk = 0;
+    if (ParseUnsignedDecimal(main_part.substr(underscore + 1), &parsed_chunk)) {
+      *chunk_seq = static_cast<uint16_t>(parsed_chunk);
+      chunk_parsed = true;
+    }
+  }
+  if (chunk_part.size() >= 2 && chunk_part[0] == 'p') {
+    uint64_t parsed_chunk = 0;
+    if (ParseUnsignedDecimal(chunk_part.substr(1), &parsed_chunk)) {
+      *chunk_seq = static_cast<uint16_t>(parsed_chunk);
+      return;
+    }
+  }
+  if (*chunk_seq == 0 && !chunk_parsed) {
+    *chunk_seq = 1;
+  }
+}
 
 static rocksdb::Options MakeStMetaOptions(
     bool disable_auto_compactions, int write_buffer_mb,
@@ -394,6 +474,8 @@ static int RunSegmentMetaCsvStKey(const std::string& csv_path,
                                   int write_buffer_mb,
                                   const StCompactionTimeSplitOptions& time_split,
                                   bool compact_after_ingest,
+                                  uint32_t bucket_sec,
+                                  bool legacy_ghost_ingest,
                                   bool experimental_global_master_ghost,
                                   bool experimental_global_verify_ghost) {
   std::unordered_map<std::string, std::vector<segval::SegmentPoint>> by_segment;
@@ -422,12 +504,14 @@ static int RunSegmentMetaCsvStKey(const std::string& csv_path,
   }
 
   int64_t written = 0;
+  int64_t logical_segments = 0;
+  uint64_t cross_bucket_replica_extra = 0;
   std::string line;
   while (std::getline(in, line)) {
     if (line.empty()) {
       continue;
     }
-    if (max_rows >= 0 && written >= max_rows) {
+    if (max_rows >= 0 && logical_segments >= max_rows) {
       break;
     }
     auto fields = SplitCsvLine(line);
@@ -457,9 +541,20 @@ static int RunSegmentMetaCsvStKey(const std::string& csv_path,
       return 1;
     }
 
-    const std::string key =
-        StSegmentKey(t_start, t_end, x_min, y_min, x_max, y_max,
-                     static_cast<uint64_t>(written));
+    uint64_t vehicle_id = 0;
+    uint32_t segment_seq = 0;
+    uint16_t chunk_seq = 0;
+    ParseSegmentIdForE7(segment_id, &vehicle_id, &segment_seq, &chunk_seq);
+    uint64_t zorder_start = 0;
+    if (!pit->second.empty()) {
+      const auto& first = pit->second.front();
+      uint32_t lon_bits = 0;
+      uint32_t lat_bits = 0;
+      std::memcpy(&lon_bits, &first.lon, sizeof(lon_bits));
+      std::memcpy(&lat_bits, &first.lat, sizeof(lat_bits));
+      zorder_start = (static_cast<uint64_t>(lon_bits) << 32) |
+                     static_cast<uint64_t>(lat_bits);
+    }
     segval::SegmentValueHeader head{};
     head.t_start = t_start;
     head.t_end = t_end;
@@ -468,20 +563,62 @@ static int RunSegmentMetaCsvStKey(const std::string& csv_path,
     head.x_max = x_max;
     head.y_max = y_max;
     head.point_count = point_count;
-    const std::string encoded = EncodeSegmentValueForGlobalMode(
-        head, pit->second, experimental_global_master_ghost);
-    if (encoded.empty()) {
-      std::cerr << "EncodeSegmentValueForGlobalMode failed for segment_id="
-                << segment_id
-                << "\n";
-      return 1;
+    const uint32_t b0 = t_start / (bucket_sec == 0 ? 3600u : bucket_sec);
+    const uint32_t b1 = t_end / (bucket_sec == 0 ? 3600u : bucket_sec);
+
+    if (legacy_ghost_ingest) {
+      const std::string key = StSegmentKeyTzid(t_start, zorder_start, vehicle_id,
+                                               segment_seq, chunk_seq, bucket_sec);
+      const std::string encoded = EncodeSegmentValueForGlobalMode(
+          head, pit->second, experimental_global_master_ghost);
+      if (encoded.empty()) {
+        std::cerr << "EncodeSegmentValueForGlobalMode failed for segment_id="
+                  << segment_id << "\n";
+        return 1;
+      }
+      st = db->Put(rocksdb::WriteOptions(), key, encoded);
+      if (!st.ok()) {
+        std::cerr << "Put failed: " << st.ToString() << "\n";
+        return 1;
+      }
+      ++written;
+      if (experimental_global_master_ghost && b1 > b0) {
+        for (uint32_t ghost_bucket = b0 + 1; ghost_bucket <= b1; ++ghost_bucket) {
+          const std::string ghost_key = StSegmentGhostKeyTzid(
+              ghost_bucket, zorder_start, vehicle_id, segment_seq, chunk_seq);
+          const std::string ghost_val =
+              segval::EncodeGhostSegmentValueV3(head, key);
+          if (ghost_val.empty()) {
+            std::cerr << "EncodeGhostSegmentValueV3 failed segment_id=" << segment_id
+                      << "\n";
+            return 1;
+          }
+          st = db->Put(rocksdb::WriteOptions(), ghost_key, ghost_val);
+          if (!st.ok()) {
+            std::cerr << "Put ghost failed: " << st.ToString() << "\n";
+            return 1;
+          }
+          ++written;
+        }
+      }
+    } else {
+      const std::string encoded =
+          st_cross_bucket::EncodeFullSegmentValue(head, pit->second);
+      if (encoded.empty()) {
+        std::cerr << "EncodeSegmentValueV2 failed for segment_id=" << segment_id
+                  << "\n";
+        return 1;
+      }
+      const std::string key = st_cross_bucket::SegmentKeyCanonical(
+          t_start, zorder_start, vehicle_id, segment_seq, chunk_seq, bucket_sec);
+      st = db->Put(rocksdb::WriteOptions(), key, encoded);
+      if (!st.ok()) {
+        std::cerr << "Put failed: " << st.ToString() << "\n";
+        return 1;
+      }
+      ++written;
     }
-    st = db->Put(rocksdb::WriteOptions(), key, encoded);
-    if (!st.ok()) {
-      std::cerr << "Put failed: " << st.ToString() << "\n";
-      return 1;
-    }
-    ++written;
+    ++logical_segments;
     if (flush_every > 0 && (written % flush_every) == 0) {
       st = db->Flush(rocksdb::FlushOptions());
       if (!st.ok()) {
@@ -506,9 +643,10 @@ static int RunSegmentMetaCsvStKey(const std::string& csv_path,
     }
   }
 
-  std::cout << "Wrote " << written
-            << " rows (segment ST keys + V2 value with points) to " << db_path
-            << "\n";
+  std::cout << "Wrote " << written << " kv rows (" << logical_segments
+            << " logical segments"
+            << " cross_bucket_replica_extra=" << cross_bucket_replica_extra
+            << ") segment ST keys + V2 value to " << db_path << "\n";
 
   // Spot verification by replaying the same rows.
   std::ifstream in2(csv_path);
@@ -533,9 +671,29 @@ static int RunSegmentMetaCsvStKey(const std::string& csv_path,
     const float y_min = static_cast<float>(std::stod(fields[7]));
     const float y_max = static_cast<float>(std::stod(fields[8]));
     const uint32_t point_count = static_cast<uint32_t>(std::stoul(fields[2]));
+    uint64_t vehicle_id = 0;
+    uint32_t segment_seq = 0;
+    uint16_t chunk_seq = 0;
+    ParseSegmentIdForE7(segment_id, &vehicle_id, &segment_seq, &chunk_seq);
+    uint64_t zorder_start = 0;
+    auto points_it = by_segment.find(segment_id);
+    if (points_it != by_segment.end() && !points_it->second.empty()) {
+      const auto& first = points_it->second.front();
+      uint32_t lon_bits = 0;
+      uint32_t lat_bits = 0;
+      std::memcpy(&lon_bits, &first.lon, sizeof(lon_bits));
+      std::memcpy(&lat_bits, &first.lat, sizeof(lat_bits));
+      zorder_start = (static_cast<uint64_t>(lon_bits) << 32) |
+                     static_cast<uint64_t>(lat_bits);
+    }
+    const uint32_t verify_bucket_sec = bucket_sec == 0 ? 3600u : bucket_sec;
     const std::string key =
-        StSegmentKey(t_start, t_end, x_min, y_min, x_max, y_max,
-                     static_cast<uint64_t>(checked));
+        legacy_ghost_ingest
+            ? StSegmentKeyTzid(t_start, zorder_start, vehicle_id, segment_seq,
+                               chunk_seq, verify_bucket_sec)
+            : st_cross_bucket::SegmentKeyCanonical(t_start, zorder_start, vehicle_id,
+                                                   segment_seq, chunk_seq,
+                                                   verify_bucket_sec);
     std::string got_blob;
     st = db->Get(rocksdb::ReadOptions(), key, &got_blob);
     if (!st.ok()) {
@@ -544,7 +702,8 @@ static int RunSegmentMetaCsvStKey(const std::string& csv_path,
     }
     segval::MaterializedSegmentValue got_materialized{};
     if (!segval::DecodeAndMaterializeSegmentValue(
-            db.get(), rocksdb::ReadOptions(), rocksdb::Slice(got_blob),
+            db.get(), rocksdb::ReadOptions(), rocksdb::Slice(key),
+            rocksdb::Slice(got_blob),
             &got_materialized) ||
         got_materialized.decoded.is_legacy) {
       std::cerr << "Expected V2 segment value at row " << checked << "\n";
@@ -592,6 +751,8 @@ int main(int argc, char** argv) {
   bool compact_after_ingest = false;
   bool experimental_global_master_ghost = false;
   bool experimental_global_verify_ghost = false;
+  uint32_t ingest_bucket_sec = 3600;
+  bool legacy_ghost_ingest = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -624,8 +785,13 @@ int main(int argc, char** argv) {
           static_cast<uint32_t>(std::stoul(argv[++i]));
     } else if (a == "--compact-after-ingest") {
       compact_after_ingest = true;
+    } else if (a == "--bucket-sec" && i + 1 < argc) {
+      ingest_bucket_sec = static_cast<uint32_t>(std::stoul(argv[++i]));
+    } else if (a == "--legacy-ghost-ingest") {
+      legacy_ghost_ingest = true;
     } else if (a == "--experimental-global-master-ghost") {
       experimental_global_master_ghost = true;
+      legacy_ghost_ingest = true;
     } else if (a == "--experimental-global-verify-ghost") {
       experimental_global_verify_ghost = true;
     } else if (a == "--st-keys") {
@@ -647,7 +813,7 @@ int main(int argc, char** argv) {
              "  st_meta_smoke --db <path> --segment-meta-csv <segments_meta.csv>\n"
              "      --segment-points-csv <segments_points.csv> --st-segment-keys [--max-points N]\n"
              "      Segment-object mode: one KV per segment with ST segment key\n"
-             "      (0xE6+...) and V2 value (header + all points t,lon,lat).\n"
+             "      (E7) and V2 value (header + all points t,lon,lat).\n"
              "  --flush-every N\n"
              "      Optional: Flush after every N writes (useful to generate many SSTs).\n"
              "  --disable-auto-compactions\n"
@@ -665,8 +831,12 @@ int main(int argc, char** argv) {
              "      Cut after K ST keys in one output file (0 = off).\n"
              "  --compact-after-ingest\n"
              "      Run CompactRange on the default CF after flush (applies time-split on compaction).\n"
+             "  --bucket-sec N\n"
+             "      Ingest time bucket width in seconds (default 3600; canonical bucket_id).\n"
+             "  --legacy-ghost-ingest\n"
+             "      Use deprecated ghost refs in non-start buckets.\n"
              "  --experimental-global-master-ghost\n"
-             "      Enable Global Master/Ghost manifest semantics in CF options.\n"
+             "      (deprecated) also enables --legacy-ghost-ingest + CF options.\n"
              "  --experimental-global-verify-ghost\n"
              "      Enable Global ghost consistency fail-fast checks.\n";
       return 0;
@@ -716,7 +886,8 @@ int main(int argc, char** argv) {
     return RunSegmentMetaCsvStKey(segment_meta_csv_path, segment_points_csv_path,
                                   db_path, max_points, flush_every,
                                   disable_auto_compactions, write_buffer_mb,
-                                  time_split, compact_after_ingest,
+                                  time_split, compact_after_ingest, ingest_bucket_sec,
+                                  legacy_ghost_ingest,
                                   experimental_global_master_ghost,
                                   experimental_global_verify_ghost);
   }

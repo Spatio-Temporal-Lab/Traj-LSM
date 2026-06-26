@@ -11,6 +11,17 @@
 
 namespace segval {
 
+constexpr unsigned char kMagicSegmentTzid = 0xE7;
+constexpr uint8_t kE7TypeGhostBit = 0x01;
+
+inline bool IsE7GhostByKeyType(const rocksdb::Slice& user_key) {
+  if (user_key.size() < 32 ||
+      static_cast<unsigned char>(user_key.data()[0]) != kMagicSegmentTzid) {
+    return false;
+  }
+  return (static_cast<uint8_t>(user_key.data()[1]) & kE7TypeGhostBit) != 0;
+}
+
 struct MaterializedSegmentValue {
   DecodedSegmentValue decoded{};
   bool was_ghost = false;
@@ -32,6 +43,7 @@ inline bool SegmentMetaMatches(const SegmentValueHeader& a,
 
 inline bool DecodeAndMaterializeSegmentValue(rocksdb::DB* db,
                                              const rocksdb::ReadOptions& read_options,
+                                             const rocksdb::Slice& user_key,
                                              const rocksdb::Slice& raw_value,
                                              MaterializedSegmentValue* out) {
   if (db == nullptr || out == nullptr) {
@@ -42,14 +54,27 @@ inline bool DecodeAndMaterializeSegmentValue(rocksdb::DB* db,
   if (!DecodeSegmentValue(blob, &out->decoded)) {
     return false;
   }
-  out->was_ghost = out->decoded.is_ghost;
+  // V1: key-first ghost detection for E7 (type bit in key header).
+  const unsigned char magic =
+      user_key.size() > 0 ? static_cast<unsigned char>(user_key.data()[0]) : 0;
+  if (magic == kMagicSegmentTzid) {
+    out->was_ghost = IsE7GhostByKeyType(user_key);
+  } else {
+    out->was_ghost = out->decoded.is_ghost;
+  }
   if (!out->decoded.is_ghost) {
+    if (!out->was_ghost) {
+      return true;
+    }
+  } else if (!out->was_ghost && magic == kMagicSegmentTzid) {
+    // Key says master but value still marks ghost: trust key-first routing.
     return true;
   }
   out->master_lookup_attempted = true;
   std::string master_blob;
-  rocksdb::Status s =
-      db->Get(read_options, out->decoded.master_key, &master_blob);
+  rocksdb::ReadOptions get_ro = read_options;
+  get_ro.io_activity = rocksdb::Env::IOActivity::kGet;
+  rocksdb::Status s = db->Get(get_ro, out->decoded.master_key, &master_blob);
   if (!s.ok()) {
     rocksdb::ReadOptions ro = read_options;
     ro.total_order_seek = true;

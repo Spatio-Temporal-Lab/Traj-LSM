@@ -10,7 +10,12 @@
 
 #pragma once
 
+#include <array>
+#include <unordered_map>
+#include <unordered_set>
+
 #include "db/blob/blob_garbage_meter.h"
+#include "table/st_meta_user_key.h"
 #include "db/compaction/compaction.h"
 #include "db/compaction/compaction_iterator.h"
 #include "db/internal_stats.h"
@@ -48,6 +53,13 @@ class CompactionOutputs {
 
   explicit CompactionOutputs(const Compaction* compaction,
                              const bool is_proximal_level);
+
+  ~CompactionOutputs();
+
+  CompactionOutputs(const CompactionOutputs&) = delete;
+  CompactionOutputs& operator=(const CompactionOutputs&) = delete;
+  CompactionOutputs(CompactionOutputs&&) = default;
+  CompactionOutputs& operator=(CompactionOutputs&&) = default;
 
   bool IsProximalLevel() const { return is_proximal_level_; }
 
@@ -248,6 +260,14 @@ class CompactionOutputs {
   // trigger (see ColumnFamilyOptions::experimental_compaction_event_time_*).
   bool ShouldStopBeforeEventTime(const CompactionIterator& c_iter);
   static double ComputeSpatialArea(const SpatioTemporalBlockMeta& m);
+  enum class StEventCutReason : uint8_t {
+    kNone = 0,
+    kBucketSpan,
+    kTimeSpan,
+    kMaxKeys,
+    kHardSpatial,
+    kSoftSpatial,
+  };
 
   void Cleanup() {
     if (builder_ != nullptr) {
@@ -408,12 +428,33 @@ class CompactionOutputs {
   uint32_t st_event_out_min_t_ = 0;
   uint32_t st_event_out_max_t_ = 0;
   uint32_t st_event_st_keys_in_output_ = 0;
+  uint32_t st_event_first_bucket_ = 0;
   uint32_t st_event_last_bucket_ = 0;
   bool st_event_out_spatial_valid_ = false;
   SpatioTemporalBlockMeta st_event_out_spatial_ = {};
+  StEventCutReason st_event_last_cut_reason_ = StEventCutReason::kNone;
+  uint32_t st_event_last_cut_bucket_span_ = 0;
+  uint64_t st_event_metric_cross_bucket_cuts_ = 0;
+  std::array<uint64_t, 17> st_event_metric_bucket_span_hist_{};
+  uint64_t st_event_metric_time_span_cuts_ = 0;
+  uint64_t st_event_metric_max_keys_cuts_ = 0;
+  uint64_t st_event_metric_hard_spatial_cuts_ = 0;
+  uint64_t st_event_metric_soft_spatial_cuts_ = 0;
   // One-shot diagnostics for event-time split debugging.
   bool st_event_diag_logged_first_decode_ = false;
   bool st_event_diag_logged_decode_fail_ = false;
+
+  // L3+ Uid-Merge: drop duplicate segment_uid in this subcompaction stream.
+  bool st_uid_merge_enabled_ = false;
+  struct StUidMergeEntry {
+    uint32_t kept_bucket_id = 0;
+    bool kept_is_host = false;
+  };
+  std::unordered_map<StSegmentUid, StUidMergeEntry, StSegmentUidHash>
+      st_uid_merge_seen_;
+  uint64_t st_compaction_uid_dropped_ = 0;
+
+  bool ShouldDropDuplicateSegmentUid(const Slice& user_key, const Slice& value);
 };
 
 // helper struct to concatenate the last level and proximal level outputs

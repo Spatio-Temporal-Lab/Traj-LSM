@@ -402,6 +402,42 @@ ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
     }
   }
 
+  // ST event-time output splitting uses per-output-level thresholds
+  // (st_event_split_policy.h). With level_compaction_dynamic_level_bytes, an
+  // empty LSM can route L0 compactions straight to the last level, skipping
+  // L1–L3 and applying the loose L4+ policy. Force the static leveled
+  // progression (L0->L1->...) so shallow-level constraints are meaningful.
+  if (result.compaction_style == kCompactionStyleLevel &&
+      result.experimental_compaction_event_time_split &&
+      result.level_compaction_dynamic_level_bytes) {
+    ROCKS_LOG_WARN(
+        db_options.info_log.get(),
+        "experimental_compaction_event_time_split: disabling "
+        "level_compaction_dynamic_level_bytes so L0 compactions use "
+        "L1,L2,... instead of jumping to the base/last level");
+    result.level_compaction_dynamic_level_bytes = false;
+  }
+
+  if (result.compaction_style == kCompactionStyleLevel &&
+      result.experimental_st_compaction &&
+      result.level_compaction_dynamic_level_bytes) {
+    ROCKS_LOG_WARN(db_options.info_log.get(),
+                   "experimental_st_compaction: disabling "
+                   "level_compaction_dynamic_level_bytes so L0 compactions "
+                   "target L1 consistently (ST-compaction pins L0 output)");
+    result.level_compaction_dynamic_level_bytes = false;
+  }
+
+  if (result.experimental_st_compaction) {
+    if (result.experimental_st_compaction_level_trigger_ratio <= 0.0 ||
+        result.experimental_st_compaction_level_trigger_ratio > 1.0) {
+      ROCKS_LOG_WARN(db_options.info_log.get(),
+                     "experimental_st_compaction_level_trigger_ratio invalid; "
+                     "clamping to 0.9");
+      result.experimental_st_compaction_level_trigger_ratio = 0.9;
+    }
+  }
+
   if (result.max_compaction_bytes == 0) {
     // For FIFO with use_kv_ratio_compaction, leave max_compaction_bytes as 0
     // to signal "auto-calculate target from capacity and SST/blob ratio."
@@ -1693,6 +1729,15 @@ Status ColumnFamilyData::ValidateOptions(
           " runs but is smaller than the compaction trigger "
           "level0_file_num_compaction_trigger.");
     }
+  }
+  if (s.ok() && cf_options.compaction_style == kCompactionStyleLevel &&
+      cf_options.experimental_compaction_event_time_split &&
+      cf_options.level_compaction_dynamic_level_bytes) {
+    return Status::InvalidArgument(
+        "experimental_compaction_event_time_split is incompatible with "
+        "level_compaction_dynamic_level_bytes=true (immutable). Re-open the "
+        "DB with level_compaction_dynamic_level_bytes=false, or enable ST time "
+        "split only after disabling dynamic level bytes and re-opening.");
   }
   return s;
 }

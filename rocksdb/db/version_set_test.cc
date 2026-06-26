@@ -16,6 +16,7 @@
 #include "db/db_test_util.h"
 #include "db/log_writer.h"
 #include "db/manifest_ops.h"
+#include "file/filename.h"
 #include "db/version_edit.h"
 #include "rocksdb/advanced_options.h"
 #include "rocksdb/convenience.h"
@@ -1509,19 +1510,18 @@ class VersionSetTest : public VersionSetTestBase, public testing::Test {
 };
 
 TEST_F(VersionSetTest, GetCurrentManifestPathsFilteredByTimeRange) {
-  const uint64_t manifest_set_number = 100;
-  const std::string manifest_set_name = ManifestSetFileName(manifest_set_number);
-  const std::string manifest_set_path =
-      ManifestSetFileName(dbname_, manifest_set_number);
-  const std::string manifest_set_content =
+  const uint64_t manager_number = 100;
+  const std::string manager_name = MManagerFileName(manager_number);
+  const std::string manager_path = MManagerFileName(dbname_, manager_number);
+  const std::string manager_content =
       "version=1\n"
       "entry=MANIFEST-000001,tmin=100,tmax=199\n"
-      "MANIFEST-000002\n"
+      "entry=MANIFEST-000002,tmin=0,tmax=18446744073709551615\n"
       "entry=MANIFEST-000003,tmin=300,tmax=399\n";
 
-  ASSERT_OK(WriteStringToFile(env_, manifest_set_content, manifest_set_path));
+  ASSERT_OK(WriteStringToFile(env_, manager_content, manager_path));
   ASSERT_OK(
-      WriteStringToFile(env_, manifest_set_name + "\n", CurrentFileName(dbname_)));
+      WriteStringToFile(env_, manager_name + "\n", CurrentFileName(dbname_)));
 
   std::vector<std::string> filtered_paths;
   std::vector<uint64_t> filtered_numbers;
@@ -1543,18 +1543,17 @@ TEST_F(VersionSetTest, GetCurrentManifestPathsFilteredByTimeRange) {
 }
 
 TEST_F(VersionSetTest, LoadCurrentManifestShardsByTimeRangeCached) {
-  const uint64_t manifest_set_number = 101;
-  const std::string manifest_set_name = ManifestSetFileName(manifest_set_number);
-  const std::string manifest_set_path =
-      ManifestSetFileName(dbname_, manifest_set_number);
-  const std::string manifest_set_content =
+  const uint64_t manager_number = 101;
+  const std::string manager_name = MManagerFileName(manager_number);
+  const std::string manager_path = MManagerFileName(dbname_, manager_number);
+  const std::string manager_content =
       "version=1\n"
       "entry=MANIFEST-000011,tmin=100,tmax=199\n"
-      "MANIFEST-000012\n"
+      "entry=MANIFEST-000012,tmin=0,tmax=18446744073709551615\n"
       "entry=MANIFEST-000013,tmin=300,tmax=399\n";
-  ASSERT_OK(WriteStringToFile(env_, manifest_set_content, manifest_set_path));
+  ASSERT_OK(WriteStringToFile(env_, manager_content, manager_path));
   ASSERT_OK(
-      WriteStringToFile(env_, manifest_set_name + "\n", CurrentFileName(dbname_)));
+      WriteStringToFile(env_, manager_name + "\n", CurrentFileName(dbname_)));
 
   ASSERT_OK(WriteStringToFile(env_, "m11\n", DescriptorFileName(dbname_, 11)));
   ASSERT_OK(WriteStringToFile(env_, "m12\n", DescriptorFileName(dbname_, 12)));
