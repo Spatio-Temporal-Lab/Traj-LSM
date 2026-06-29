@@ -80,8 +80,11 @@ enum class CompactToNextLevel {
   kSkipLastLevel,  // compact to the next level but skip the last level
 };
 
-// Global spatiotemporal envelope: scans all live files across all levels
-// to get the current global bounding box for S_hybrid normalization.
+// Per-level spatiotemporal envelope: computes the bounding box covering
+// the given level's files for S_hybrid normalization. Uses per-level
+// (not global) envelope to avoid normalization collapse: a multi-year
+// global span would flatten all local time differences to near-zero,
+// making DeltaS meaningless for neighbor-pair selection.
 struct GlobalEnvelope {
   double t_min = 0, t_max = 1;
   double x_min = 0, x_max = 1;
@@ -89,7 +92,8 @@ struct GlobalEnvelope {
   bool valid = false;
 };
 
-GlobalEnvelope ComputeGlobalEnvelope(const VersionStorageInfo* vstorage) {
+GlobalEnvelope ComputeLevelEnvelope(
+    const std::vector<FileMetaData*>& files) {
   GlobalEnvelope e;
   double t_min = std::numeric_limits<double>::max();
   double t_max = std::numeric_limits<double>::lowest();
@@ -98,18 +102,16 @@ GlobalEnvelope ComputeGlobalEnvelope(const VersionStorageInfo* vstorage) {
   double y_min = std::numeric_limits<double>::max();
   double y_max = std::numeric_limits<double>::lowest();
   bool any = false;
-  for (int lvl = 0; lvl < vstorage->num_levels(); ++lvl) {
-    for (const auto* f : vstorage->LevelFiles(lvl)) {
-      if (f == nullptr || !f->has_st_file_meta) continue;
-      const auto& m = f->st_file_meta;
-      t_min = std::min(t_min, static_cast<double>(m.t_min));
-      t_max = std::max(t_max, static_cast<double>(m.t_max));
-      x_min = std::min(x_min, static_cast<double>(m.x_min));
-      x_max = std::max(x_max, static_cast<double>(m.x_max));
-      y_min = std::min(y_min, static_cast<double>(m.y_min));
-      y_max = std::max(y_max, static_cast<double>(m.y_max));
-      any = true;
-    }
+  for (const auto* f : files) {
+    if (f == nullptr || !f->has_st_file_meta) continue;
+    const auto& m = f->st_file_meta;
+    t_min = std::min(t_min, static_cast<double>(m.t_min));
+    t_max = std::max(t_max, static_cast<double>(m.t_max));
+    x_min = std::min(x_min, static_cast<double>(m.x_min));
+    x_max = std::max(x_max, static_cast<double>(m.x_max));
+    y_min = std::min(y_min, static_cast<double>(m.y_min));
+    y_max = std::max(y_max, static_cast<double>(m.y_max));
+    any = true;
   }
   if (!any) return e;  // no ST meta at all
   constexpr double kEps = 1e-9;
@@ -217,33 +219,6 @@ SpatioTemporalBlockMeta UnionMbr(const SpatioTemporalBlockMeta& a,
   out.t_max = std::max(out.t_max, b.t_max);
   // bitmap_words not used for picker scoring; ignore.
   return out;
-}
-
-// Heuristic for Mind.md "spatially-near SST" picking:
-// Two-stage (best-effort) heuristic for Mind.md:
-//  1) Coarse filter: keep only candidates that are spatially close to at
-//     least one output-level overlapping file (MBR intersects or edge distance
-//     within a per-level threshold).
-//  2) Fine score: compute weighted score based on time gap + IoU/edge distance
-//     + MBR expansion penalty + file size imbalance penalty. Lower is better.
-//
-// This is best-effort and only used when file-level ST meta exists.
-double SpatialUnionExpansionScore(const FileMetaData* cand,
-                                 const std::vector<FileMetaData*>& overlaps) {
-  if (cand == nullptr || !cand->has_st_file_meta) {
-    return std::numeric_limits<double>::infinity();
-  }
-  const auto& c = cand->st_file_meta;
-  const double base_area = std::max(ComputeMbrArea(c), 1e-12);
-  SpatioTemporalBlockMeta merged = c;
-  for (const FileMetaData* f : overlaps) {
-    if (f == nullptr || !f->has_st_file_meta) {
-      continue;
-    }
-    merged = UnionMbr(merged, f->st_file_meta);
-  }
-  const double merged_area = ComputeMbrArea(merged);
-  return merged_area / base_area;
 }
 
 bool MbrIntersects(const SpatioTemporalBlockMeta& a,
