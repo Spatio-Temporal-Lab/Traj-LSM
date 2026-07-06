@@ -410,6 +410,12 @@ void ParseSegmentIdForE7(const std::string& segment_id, uint64_t* vehicle_id,
       *chunk_seq = static_cast<uint16_t>(parsed_chunk);
       chunk_parsed = true;
     }
+  } else if (!main_part.empty()) {
+    // No underscore: entire tail is segment_seq (e.g. wuxi:phone:000001)
+    uint64_t parsed_seq = 0;
+    if (ParseUnsignedDecimal(main_part, &parsed_seq)) {
+      *segment_seq = static_cast<uint32_t>(parsed_seq);
+    }
   }
   if (chunk_part.size() >= 2 && chunk_part[0] == 'p') {
     uint64_t parsed_chunk = 0;
