@@ -252,6 +252,20 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
 
   if (need_seek_index) {
     if (target) {
+      // ST-LSM suffix-max forward cutoff: setup before index Seek.
+      // Controlled by block_level_index_suffix_max_stops != nullptr.
+      if (read_options_.experimental_st_prune_scan.enable &&
+          table_->get_rep()->table_options
+              .experimental_spatio_temporal_meta_in_index_value &&
+          read_options_.experimental_st_prune_scan
+              .block_level_index_suffix_max_stops != nullptr) {
+        auto* ib_iter = static_cast<IndexBlockIter*>(index_iter_.get());
+        ib_iter->EnsureSuffixMaxComputed();
+        ib_iter->SetQueryStartTimeForSuffixMax(
+            read_options_.experimental_st_prune_scan.t_min,
+            read_options_.experimental_st_prune_scan
+                .block_level_index_suffix_max_stops);
+      }
       index_iter_->Seek(*target);
     } else {
       SeekStPruneIndexForScan(read_options_, index_iter_.get());

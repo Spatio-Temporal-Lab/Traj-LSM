@@ -187,19 +187,6 @@ double ComputeMbrArea(const SpatioTemporalBlockMeta& m);
 
 // Check if a file is "bloated": large MBR area but low data density.
 // Returns true if the file should be pushed down (trigger B).
-bool IsBloatedFile(const FileMetaData* f, double area_threshold_factor) {
-  if (!f->has_st_file_meta) return false;
-  double area = ComputeMbrArea(f->st_file_meta);
-  if (area <= 0.0) return false;
-  double bytes = static_cast<double>(std::max<uint64_t>(f->fd.GetFileSize(), 1));
-  double density = bytes / area;  // bytes per unit area
-  // Low density + large area = bloated.
-  // Threshold: file spans > 25% of a degree and density < 4KB per sq-degree.
-  constexpr double kMinAreaDeg = 0.25;
-  constexpr double kMinDensity = 4096.0;
-  return (area >= kMinAreaDeg && density < kMinDensity * area_threshold_factor);
-}
-
 double ComputeMbrArea(const SpatioTemporalBlockMeta& m) {
   const double w = std::max(0.0, static_cast<double>(m.x_max) -
                                      static_cast<double>(m.x_min));
@@ -859,43 +846,6 @@ void LevelCompactionBuilder::SetupInitialFiles() {
   }
 
   // ── STFR Trigger B: bloated file push-down (IDLE only, ALL non-L0 levels) ──
-  // When idle, identify files with large MBR but low data density.
-  // Push them down to the next level for consolidation.
-  if (start_level_inputs_.empty() &&
-      wp == WritePressure::IDLE &&
-      mutable_cf_options_.experimental_st_compaction_l1_l2_tiered &&
-      mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2 &&
-      mutable_cf_options_.experimental_st_compaction_stfp_enable) {
-    for (int lvl = 1; lvl < vstorage_->num_levels() - 1; ++lvl) {
-      const auto& files = vstorage_->LevelFiles(lvl);
-      for (auto* f : files) {
-        if (f == nullptr || f->being_compacted) continue;
-        if (IsBloatedFile(f, 1.0)) {
-          start_level_inputs_.level = lvl;
-          start_level_inputs_.files.push_back(f);
-          // Find best-IoU neighbor in the next level to merge with.
-          const auto& next_files = vstorage_->LevelFiles(lvl + 1);
-          double best_iou = -1.0;
-          FileMetaData* best_nf = nullptr;
-          for (auto* nf : next_files) {
-            if (nf == nullptr || nf->being_compacted) continue;
-            if (!f->has_st_file_meta || !nf->has_st_file_meta) continue;
-            double iou = MbrIou(f->st_file_meta, nf->st_file_meta);
-            if (iou > best_iou) { best_iou = iou; best_nf = nf; }
-          }
-          if (best_nf != nullptr) {
-            start_level_inputs_.files.push_back(best_nf);
-          }
-          output_level_ = lvl + 1;
-          start_level_ = lvl;
-          compaction_reason_ = CompactionReason::kLevelMaxLevelSize;
-          break;
-        }
-      }
-      if (!start_level_inputs_.empty()) break;
-    }
-  }
-
   if (!start_level_inputs_.empty()) {
     return;
   }
@@ -1789,6 +1739,11 @@ bool LevelCompactionBuilder::PickSizeBasedIntraL0Compaction() {
 }
 
 
+// ST-aware level compaction: picks files from start_level_ for compaction.
+// Despite the "WholeLevel" name, when ST metadata is present this method
+// selects a spatially-proximate subset anchored at the earliest-t_min file,
+// not necessarily every file in the level. Non-ST files or files without
+// valid st_file_meta fall back to whole-level inclusion.
 bool LevelCompactionBuilder::TryPickWholeLevelNonL0ST() {
   assert(start_level_ > 0);
   start_level_inputs_.clear();

@@ -2413,6 +2413,10 @@ struct ReadOptions {
     // prune decisions (AdvanceIndexPastPrunedForward), summed over examined
     // index entries for this ReadOptions.
     uint64_t* block_level_index_prune_ns = nullptr;
+    // Suffix-max forward cutoff: incremented once per query when the
+    // suffix-max t_end check terminates the forward index scan early.
+    // Counts the number of iterator invalidations due to suffix-max cutoff.
+    uint64_t* block_level_index_suffix_max_stops = nullptr;
     // Bench-only: cap how many distinct SST files LevelIterator may open when
     // advancing (forward/backward). 0 = disabled. When the cap is hit,
     // iteration stops early (results incomplete — for A/B locality experiments).

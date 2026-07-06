@@ -32,7 +32,7 @@ struct StEventSplitLevelPolicy {
 // scale together so output files naturally grow ~4× per level.
 //
 // Target example with 284K segments across 7535 daily buckets:
-//   L1:   5000 keys,  64 buckets → ~56 SSTs, ~6.5MB each
+//   L1:  12000 keys,  64 buckets → ~24 SSTs, ~15.6MB each
 //   L2:  20000 keys, 128 buckets → ~14 SSTs, ~26MB each
 //   L3:  80000 keys, 256 buckets →  ~4 SSTs, ~64MB each (file-size bound)
 //   L4+: no key cap,  512 buckets → ~1-2 SSTs, ~64MB each
@@ -42,7 +42,7 @@ inline StEventSplitLevelPolicy ComputeStEventSplitLevelPolicy(
 
   // ── Per-file ST key cap (hard constraint, 4× per level) ──
   if (output_level <= 1) {
-    p.effective_max_keys = 5000;
+    p.effective_max_keys = 12000;
   } else if (output_level == 2) {
     p.effective_max_keys = 20000;
   } else if (output_level == 3) {

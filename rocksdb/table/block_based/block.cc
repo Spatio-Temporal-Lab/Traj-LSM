@@ -44,6 +44,69 @@ void MetaBlockIter::NextImpl() {
   ParseNextKey<DecodeEntry, true>(&is_shared);
 }
 
+void IndexBlockIter::SetQueryStartTimeForSuffixMax(uint32_t q_start,
+                                                      uint64_t* stop_counter) {
+  if (!sx_) sx_ = std::make_unique<SuffixMaxState>();
+  sx_->query_t_start = q_start;
+  sx_->stop_counter = stop_counter;
+}
+
+void IndexBlockIter::EnsureSuffixMaxComputed() {
+  if (!sx_ || sx_->computed) return;
+  sx_->computed = true;
+  if (!decode_index_st_meta_tail_) return;
+
+  std::vector<uint32_t> t_ends;
+  IndexValue entry;
+  const char* p = data_;
+  const char* limit = data_ + restarts_;
+  uint32_t count = 0;
+
+  while (p < limit) {
+    uint64_t shared = 0, non_shared = 0, value_len = 0;
+    for (int shift = 0; shift < 35; shift += 7) {
+      if (p >= limit) break;
+      unsigned char c = static_cast<unsigned char>(*p++);
+      shared |= static_cast<uint64_t>(c & 0x7f) << shift;
+      if (!(c & 0x80)) break;
+    }
+    for (int shift = 0; shift < 35; shift += 7) {
+      if (p >= limit) break;
+      unsigned char c = static_cast<unsigned char>(*p++);
+      non_shared |= static_cast<uint64_t>(c & 0x7f) << shift;
+      if (!(c & 0x80)) break;
+    }
+    for (int shift = 0; shift < 35; shift += 7) {
+      if (p >= limit) break;
+      unsigned char c = static_cast<unsigned char>(*p++);
+      value_len |= static_cast<uint64_t>(c & 0x7f) << shift;
+      if (!(c & 0x80)) break;
+    }
+    if (p + non_shared + value_len > limit) break;
+    p += non_shared;
+    Slice val(p, static_cast<size_t>(value_len));
+    Status s = entry.DecodeFrom(&val, have_first_key_,
+                                /*first_internal_key=*/nullptr,
+                                decode_index_st_meta_tail_);
+    p += value_len;
+    uint32_t t_max = 0;
+    if (s.ok() && entry.has_st_meta) {
+      t_max = entry.st_meta.t_max;
+    }
+    t_ends.push_back(t_max);
+    ++count;
+  }
+
+  uint32_t n = static_cast<uint32_t>(t_ends.size());
+  sx_->suffix_max_t_end.resize(n);
+  if (n == 0) return;
+  uint32_t running = t_ends[n - 1];
+  for (int i = static_cast<int>(n) - 1; i >= 0; --i) {
+    running = std::max(running, t_ends[i]);
+    sx_->suffix_max_t_end[i] = running;
+  }
+}
+
 void IndexBlockIter::NextImpl() { ParseNextIndexKey(); }
 
 void IndexBlockIter::PrevImpl() {
@@ -386,6 +449,21 @@ void IndexBlockIter::SeekImpl(const Slice& target) {
     return;
   }
   FindKeyAfterBinarySeek(seek_key, index, skip_linear_scan);
+  // ST-LSM: conservative suffix-max check after Seek. Since suffix-max
+  // is non-increasing, checking at restart_index * restart_interval is a
+  // safe lower bound — may skip slightly fewer entries than optimal
+  // but will never cause a false skip.
+  if (sx_ && sx_->query_t_start > 0 && sx_->computed &&
+      sx_->suffix_max_t_end.size() > 0) {
+    uint32_t est_idx = index * block_restart_interval_;
+    if (est_idx < sx_->suffix_max_t_end.size() &&
+        sx_->suffix_max_t_end[est_idx] < sx_->query_t_start) {
+      // All remaining entries to the right have t_end < query_t_start.
+      // Safe to invalidate — no data blocks can match.
+      if (sx_->stop_counter) (*sx_->stop_counter)++;
+      Invalidate(Status::OK());
+    }
+  }
 }
 
 template <typename DecodeKeyFunc>

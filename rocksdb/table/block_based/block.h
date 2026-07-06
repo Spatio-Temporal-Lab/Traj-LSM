@@ -989,6 +989,11 @@ class IndexBlockIter final : public BlockIter<IndexValue> {
     value_.clear();
   }
 
+ public:
+  void SetQueryStartTimeForSuffixMax(uint32_t q_start,
+                                        uint64_t* stop_counter = nullptr);
+  void EnsureSuffixMaxComputed();
+
   void PrevImpl() override;
   void NextImpl() override;
   void SeekToFirstImpl() override;
@@ -1006,6 +1011,18 @@ class IndexBlockIter final : public BlockIter<IndexValue> {
   // previous delta encoded values in the same restart interval to the offset of
   // the first value in that restart interval.
   IndexValue decoded_value_;
+
+  // ST-LSM suffix-max optimization: lazily-allocated state.
+  // Uses a separate struct to avoid ABI issues with IndexBlockIter.
+  struct SuffixMaxState {
+    std::vector<uint32_t> suffix_max_t_end;
+    uint32_t query_t_start = 0;
+    bool computed = false;
+    uint32_t entry_idx = 0;
+    uint32_t restart_idx = 0;
+    uint64_t* stop_counter = nullptr;
+  };
+  std::unique_ptr<SuffixMaxState> sx_;
 
   // When sequence number overwriting is enabled, this struct contains the seqno
   // to overwrite with, and current first_internal_key with overwritten seqno.

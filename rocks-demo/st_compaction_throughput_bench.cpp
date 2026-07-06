@@ -454,6 +454,7 @@ static Result Run(const std::string& root, const Config& cfg,
   int64_t total_block_skipped = 0;
   int64_t total_key_examined = 0;
   int64_t total_key_skipped = 0;
+  int64_t total_suffix_max_stops = 0;
   uint64_t total_block_reads = 0;
 
   // Lambda: run all query windows once with full prune pipeline
@@ -472,6 +473,7 @@ static Result Run(const std::string& root, const Config& cfg,
       uint64_t key_examined = 0, key_skipped = 0;
 
       rst::ReadOptions ro;
+      ro.io_activity = rst::Env::IOActivity::kDBIterator;
       ro.total_order_seek = true;
       ro.fill_cache = false;
       ro.verify_checksums = false;

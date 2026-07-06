@@ -4697,14 +4697,8 @@ std::unique_ptr<MultiScan> DBImpl::NewMultiScan(
 
 Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
                               ColumnFamilyHandle* column_family) {
-  if (_read_options.io_activity != Env::IOActivity::kUnknown &&
-      _read_options.io_activity != Env::IOActivity::kDBIterator) {
-    return NewErrorIterator(Status::InvalidArgument(
-        "Can only call NewIterator with `ReadOptions::io_activity` is "
-        "`Env::IOActivity::kUnknown` or `Env::IOActivity::kDBIterator`"));
-  }
   ReadOptions read_options(_read_options);
-  if (read_options.io_activity == Env::IOActivity::kUnknown) {
+  if (read_options.io_activity != Env::IOActivity::kDBIterator) {
     read_options.io_activity = Env::IOActivity::kDBIterator;
   }
 
