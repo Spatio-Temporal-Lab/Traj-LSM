@@ -30,6 +30,18 @@ inline bool StPruneNeedsMaterializedDataBlock(const ReadOptions& ro) {
          (q.key_level_enable || q.value_level_point_truth_enable);
 }
 
+// Env-var controlled switches for ablation experiments.
+// ST_DISABLE_FORWARD_TRUNCATION=1 → skip block-level t_max/MBR disjoint check
+// ST_DISABLE_BACKWARD_TRUNCATION=1 → skip bucket_id early termination
+static bool StDisableForwardTruncation() {
+  const char* v = std::getenv("ST_DISABLE_FORWARD_TRUNCATION");
+  return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+static bool StDisableBackwardTruncation() {
+  const char* v = std::getenv("ST_DISABLE_BACKWARD_TRUNCATION");
+  return v != nullptr && v[0] == '1' && v[1] == '\0';
+}
+
 void SeekStPruneIndexForScan(const ReadOptions& ro,
                              InternalIteratorBase<IndexValue>* index_iter) {
   const auto& q = ro.experimental_st_prune_scan;
@@ -86,7 +98,8 @@ void AdvanceIndexPastPrunedForward(
     }
     // Early termination: if index key's bucket_id is past the query window,
     // all subsequent blocks are guaranteed not to contain the window.
-    if (IndexBucketPastQueryWindow(index_iter->key(),
+    if (!StDisableBackwardTruncation() &&
+        IndexBucketPastQueryWindow(index_iter->key(),
                                    ro.experimental_st_prune_scan)) {
       break;
     }
@@ -112,8 +125,9 @@ void AdvanceIndexPastPrunedForward(
       break;
     }
     const auto& m = v.st_meta;
-    if (m.t_max < q.t_min || m.t_min > q.t_max || m.x_max < q.x_min ||
-        m.x_min > q.x_max || m.y_max < q.y_min || m.y_min > q.y_max) {
+    if (!StDisableForwardTruncation() &&
+        (m.t_max < q.t_min || m.t_min > q.t_max || m.x_max < q.x_min ||
+         m.x_min > q.x_max || m.y_max < q.y_min || m.y_min > q.y_max)) {
       if (q.block_level_index_entries_skipped_st_disjoint != nullptr) {
         ++(*q.block_level_index_entries_skipped_st_disjoint);
       }
