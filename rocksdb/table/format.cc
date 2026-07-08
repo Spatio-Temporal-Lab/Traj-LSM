@@ -153,7 +153,8 @@ Status IndexValue::DecodeFrom(Slice* input, bool have_first_key,
   has_st_meta = false;
   st_meta = SpatioTemporalBlockMeta{};
   if (decode_st_meta_tail) {
-    if (input->size() >= kSpatioTemporalIndexTailBytes()) {
+    // Accept both legacy (56-byte) and current (60-byte) tail formats.
+    if (input->size() >= kSpatioTemporalIndexTailBytesLegacy()) {
       Status ts = DecodeSpatioTemporalIndexTail(input, &st_meta);
       if (!ts.ok()) {
         return ts;

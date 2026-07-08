@@ -604,9 +604,6 @@ bool UserKeySpatioTemporalInWindow(const Slice& user_key, uint32_t t_min,
       if (cnt++ < 5) fprintf(stderr, "STI: E7 decode fail sz=%zu\n", user_key.size());
       return false;
     }
-    // debug
-    static int cnt2 = 0;
-    if (cnt2++ < 3) fprintf(stderr, "STI: E7 t_start=%u t_max=%u result=%d\n", t_start, t_max, t_start <= t_max);
     // No t_end/MBR in key; keep this conservative and let value verification or
     // block-level metadata make the final decision.
     return t_start <= t_max;

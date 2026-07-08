@@ -184,6 +184,9 @@ SpatioTemporalBlockMeta ShortenedIndexBuilder::FinalizeBlockStMetaForDataBlock(
     out.y_max = std::numeric_limits<float>::infinity();
     SetSpatioTemporalBitmapAll(&out);
   }
+  // Set prefix-max to the running max of t_end from all previous blocks.
+  out.prefix_max_t_end = running_prefix_max_t_end_;
+  running_prefix_max_t_end_ = std::max(running_prefix_max_t_end_, out.t_max);
   block_st_meta_accumulator_valid_ = false;
   block_st_meta_accumulator_ = SpatioTemporalBlockMeta{};
   return out;
@@ -233,6 +236,12 @@ PartitionedIndexBuilder::PartitionedIndexBuilder(
 }
 
 void PartitionedIndexBuilder::MakeNewSubIndexBuilder() {
+  // Carry prefix_max_t_end across partition boundaries so that blocks in
+  // later partitions correctly record the max t_end of all preceding blocks.
+  uint32_t carry_prefix_max = 0;
+  if (!entries_.empty() && entries_.back().value != nullptr) {
+    carry_prefix_max = entries_.back().value->GetRunningPrefixMaxTEnd();
+  }
   auto new_builder = std::make_unique<ShortenedIndexBuilder>(
       comparator_, table_opt_.index_block_restart_interval,
       table_opt_.format_version, use_value_delta_encoding_,
@@ -241,6 +250,7 @@ void PartitionedIndexBuilder::MakeNewSubIndexBuilder() {
       table_opt_.uniform_cv_threshold,
       table_opt_.experimental_spatio_temporal_meta_in_index_value);
   sub_index_builder_ = new_builder.get();
+  sub_index_builder_->SetRunningPrefixMaxTEnd(carry_prefix_max);
   // Start next partition entry, where we will modify the key
   entries_.push_back({{}, std::move(new_builder)});
 

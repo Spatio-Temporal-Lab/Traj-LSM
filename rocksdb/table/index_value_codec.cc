@@ -43,6 +43,7 @@ void AppendSpatioTemporalIndexTail(std::string* dst,
   for (uint64_t word : meta.bitmap_words) {
     PutFixed64(dst, word);
   }
+  PutFixed32(dst, meta.prefix_max_t_end);
 }
 
 Status DecodeSpatioTemporalIndexTail(Slice* input,
@@ -50,9 +51,13 @@ Status DecodeSpatioTemporalIndexTail(Slice* input,
   if (meta == nullptr) {
     return Status::InvalidArgument("null meta");
   }
-  if (input->size() < kSpatioTemporalIndexTailBytes()) {
+  // Accept both legacy (56 bytes, no prefix_max_t_end) and current
+  // (60 bytes, with prefix_max_t_end) formats.
+  if (input->size() < kSpatioTemporalIndexTailBytesLegacy()) {
     return Status::Corruption("truncated spatio-temporal tail");
   }
+  const bool has_prefix_max =
+      input->size() >= kSpatioTemporalIndexTailBytes();
   uint32_t t_min = 0;
   uint32_t t_max = 0;
   if (!GetFixed32(input, &t_min) || !GetFixed32(input, &t_max)) {
@@ -76,6 +81,13 @@ Status DecodeSpatioTemporalIndexTail(Slice* input,
   meta->y_min = y_min;
   meta->x_max = x_max;
   meta->y_max = y_max;
+  if (has_prefix_max) {
+    if (!GetFixed32(input, &meta->prefix_max_t_end)) {
+      return Status::Corruption("bad prefix_max_t_end");
+    }
+  } else {
+    meta->prefix_max_t_end = 0;
+  }
   return Status::OK();
 }
 

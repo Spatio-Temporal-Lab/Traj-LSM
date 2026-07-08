@@ -20,9 +20,24 @@ struct SpatioTemporalBlockMeta {
   float x_max = 0.f;
   float y_max = 0.f;
   std::array<uint64_t, kSpatioTemporalBitmapWords> bitmap_words{};
+  // Max t_end among all index blocks that precede this one in key order.
+  // 0 for the first block (no preceding blocks). Monotonically non-decreasing.
+  // Used at query time for forward truncation: if prefix_max_t_end < q.t_min,
+  // all preceding blocks end strictly before the query and can be skipped.
+  uint32_t prefix_max_t_end = 0;
 };
 
+// Current on-disk tail size (includes prefix_max_t_end).
 constexpr size_t kSpatioTemporalIndexTailBytes() {
+  return sizeof(uint32_t) * 2 + sizeof(float) * 4 +
+         sizeof(uint64_t) * kSpatioTemporalBitmapWords + sizeof(uint32_t);
+  //                                                ^^^ prefix_max_t_end
+}
+
+// Legacy tail size before prefix_max_t_end was added.
+// DBs / SSTs built with the old format have 56-byte tails;
+// DecodeSpatioTemporalIndexTail accepts both.
+constexpr size_t kSpatioTemporalIndexTailBytesLegacy() {
   return sizeof(uint32_t) * 2 + sizeof(float) * 4 +
          sizeof(uint64_t) * kSpatioTemporalBitmapWords;
 }

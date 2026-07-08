@@ -492,6 +492,11 @@ class ShortenedIndexBuilder : public IndexBuilder {
   void AccumulateFileSpatioTemporalMetaForManifest(
       SpatioTemporalBlockMeta* acc, bool* acc_valid) const override;
 
+  // Prefix-max of block t_end across all preceding index entries in this
+  // index builder. Used for query-time forward truncation.
+  uint32_t GetRunningPrefixMaxTEnd() const { return running_prefix_max_t_end_; }
+  void SetRunningPrefixMaxTEnd(uint32_t v) { running_prefix_max_t_end_ = v; }
+
   // Changes *key to a short string >= *key.
   //
   static Slice FindShortestInternalKeySeparator(const Comparator& comparator,
@@ -546,6 +551,9 @@ class ShortenedIndexBuilder : public IndexBuilder {
   std::vector<SpatioTemporalPoint> block_st_points_{};
   bool file_st_meta_accumulator_valid_ = false;
   SpatioTemporalBlockMeta file_st_meta_accumulator_{};
+  // Running max of t_end across all finalized blocks, used to set
+  // prefix_max_t_end on each outgoing index entry.
+  uint32_t running_prefix_max_t_end_ = 0;
 };
 
 // HashIndexBuilder contains a binary-searchable primary index and the

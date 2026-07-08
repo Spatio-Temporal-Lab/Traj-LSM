@@ -12,6 +12,7 @@
 
 #include "db/dbformat.h"
 #include "table/format.h"
+#include "table/block_based/block.h"
 #include "table/st_meta_user_key.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -65,44 +66,105 @@ void SeekStPruneIndexForScan(const ReadOptions& ro,
 // maximum bucket_id. If so, all subsequent blocks start after the query
 // window (keys are sorted by bucket_id) and we can safely stop.
 // Returns true when iteration should stop.
+//
+// RocksDB may shorten the index separator key. When two adjacent data blocks
+// have different bucket_ids, the separator placed between them may be shorter
+// than 6 bytes. We handle this by extracting a conservative lower bound from
+// the available bytes and comparing it to max_query_bucket.
 inline bool IndexBucketPastQueryWindow(const Slice& index_separator_key,
                                         const ReadOptions::ExperimentalSpatioTemporalPruneScan& q) {
   if (q.event_time_bucket_width_sec == 0) {
     return false;  // no bucket width configured, cannot optimize
   }
   const Slice uk = UserKeyFromIteratorKey(index_separator_key);
-  if (uk.size() < 6) return false;
+  if (uk.size() < 2) return false;
   const unsigned char magic = static_cast<unsigned char>(uk.data()[0]);
-  // E7 segment key: bucket_id at bytes [2:6) big-endian
   if (magic != kSpatioTemporalSegmentKeyTzidMagic) {
     return false;  // not E7, skip optimization
   }
   const unsigned char* p = reinterpret_cast<const unsigned char*>(uk.data());
-  const uint32_t bucket_id = (static_cast<uint32_t>(p[2]) << 24) |
-                             (static_cast<uint32_t>(p[3]) << 16) |
-                             (static_cast<uint32_t>(p[4]) << 8) |
-                             static_cast<uint32_t>(p[5]);
   const uint32_t max_query_bucket = q.t_max / q.event_time_bucket_width_sec;
-  // Conservative: stop only when bucket_id is strictly past max_query_bucket+1
-  // (+1 accounts for segments that start near the query end boundary)
-  return bucket_id > max_query_bucket + 1;
+  // E7 segment key: bucket_id at bytes [2:6) big-endian.
+  // When uk.size() >= 6 we have the full bucket_id and can do an exact check.
+  // When uk.size() < 6 the separator was shortened across a bucket_id
+  // boundary — reconstruct a conservative lower bound: pad missing lower
+  // bytes with 0x00. The true next-block bucket_id is >= this lower bound.
+  uint32_t bucket_id_lower = 0;
+  for (size_t i = 2; i < 6; ++i) {
+    bucket_id_lower <<= 8;
+    if (i < uk.size()) {
+      bucket_id_lower |= static_cast<uint32_t>(p[i]);
+    }
+    // else: pad with 0x00 (missing lower bytes → conservative lower bound)
+  }
+  // Conservative: stop only when the lower bound is strictly past
+  // max_query_bucket+1 (+1 accounts for segments that start near the
+  // query end boundary).
+  return bucket_id_lower > max_query_bucket + 1;
 }
 
 void AdvanceIndexPastPrunedForward(
-    const ReadOptions& ro, InternalIteratorBase<IndexValue>* index_iter) {
-  while (index_iter->Valid()) {
-    if (!ro.experimental_st_prune_scan.enable ||
-        !ro.experimental_st_prune_scan.block_level_enable ||
-        IsStLocalPruneShortCircuited(ro)) {
-      break;
+    const ReadOptions& ro, InternalIteratorBase<IndexValue>* index_iter,
+    bool skip_prefix_max_backward) {
+  if (!ro.experimental_st_prune_scan.enable) {
+    return;  // ST prune disabled: nothing to advance
+  }
+  // ── Forward truncation via prefix_max_t_end ──────────────────────
+  // Each index entry carries prefix_max_t_end = max{t_end of all blocks
+  // before this one}. If at the Seek landing position this value is
+  // strictly less than q.t_min, every preceding block ends before the
+  // query and we can safely start from here. Otherwise, a long segment
+  // starting in an earlier bucket may extend into the query window, so
+  // walk backward one entry at a time until we find a safe position.
+  //
+  // IMPORTANT: this backward walk is ONLY correct for initial positioning
+  // (after Seek/SeekToFirst). During forward iteration (FindBlockForward),
+  // the iterator is already past the safe starting point and walking
+  // backward would re-process already-read blocks. Use
+  // skip_prefix_max_backward=true from forward-iteration call sites.
+  if (!skip_prefix_max_backward &&
+      index_iter->Valid() && ro.experimental_st_prune_scan.enable &&
+      ro.experimental_st_prune_scan.block_level_enable &&
+      !IsStLocalPruneShortCircuited(ro) && !StDisableForwardTruncation()) {
+    const IndexValue& first = index_iter->value();
+    if (first.has_st_meta &&
+        first.st_meta.prefix_max_t_end >= ro.experimental_st_prune_scan.t_min) {
+      // Walk backward: prefix_max_t_end is monotonically non-decreasing,
+      // so the first entry (prefix_max=0) is always a safe fallback.
+      while (index_iter->Valid()) {
+        index_iter->Prev();
+        if (!index_iter->Valid()) {
+          index_iter->SeekToFirst();
+          break;
+        }
+        const IndexValue& pv = index_iter->value();
+        if (pv.has_st_meta &&
+            pv.st_meta.prefix_max_t_end < ro.experimental_st_prune_scan.t_min) {
+          // All blocks before this position end strictly before the query.
+          break;
+        }
+      }
     }
-    // Early termination: if index key's bucket_id is past the query window,
-    // all subsequent blocks are guaranteed not to contain the window.
+  }
+  // ── Per-entry forward pruning + backward truncation ──────────────
+  while (index_iter->Valid()) {
+    // Backward truncation: always active, needs only the index key's
+    // bucket_id ordering (no ST meta). Invalidate on hit so callers
+    // (FindBlockForward / SeekImpl) see !Valid() and stop immediately.
     if (!StDisableBackwardTruncation() &&
         IndexBucketPastQueryWindow(index_iter->key(),
                                    ro.experimental_st_prune_scan)) {
-      break;
+      auto* ib = static_cast<IndexBlockIter*>(index_iter);
+      ib->Invalidate(Status::OK());
+      return;
     }
+    // ST overlap check: always active in Local index (every index entry
+    // must pass time+space overlap before its data block is decompressed).
+    // Controlled by block_level_enable, not by ST_DISABLE_FORWARD_TRUNCATION
+    // (which only disables the prefix_max_t_end backward walk above).
+    bool do_forward_check = ro.experimental_st_prune_scan.enable &&
+                            ro.experimental_st_prune_scan.block_level_enable &&
+                            !IsStLocalPruneShortCircuited(ro);
     const auto t0 = std::chrono::steady_clock::now();
     const IndexValue& v = index_iter->value();
     const auto& q = ro.experimental_st_prune_scan;
@@ -125,7 +187,7 @@ void AdvanceIndexPastPrunedForward(
       break;
     }
     const auto& m = v.st_meta;
-    if (!StDisableForwardTruncation() &&
+    if (do_forward_check &&
         (m.t_max < q.t_min || m.t_min > q.t_max || m.x_max < q.x_min ||
          m.x_min > q.x_max || m.y_max < q.y_min || m.y_min > q.y_max)) {
       if (q.block_level_index_entries_skipped_st_disjoint != nullptr) {
@@ -291,7 +353,8 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
     }
     if (target == nullptr &&
         !IsStLocalPruneShortCircuited(read_options_)) {
-      AdvanceIndexPastPrunedForward(read_options_, index_iter_.get());
+      AdvanceIndexPastPrunedForward(read_options_, index_iter_.get(),
+                                     /*skip_prefix_max_backward=*/false);
       if (!index_iter_->Valid()) {
         ResetDataIter();
         return;
@@ -901,6 +964,11 @@ void BlockBasedTableIterator::FindBlockForward() {
       block_handles_->pop_front();
     }
 
+    // ST pruning: clear any queued block handles so every subsequent
+    // block goes through AdvanceIndexPastPrunedForward for ST checks.
+    if (read_options_.experimental_st_prune_scan.enable && DoesContainBlockHandles()) {
+      block_handles_->clear();
+    }
     if (!DoesContainBlockHandles()) {
       // For readahead_cache_lookup_ enabled scenario -
       // 1. In case of Seek, block_handle will be empty and it should be follow
@@ -950,9 +1018,11 @@ void BlockBasedTableIterator::FindBlockForward() {
       if (!index_iter_->Valid()) {
         return;
       }
-      if (!IsStLocalPruneShortCircuited(read_options_)) {
-        AdvanceIndexPastPrunedForward(read_options_, index_iter_.get());
-      }
+      // ST pruning: check every index entry before decompressing its block.
+      // skip_prefix_max_backward=true: during forward iteration the iterator
+      // is already past the safe starting point — only run per-entry pruning.
+      AdvanceIndexPastPrunedForward(read_options_, index_iter_.get(),
+                                     /*skip_prefix_max_backward=*/true);
       if (!index_iter_->Valid()) {
         return;
       }

@@ -68,7 +68,8 @@ rocksdb::Options MakeDbOptions(bool create_if_missing,
                                bool experimental_global_verify_ghost,
                                bool experimental_st_compaction,
                                uint32_t bucket_sec,
-                               int max_level_bytes_mb = 0) {
+                               int max_level_bytes_mb = 0,
+                               uint64_t block_size = 0) {
   rocksdb::Options o;
   o.create_if_missing = create_if_missing;
   o.disable_auto_compactions = disable_auto_compactions;
@@ -98,6 +99,9 @@ rocksdb::Options MakeDbOptions(bool create_if_missing,
   }
   rocksdb::BlockBasedTableOptions tb;
   tb.experimental_spatio_temporal_meta_in_index_value = true;
+  if (block_size > 0) {
+    tb.block_size = block_size;
+  }
   o.table_factory.reset(rocksdb::NewBlockBasedTableFactory(tb));
   return o;
 }
@@ -810,7 +814,9 @@ int main(int argc, char** argv) {
   bool st_real_tiered = false;
   int st_tiered_max_level = 0;
   int st_tiered_max_runs_per_level = 0;
+  std::vector<std::pair<std::string, std::string>> st_custom_opts;
   int max_level_bytes_mb = 0;
+  uint64_t block_size = 0;
   int64_t max_rows = -1;
   UserKeySchema user_key_schema = UserKeySchema::kTmanSt;
   st_tman::StKeyBuildConfig st_key_cfg;
@@ -850,10 +856,18 @@ int main(int argc, char** argv) {
       st_real_tiered = true;
     } else if (a == "--st-tiered-max-level" && i + 1 < argc) {
       st_tiered_max_level = std::stoi(argv[++i]);
+    } else if (a == "--st-set-opt" && i + 1 < argc) {
+      std::string kv = argv[++i];
+      size_t eq = kv.find('=');
+      if (eq != std::string::npos) {
+        st_custom_opts.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
+      }
     } else if (a == "--st-tiered-max-runs-per-level" && i + 1 < argc) {
       st_tiered_max_runs_per_level = std::stoi(argv[++i]);
     } else if (a == "--max-level-bytes-mb" && i + 1 < argc) {
       max_level_bytes_mb = std::stoi(argv[++i]);
+    } else if (a == "--block-size" && i + 1 < argc) {
+      block_size = std::stoull(argv[++i]);
     } else if (a == "--stream-ingest") {
       stream_ingest = true;
     } else if (a == "--stream-ingest-flush-only") {
@@ -1018,7 +1032,7 @@ int main(int argc, char** argv) {
   rocksdb::Options stage_opts = MakeDbOptions(
       !st_ladder_drain_only, true, experimental_global_master_ghost,
       experimental_global_verify_ghost, experimental_st_compaction, bucket_sec,
-      max_level_bytes_mb);
+      max_level_bytes_mb, block_size);
   std::cout << "Opening staging DB (before points preload): " << target_db << "\n"
             << std::flush;
   std::unique_ptr<rocksdb::DB> stage_db;
@@ -1064,9 +1078,26 @@ int main(int argc, char** argv) {
             std::to_string(st_tiered_max_runs_per_level);
       }
     }
+    for (const auto& [k, v] : st_custom_opts) {
+      st_opts[k] = v;
+    }
     s = stage_db->SetOptions(cf, st_opts);
     if (!s.ok()) {
       std::cerr << "SetOptions(ST at open) failed: " << s.ToString() << "\n";
+      return 1;
+    }
+  }
+
+  // Apply any custom options (e.g. for parameter sweeps)
+  if (!st_custom_opts.empty()) {
+    std::unordered_map<std::string, std::string> custom_map;
+    for (const auto& [k, v] : st_custom_opts) {
+      custom_map[k] = v;
+      std::cout << "SetOption: " << k << "=" << v << "\n";
+    }
+    s = stage_db->SetOptions(cf, custom_map);
+    if (!s.ok()) {
+      std::cerr << "SetOptions(custom) failed: " << s.ToString() << "\n";
       return 1;
     }
   }

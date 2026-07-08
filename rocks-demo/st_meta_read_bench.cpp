@@ -352,6 +352,8 @@ int main(int argc, char** argv) {
   bool virtual_merge_enable = false;
   bool virtual_merge_auto = false;
   uint32_t vm_time_span_sec_threshold = 6 * 3600;
+  // Override event_time_bucket_width_sec (0 = use DB option).
+  uint32_t event_time_bucket_width_sec_override = 0;
   // manifest-only: use sequential disjoint checks only (debug / A-B vs bucket path).
   bool manifest_linear_file_skip_only = false;
   // When time-bucket R-tree file path is on: pre-scan eligible SSTs; if
@@ -543,6 +545,14 @@ int main(int argc, char** argv) {
         return 1;
       }
       vm_contains_batch_prewarm = (v == 1);
+      continue;
+    }
+    if (std::strcmp(a, "--event-time-bucket-width-sec") == 0 && i + 1 < argc) {
+      if (!ParseU32(argv[++i], &event_time_bucket_width_sec_override) ||
+          event_time_bucket_width_sec_override == 0) {
+        std::cerr << "Invalid --event-time-bucket-width-sec\n";
+        return 1;
+      }
       continue;
     }
     if (std::strcmp(a, "--time-bucket-count") == 0 && i + 1 < argc) {
@@ -809,6 +819,12 @@ int main(int argc, char** argv) {
     if (auto* io = rocksdb::get_iostats_context(); io != nullptr) {
       io->Reset();
     }
+    uint64_t full_data_miss_before =
+        db->GetOptions().statistics
+            ? db->GetOptions().statistics->getAndResetTickerCount(
+                  rocksdb::Tickers::BLOCK_CACHE_DATA_MISS)
+            : 0;
+    (void)full_data_miss_before;  // used after iterator
     const IoSnap io0 = IoStatsSnap();
     auto t0 = std::chrono::steady_clock::now();
     {
@@ -894,13 +910,19 @@ int main(int argc, char** argv) {
     auto t1 = std::chrono::steady_clock::now();
     br_full = rocksdb::get_perf_context()->block_read_count;
     us_full = std::chrono::duration<double, std::micro>(t1 - t0).count();
+    uint64_t full_data_decomp =
+        db->GetOptions().statistics
+            ? db->GetOptions().statistics->getAndResetTickerCount(
+                  rocksdb::Tickers::BLOCK_CACHE_DATA_MISS)
+            : 0;
     IoStatsDiff(io0, "full_scan");
     std::cout << "full_scan mode=" << full_scan_mode
               << " keys=" << count_full;
     if (full_scan_mode == "window") {
       std::cout << " keys_scanned_total=" << count_full_scanned_total;
     }
-    std::cout << " block_read_count=" << br_full << " wall_us=" << us_full << "\n";
+    std::cout << " data_blocks_decompressed=" << full_data_decomp
+              << " block_read_count=" << br_full << " wall_us=" << us_full << "\n";
   }
 
   int64_t count_prune = 0;
@@ -970,8 +992,13 @@ int main(int argc, char** argv) {
       prune.experimental_st_prune_scan.query_dedup_by_segment_uid_enable = true;
       prune.experimental_st_prune_scan.query_segment_uid_dedup = &query_dedup_prune;
     }
-    prune.experimental_st_prune_scan.event_time_bucket_width_sec =
-        cf_bucket_width_sec;
+    if (event_time_bucket_width_sec_override > 0) {
+      prune.experimental_st_prune_scan.event_time_bucket_width_sec =
+          event_time_bucket_width_sec_override;
+    } else {
+      prune.experimental_st_prune_scan.event_time_bucket_width_sec =
+          cf_bucket_width_sec;
+    }
     prune.experimental_st_prune_scan.t_min = prune_t_min;
     prune.experimental_st_prune_scan.t_max = prune_t_max;
     prune.experimental_st_prune_scan.x_min = prune_x_min;
@@ -1144,6 +1171,12 @@ int main(int argc, char** argv) {
     if (auto* io = rocksdb::get_iostats_context(); io != nullptr) {
       io->Reset();
     }
+    uint64_t prune_data_miss_before =
+        db->GetOptions().statistics
+            ? db->GetOptions().statistics->getAndResetTickerCount(
+                  rocksdb::Tickers::BLOCK_CACHE_DATA_MISS)
+            : 0;
+    (void)prune_data_miss_before;
     const IoSnap io1 = IoStatsSnap();
     auto t2 = std::chrono::steady_clock::now();
     for (int rep = 0; rep < iterator_repeat; ++rep) {
@@ -1254,10 +1287,16 @@ int main(int argc, char** argv) {
     br_prune = rocksdb::get_perf_context()->block_read_count;
     us_prune =
         std::chrono::duration<double, std::micro>(t3 - t2).count();
+    uint64_t prune_data_decomp =
+        db->GetOptions().statistics
+            ? db->GetOptions().statistics->getAndResetTickerCount(
+                  rocksdb::Tickers::BLOCK_CACHE_DATA_MISS)
+            : 0;
     IoStatsDiff(io1, "prune_scan");
 
     std::cout << "prune_scan iterator_repeat=" << iterator_repeat
               << " keys(last_iter)=" << count_prune
+              << " data_blocks_decompressed=" << prune_data_decomp
               << " block_read_count=" << br_prune << " wall_us_total=" << us_prune
               << " wall_us_per_iter_avg="
               << (us_prune / static_cast<double>(iterator_repeat))
