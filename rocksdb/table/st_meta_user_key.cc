@@ -884,15 +884,17 @@ bool SegmentValueHasPointInWindow(
     const Slice& value, const ReadOptions::ExperimentalSpatioTemporalPruneScan& q) {
   SegmentValueHeaderForStMeta header{};
   if (!TryDecodeSegmentValueHeader(value, &header)) {
-    return true;
+    // Decode failure: value is malformed or uses a legacy format no longer
+    // supported (e.g. raw header without magic). Treat as not-in-window.
+    return false;
   }
   if (value.size() == sizeof(SegmentValueHeaderForStMeta)) {
-    return !(header.t_start > q.t_max || header.t_end < q.t_min ||
-             header.x_min > q.x_max || header.x_max < q.x_min ||
-             header.y_min > q.y_max || header.y_max < q.y_min);
+    // Header-only value (no points): cannot verify, treat as not-in-window.
+    return false;
   }
   if (value.size() < 4 + sizeof(SegmentValueHeaderForStMeta)) {
-    return true;
+    // Value too small to contain magic + header + points.
+    return false;
   }
   uint32_t value_magic = 0;
   std::memcpy(&value_magic, value.data(), sizeof(value_magic));
@@ -900,7 +902,8 @@ bool SegmentValueHasPointInWindow(
     size_t off = 4 + sizeof(SegmentValueHeaderForStMeta);
     for (uint32_t i = 0; i < header.point_count; ++i) {
       if (off + 12 > value.size()) {
-        return true;
+        // Buffer overflow: malformed value, no point in window.
+        return false;
       }
       uint32_t t = 0;
       float x = 0.f, y = 0.f;
@@ -917,27 +920,27 @@ bool SegmentValueHasPointInWindow(
   if (value_magic == kSegmentValueMagicV3) {
     size_t off = 4 + sizeof(SegmentValueHeaderForStMeta);
     if (off + 1 + 4 > value.size()) {
-      return true;
+      return false;
     }
-    const uint8_t flags = static_cast<uint8_t>(value.data()[off]);
+    // Skip flags byte (legacy ghost bit, no longer used).
     off += 1;
     uint32_t master_key_len = 0;
     std::memcpy(&master_key_len, value.data() + off, sizeof(master_key_len));
     off += 4;
     if (off + static_cast<size_t>(master_key_len) > value.size()) {
-      return true;
+      return false;
     }
     off += master_key_len;
     const size_t points_bytes =
         static_cast<size_t>(header.point_count) * static_cast<size_t>(12);
     const size_t remaining = value.size() - off;
-    const bool is_ghost = (flags & kSegmentValueFlagGhost) != 0;
-    if (remaining != points_bytes || (is_ghost && remaining == 0)) {
-      return is_ghost ? false : true;
+    if (remaining != points_bytes) {
+      // Size mismatch: value does not contain exactly the expected points.
+      return false;
     }
     for (uint32_t i = 0; i < header.point_count; ++i) {
       if (off + 12 > value.size()) {
-        return true;
+        return false;
       }
       uint32_t t = 0;
       float x = 0.f, y = 0.f;
@@ -951,7 +954,8 @@ bool SegmentValueHasPointInWindow(
     }
     return false;
   }
-  return true;
+  // Unknown value magic: unsupported format, treat as not-in-window.
+  return false;
 }
 
 }  // namespace
@@ -959,7 +963,7 @@ bool SegmentValueHasPointInWindow(
 bool KeyValueHasPointInSpatioTemporalWindow(
     const Slice& user_key, const Slice& value,
     const ReadOptions::ExperimentalSpatioTemporalPruneScan& q) {
-  if (!q.enable || !q.value_level_point_truth_enable) {
+  if (!q.enable) {
     return true;
   }
   if (user_key.size() < 1) {

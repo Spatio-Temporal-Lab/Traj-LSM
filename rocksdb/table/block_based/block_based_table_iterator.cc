@@ -884,7 +884,10 @@ void BlockBasedTableIterator::FindKeyForward() {
       block_iter_.Next();
       continue;
     }
-    if (q.value_level_point_truth_enable) {
+    // Key-level checks (temporal / MBR) are conservative and can produce
+    // false positives. Always verify with point-level truth to guarantee
+    // only segments with actual trajectory points in the window are yielded.
+    if (q.value_level_point_truth_enable || q.key_level_enable) {
       const Slice val = block_iter_.value();
       if (!KeyValueHasPointInSpatioTemporalWindow(ukey, val, q)) {
         if (q.key_level_keys_skipped_false_positive != nullptr) {

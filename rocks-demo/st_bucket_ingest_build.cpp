@@ -454,6 +454,14 @@ struct MetaRowFields {
   float x_max = 0;
   float y_min = 0;
   float y_max = 0;
+  // Pre-computed E7 fields (optional, speeds up ingest)
+  bool has_e7_precomputed = false;
+  uint32_t e7_bucket_id = 0;
+  uint64_t e7_zorder = 0;
+  uint32_t e7_t_start_offset = 0;
+  uint64_t e7_vehicle_id = 0;
+  uint32_t e7_segment_seq = 0;
+  uint16_t e7_chunk_seq = 0;
 };
 
 bool TryParseMetaLine(const std::string& line, MetaRowFields* out) {
@@ -472,6 +480,16 @@ bool TryParseMetaLine(const std::string& line, MetaRowFields* out) {
   out->x_max = static_cast<float>(std::stod(f[6]));
   out->y_min = static_cast<float>(std::stod(f[7]));
   out->y_max = static_cast<float>(std::stod(f[8]));
+  // Parse pre-computed E7 fields if available (columns 10-15)
+  if (f.size() >= 16) {
+    out->has_e7_precomputed = true;
+    out->e7_bucket_id     = static_cast<uint32_t>(std::stoul(f[10]));
+    out->e7_zorder        = std::stoull(f[11]);
+    out->e7_t_start_offset = static_cast<uint32_t>(std::stoul(f[12]));
+    out->e7_vehicle_id    = std::stoull(f[13]);
+    out->e7_segment_seq   = static_cast<uint32_t>(std::stoul(f[14]));
+    out->e7_chunk_seq     = static_cast<uint16_t>(std::stoul(f[15]));
+  }
   return true;
 }
 
@@ -537,8 +555,17 @@ rocksdb::Status BuildKvsForMetaRow(
   uint64_t vehicle_id = 0;
   uint32_t segment_seq = 0;
   uint16_t chunk_seq = 0;
-  ParseSegmentIdForE7(row.segment_id, &vehicle_id, &segment_seq, &chunk_seq);
-  const uint64_t zorder_start = MakeSimpleZOrderStart(points);
+  uint64_t zorder_start = 0;
+  if (row.has_e7_precomputed) {
+    // Use pre-computed E7 fields from meta CSV — skip string parsing + points read
+    vehicle_id  = row.e7_vehicle_id;
+    segment_seq = row.e7_segment_seq;
+    chunk_seq   = row.e7_chunk_seq;
+    zorder_start = row.e7_zorder;
+  } else {
+    ParseSegmentIdForE7(row.segment_id, &vehicle_id, &segment_seq, &chunk_seq);
+    zorder_start = MakeSimpleZOrderStart(points);
+  }
 
   if (legacy_ghost_ingest) {
     Kv kv;

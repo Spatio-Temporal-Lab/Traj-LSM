@@ -21,6 +21,19 @@ rocksdb_vanilla/build_snappy3/
 /TMan-tsp/
 /Tman-RocksDB/
 
+# Tools / experiment scripts (not part of engine)
+/tools/
+
+# Experiment result reports (docs/)
+docs/*result*.md
+docs/*ablation*.md
+docs/*tdwx*.md
+docs/*prefix*.md
+docs/Wuxi_TDrive_数据集信息.xlsx
+
+# Third-party source
+/code/
+
 # Unrelated
 /homework/
 /ST-RocksDB_TiDB_交付包/

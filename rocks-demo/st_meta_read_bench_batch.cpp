@@ -558,10 +558,16 @@ static QueryMetrics RunOneQuery(rocksdb::DB* db, rocksdb::ReadOptions& prune,
       if (!verify) {
         continue;
       }
-      const PointTruthEval pe = EvalPointTruthInWindow(
-          db, prune, uk, it->value(), t_min, t_max, w.x_min, w.x_max, w.y_min, w.y_max);
-      if (!pe.in_window) {
-        continue;
+      // When key_level is enabled, the iterator already performed point-truth
+      // verification (SegmentValueHasPointInWindow) before yielding each key.
+      // Skip redundant EvalPointTruthInWindow to avoid divergence between the
+      // two code paths. When key_level is off, perform the full check here.
+      if (!prune.experimental_st_prune_scan.key_level_enable) {
+        const PointTruthEval pe = EvalPointTruthInWindow(
+            db, prune, uk, it->value(), t_min, t_max, w.x_min, w.x_max, w.y_min, w.y_max);
+        if (!pe.in_window) {
+          continue;
+        }
       }
       if (!iterator_dedup && dedup != nullptr && !dedup->AcceptEmitUserKey(uk)) {
         continue;
