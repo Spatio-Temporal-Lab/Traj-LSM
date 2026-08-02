@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>

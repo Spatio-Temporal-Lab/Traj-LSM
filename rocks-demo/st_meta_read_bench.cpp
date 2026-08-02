@@ -987,6 +987,7 @@ int main(int argc, char** argv) {
     prune.total_order_seek = true;
     prune.fill_cache = false;
     prune.experimental_st_prune_scan.enable = true;
+    prune.experimental_st_prune_scan.value_level_point_truth_enable = true;
     const bool prune_iterator_segment_uid_dedup = query_segment_uid_dedup;
     if (prune_iterator_segment_uid_dedup) {
       prune.experimental_st_prune_scan.query_dedup_by_segment_uid_enable = true;
@@ -1196,33 +1197,24 @@ int main(int argc, char** argv) {
       prune_block_index_prune_ns = 0;
       prune_key_examined = 0;
       prune_key_skipped_disjoint = 0;
-      if (verify_kv_results) {
-        prune_inwindow_kv = 0;
-        prune_inwindow_segment_kv = 0;
-        prune_hash1 = 0;
-        prune_hash2 = 0;
-        verify_prune_decode_failed = 0;
-        verify_prune_legacy_segment_value = 0;
-        verify_prune_unsupported_key = 0;
-        verify_prune_ghost_segment_value = 0;
-        verify_prune_ghost_missing_master_key = 0;
-        verify_prune_ghost_master_lookup_failed = 0;
-        verify_prune_ghost_master_decode_failed = 0;
-        verify_prune_ghost_master_is_ghost = 0;
-        verify_prune_ghost_master_meta_mismatch = 0;
-      }
+      prune_inwindow_kv = 0;
+      prune_inwindow_segment_kv = 0;
+      prune_hash1 = 0;
+      prune_hash2 = 0;
+      verify_prune_decode_failed = 0;
+      verify_prune_legacy_segment_value = 0;
+      verify_prune_unsupported_key = 0;
+      verify_prune_ghost_segment_value = 0;
+      verify_prune_ghost_missing_master_key = 0;
+      verify_prune_ghost_master_lookup_failed = 0;
+      verify_prune_ghost_master_decode_failed = 0;
+      verify_prune_ghost_master_is_ghost = 0;
+      verify_prune_ghost_master_meta_mismatch = 0;
       std::unique_ptr<rocksdb::Iterator> it(db->NewIterator(prune));
       for (it->SeekToFirst(); it->Valid(); it->Next()) {
         ++count_prune;
-        const rocksdb::Slice uk = UserKeyFromIteratorKey(it->key());
-        const bool in_window =
-            UserKeySpatioTemporalInWindow(uk, prune_t_min, prune_t_max,
-                                          prune_x_min, prune_x_max, prune_y_min,
-                                          prune_y_max);
-        if (in_window) {
-          ++count_prune_in_window;
-        }
-        if (verify_kv_results) {
+        // Always run point-truth to get accurate count; verify_kv_results adds extra diag
+          const rocksdb::Slice uk = UserKeyFromIteratorKey(it->key());
           const rocksdb::Slice v = it->value();
           const PointTruthEval pe = EvalPointTruthInWindow(
               db.get(), prune, uk, v, prune_t_min, prune_t_max, prune_x_min, prune_x_max,
@@ -1276,7 +1268,6 @@ int main(int argc, char** argv) {
           }
           prune_hash1 += h1;
           prune_hash2 += h2;
-        }
       }
       if (!it->status().ok()) {
         std::cerr << "Prune iter: " << it->status().ToString() << "\n";
@@ -1300,7 +1291,7 @@ int main(int argc, char** argv) {
               << " block_read_count=" << br_prune << " wall_us_total=" << us_prune
               << " wall_us_per_iter_avg="
               << (us_prune / static_cast<double>(iterator_repeat))
-              << " keys_in_window(last_iter)=" << count_prune_in_window << "\n";
+              << " keys_in_window(last_iter)=" << prune_inwindow_segment_kv << "\n";
     std::cout << "prune_file_skipped=" << prune_files_skipped << "\n";
     std::cout << "prune_file_diag considered=" << prune_files_considered
               << " missing_meta=" << prune_files_missing_meta

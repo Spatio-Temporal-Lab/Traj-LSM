@@ -21,6 +21,10 @@ rocksdb_vanilla/build_snappy3/
 /TMan-tsp/
 /Tman-RocksDB/
 
+# TMan build artifacts
+/TMan-*.jar
+/downloads/
+
 # Tools / experiment scripts (not part of engine)
 /tools/
 
