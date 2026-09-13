@@ -183,6 +183,8 @@ PointTruthEval EvalPointTruthInWindow(rocksdb::DB* db,
                                       uint32_t t_max, float x_min, float x_max,
                                       float y_min, float y_max) {
   PointTruthEval out;
+  (void)db;
+  (void)ro;
   if (user_key.empty()) {
     return out;
   }
@@ -195,15 +197,15 @@ PointTruthEval EvalPointTruthInWindow(rocksdb::DB* db,
   }
   if (ROCKSDB_NAMESPACE::IsTmanStSegmentUserKey(user_key)) {
     out.supported = true;
-    segval::MaterializedSegmentValue materialized{};
-    if (!segval::DecodeAndMaterializeSegmentValue(db, ro, user_key, value,
-                                                  &materialized)) {
+    segval::DecodedSegmentValue decoded{};
+    if (!segval::DecodeSegmentValue(std::string(value.data(), value.size()),
+                                    &decoded)) {
       return out;
     }
-    if (materialized.decoded.is_legacy) {
+    if (decoded.is_legacy) {
       return out;
     }
-    for (const auto& p : materialized.decoded.points) {
+    for (const auto& p : decoded.points) {
       if (p.unix_s >= t_min && p.unix_s <= t_max && p.lon >= x_min &&
           p.lon <= x_max && p.lat >= y_min && p.lat <= y_max) {
         out.in_window = true;
@@ -216,23 +218,15 @@ PointTruthEval EvalPointTruthInWindow(rocksdb::DB* db,
     return out;
   }
   out.supported = true;
-  segval::MaterializedSegmentValue materialized{};
-  if (!segval::DecodeAndMaterializeSegmentValue(db, ro, user_key, value,
-                                                &materialized)) {
+  segval::DecodedSegmentValue decoded{};
+  if (!segval::DecodeSegmentValue(std::string(value.data(), value.size()),
+                                  &decoded)) {
     return out;
   }
-  if (materialized.decoded.is_legacy) {
+  if (decoded.is_legacy) {
     return out;
   }
-  if (materialized.was_ghost) {
-    const auto& d = materialized.decoded;
-    if (d.master_key.empty() || !materialized.master_lookup_ok ||
-        materialized.master_decode_failed || materialized.master_is_ghost ||
-        materialized.master_meta_mismatch) {
-      return out;
-    }
-  }
-  for (const auto& p : materialized.decoded.points) {
+  for (const auto& p : decoded.points) {
     if (p.unix_s >= t_min && p.unix_s <= t_max && p.lon >= x_min && p.lon <= x_max &&
         p.lat >= y_min && p.lat <= y_max) {
       out.in_window = true;

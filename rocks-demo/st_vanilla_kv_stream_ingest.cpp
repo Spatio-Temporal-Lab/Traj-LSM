@@ -62,21 +62,6 @@ rocksdb::Options VanillaIngestOptions(int write_buffer_mb,
   return o;
 }
 
-template <typename OptionsT>
-void MaybeApplyExperimentalGlobalOptions(
-    OptionsT* opt, bool experimental_global_master_ghost,
-    bool experimental_global_verify_ghost) {
-  if (opt == nullptr) {
-    return;
-  }
-  if constexpr (requires(OptionsT& o) { o.experimental_global_master_ghost; }) {
-    opt->experimental_global_master_ghost = experimental_global_master_ghost;
-  }
-  if constexpr (requires(OptionsT& o) { o.experimental_global_verify_ghost; }) {
-    opt->experimental_global_verify_ghost = experimental_global_verify_ghost;
-  }
-}
-
 bool ReadU32(std::istream& in, uint32_t* out) {
   unsigned char b[4];
   in.read(reinterpret_cast<char*>(b), 4);
@@ -302,8 +287,6 @@ int main(int argc, char** argv) {
   std::string compression_name = "none";
   uint64_t block_size = 4096;
   std::string key_schema = "e7_tzid";
-  bool experimental_global_master_ghost = false;
-  bool experimental_global_verify_ghost = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -323,10 +306,6 @@ int main(int argc, char** argv) {
       block_size = static_cast<uint64_t>(std::strtoull(argv[++i], nullptr, 10));
     } else if (a == "--key-schema" && i + 1 < argc) {
       key_schema = argv[++i];
-    } else if (a == "--experimental-global-master-ghost") {
-      experimental_global_master_ghost = true;
-    } else if (a == "--experimental-global-verify-ghost") {
-      experimental_global_verify_ghost = true;
     } else if (a == "-h" || a == "--help") {
       std::cout
           << "st_vanilla_kv_stream_ingest --db <new_dir> (--in <dump.kvs> | --jsonl <segments.jsonl>) [--compact]\n"
@@ -336,22 +315,13 @@ int main(int argc, char** argv) {
              "    segment_id, t_min, t_max, mbr.{min_lon,min_lat,max_lon,max_lat}\n"
              "  --compression {none|snappy|zstd|lz4} (default: none)\n"
              "  --block-size <bytes> (default: 4096)\n"
-             "  --key-schema {e7_tzid} (default: e7_tzid)\n"
-             "  --experimental-global-master-ghost\n"
-             "      Enable Global Master/Ghost manifest semantics in CF options.\n"
-             "  --experimental-global-verify-ghost\n"
-             "      Enable Global ghost consistency fail-fast checks.\n";
+             "  --key-schema {e7_tzid} (default: e7_tzid)\n";
       return 0;
     }
   }
 
   if (db_path.empty() || (in_path.empty() == jsonl_path.empty())) {
     std::cerr << "Required: --db <dir> and exactly one of --in <dump.kvs> or --jsonl <segments.jsonl>\n";
-    return 1;
-  }
-
-  if (experimental_global_verify_ghost && !experimental_global_master_ghost) {
-    std::cerr << "--experimental-global-verify-ghost requires --experimental-global-master-ghost\n";
     return 1;
   }
 
@@ -365,8 +335,6 @@ int main(int argc, char** argv) {
   }
   rocksdb::Options opt =
       VanillaIngestOptions(write_buffer_mb, compression, block_size);
-  MaybeApplyExperimentalGlobalOptions(
-      &opt, experimental_global_master_ghost, experimental_global_verify_ghost);
   std::unique_ptr<rocksdb::DB> db;
   rocksdb::Status st = rocksdb::DB::Open(opt, db_path, &db);
   if (!st.ok()) {

@@ -6,7 +6,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $Root
 
-$py = Join-Path $Root 'tools\run_tdrive_st_query_bench.py'
+$py = Join-Path $Root 'tools\benchmark\run_tdrive_st_query_bench.py'
 $verify = Join-Path $Root 'scripts\verify-repeat-results.ps1'
 if (-not (Test-Path $py)) { throw "Missing tool script: $py" }
 if (-not (Test-Path $verify)) { throw "Missing verify script: $verify" }
@@ -27,7 +27,8 @@ for ($i = 1; $i -le $Rounds; $i++) {
   $stamp = New-TimestampId
   $runDir = Join-Path $outRoot ("{0}_round_{1:D2}" -f $stamp, $i)
   New-Item -ItemType Directory -Force $runDir | Out-Null
-  python $py --query-root D:\Project\data\processed\tman_tdrive\tdrive_query_st --suites unified_12 --out-dir $runDir
+  $queryRoot = Join-Path $Root 'data\processed\tman_tdrive\tdrive_query_st'
+  python $py --query-root $queryRoot --suites unified_12 --out-dir $runDir
   if ($LASTEXITCODE -eq 0) {
     & powershell -ExecutionPolicy Bypass -File $verify -Root $Root -RoundDir $runDir | Out-Null
   }
@@ -39,12 +40,12 @@ for ($i = 1; $i -le $Rounds; $i++) {
   Start-Sleep -Milliseconds 250
 }
 
-@'
+@"
 import csv
 import json
 from pathlib import Path
 
-root = Path(r'D:\Project\Result\TSV\tdrive_st_query_repeat')
+root = Path(r'$outRoot')
 runs = sorted([p for p in root.iterdir() if p.is_dir() and '_round_' in p.name])
 metric = 'unified_12'
 times = []
@@ -87,6 +88,6 @@ idx.write_text(json.dumps({
 }, indent=2) + '\n', encoding='utf-8')
 print(out)
 print(idx)
-'@ | python -
+"@ | python -
 
 & powershell -ExecutionPolicy Bypass -File $verify -Root $Root | Out-Null

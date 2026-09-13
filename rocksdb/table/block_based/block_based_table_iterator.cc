@@ -129,21 +129,13 @@ void AdvanceIndexPastPrunedForward(
     const IndexValue& first = index_iter->value();
     if (first.has_st_meta &&
         first.st_meta.prefix_max_t_end >= ro.experimental_st_prune_scan.t_min) {
-      // Walk backward: prefix_max_t_end is monotonically non-decreasing,
-      // so the first entry (prefix_max=0) is always a safe fallback.
-      while (index_iter->Valid()) {
-        index_iter->Prev();
-        if (!index_iter->Valid()) {
-          index_iter->SeekToFirst();
-          break;
-        }
-        const IndexValue& pv = index_iter->value();
-        if (pv.has_st_meta &&
-            pv.st_meta.prefix_max_t_end < ro.experimental_st_prune_scan.t_min) {
-          // All blocks before this position end strictly before the query.
-          break;
-        }
-      }
+      // Binary-search backward to the first entry whose data block can overlap:
+      // prefix_max_t_end is monotonically non-decreasing, so the rightmost entry
+      // with prefix_max_t_end < q.t_min is the safe starting position (all
+      // blocks before it end strictly before the query). The first entry
+      // (prefix_max=0) remains the always-safe fallback.
+      static_cast<IndexBlockIter*>(index_iter)
+          ->SeekToFirstPotentialOverlap(ro.experimental_st_prune_scan.t_min);
     }
   }
   // ── Per-entry forward pruning + backward truncation ──────────────

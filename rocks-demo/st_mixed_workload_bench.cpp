@@ -88,14 +88,12 @@ std::string RandomE7Key(std::mt19937_64& rng, uint32_t bucket_sec,
     t_start = 1406851200u + std::uniform_int_distribution<uint32_t>(0, 43200)(rng);
   }
   const uint32_t bucket_id = t_start / bucket_sec;
-  const uint32_t t_start_offset = t_start - bucket_id * bucket_sec;
   const uint64_t zorder = std::uniform_int_distribution<uint64_t>(
       0, (uint64_t{1} << 48) - 1)(rng);
   const uint64_t vehicle_id = 20000000000000ULL + seq;
   const uint32_t segment_seq = static_cast<uint32_t>(seq % 100000);
   out_vehicle_id = vehicle_id;
-  return StSegmentKeyTzidRaw(bucket_id, zorder, t_start_offset,
-                             vehicle_id, segment_seq, 0, 0);
+  return StSegmentKeyTzidRaw(bucket_id, zorder, vehicle_id, segment_seq, 0);
 }
 
 std::string RandomSegmentValue(std::mt19937_64& rng, uint32_t t_start) {
@@ -144,17 +142,16 @@ rocksdb::Options OpenOptions(int block_cache_mb, int level_bytes_mb) {
 }
 
 // Build an E7 seek key for the given bucket_id with all other fields zeroed.
-// E7 key: [magic 0xE7][type 0x00][bucket_id u32 BE][zorder u64 BE]
-//         [t_start_offset u32 BE][vehicle_id u64 BE][segment_seq u32 BE][chunk_seq u16 BE]
+// E7 key: [magic 0xE7][bucket_id u32 BE][zorder u64 BE]
+//         [vehicle_id u64 BE][segment_seq u32 BE][chunk_seq u16 BE]
 std::string BuildE7SeekKey(uint32_t bucket_id) {
-  std::string key(32, '\0');
+  std::string key(27, '\0');
   key[0] = static_cast<char>(0xE7);
-  key[1] = 0;
-  key[2] = static_cast<char>((bucket_id >> 24) & 0xFF);
-  key[3] = static_cast<char>((bucket_id >> 16) & 0xFF);
-  key[4] = static_cast<char>((bucket_id >> 8) & 0xFF);
-  key[5] = static_cast<char>(bucket_id & 0xFF);
-  // zorder, t_start_offset, vehicle_id, segment_seq, chunk_seq all remain 0
+  key[1] = static_cast<char>((bucket_id >> 24) & 0xFF);
+  key[2] = static_cast<char>((bucket_id >> 16) & 0xFF);
+  key[3] = static_cast<char>((bucket_id >> 8) & 0xFF);
+  key[4] = static_cast<char>(bucket_id & 0xFF);
+  // zorder, vehicle_id, segment_seq, chunk_seq all remain 0
   return key;
 }
 
@@ -170,12 +167,12 @@ uint64_t RunOneQuery(rocksdb::Iterator* it, const QueryWindow& w,
   auto t0 = std::chrono::steady_clock::now();
   it->Seek(seek_key);
   while (it->Valid()) {
-    if (it->key().size() >= 6) {
+    if (it->key().size() >= 5) {
       const auto* d = reinterpret_cast<const uint8_t*>(it->key().data());
-      uint32_t cur_bucket = (static_cast<uint32_t>(d[2]) << 24) |
-                            (static_cast<uint32_t>(d[3]) << 16) |
-                            (static_cast<uint32_t>(d[4]) << 8) |
-                            static_cast<uint32_t>(d[5]);
+      uint32_t cur_bucket = (static_cast<uint32_t>(d[1]) << 24) |
+                            (static_cast<uint32_t>(d[2]) << 16) |
+                            (static_cast<uint32_t>(d[3]) << 8) |
+                            static_cast<uint32_t>(d[4]);
       if (cur_bucket > max_bucket) break;
     }
     volatile auto v = it->value().size(); (void)v;

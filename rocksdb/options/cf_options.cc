@@ -722,32 +722,23 @@ static std::unordered_map<std::string, OptionTypeInfo>
                    experimental_compaction_read_repair_shape_weight),
           OptionType::kDouble, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"experimental_st_block_compaction_ratio",
+         {offsetof(struct MutableCFOptions,
+                   experimental_st_block_compaction_ratio),
+          OptionType::kDouble, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         {"experimental_compaction_spatial_soft_expansion_ratio",
-         {offsetof(struct MutableCFOptions,
-                   experimental_compaction_spatial_soft_expansion_ratio),
-          OptionType::kDouble, OptionVerificationType::kNormal,
-          OptionTypeFlags::kMutable}},
+         {0, OptionType::kDouble, OptionVerificationType::kDeprecated,
+          OptionTypeFlags::kNone}},
         {"experimental_compaction_spatial_hard_expansion_ratio",
-         {offsetof(struct MutableCFOptions,
-                   experimental_compaction_spatial_hard_expansion_ratio),
-          OptionType::kDouble, OptionVerificationType::kNormal,
-          OptionTypeFlags::kMutable}},
+         {0, OptionType::kDouble, OptionVerificationType::kDeprecated,
+          OptionTypeFlags::kNone}},
         {"experimental_compaction_spatial_hard_min_file_size",
-         {offsetof(struct MutableCFOptions,
-                   experimental_compaction_spatial_hard_min_file_size),
-          OptionType::kUInt64T, OptionVerificationType::kNormal,
-          OptionTypeFlags::kMutable}},
+         {0, OptionType::kUInt64T, OptionVerificationType::kDeprecated,
+          OptionTypeFlags::kNone}},
         {"experimental_st_block_mbr_flush_enable",
          {offsetof(struct MutableCFOptions,
                    experimental_st_block_mbr_flush_enable),
-          OptionType::kBoolean, OptionVerificationType::kNormal,
-          OptionTypeFlags::kMutable}},
-        {"experimental_global_master_ghost",
-         {offsetof(struct MutableCFOptions, experimental_global_master_ghost),
-          OptionType::kBoolean, OptionVerificationType::kNormal,
-          OptionTypeFlags::kMutable}},
-        {"experimental_global_verify_ghost",
-         {offsetof(struct MutableCFOptions, experimental_global_verify_ghost),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
         {"experimental_st_compaction",
@@ -1414,19 +1405,8 @@ void MutableCFOptions::Dump(Logger* log) const {
   ROCKS_LOG_INFO(
       log, " experimental_compaction_read_repair_shape_weight: %f",
       experimental_compaction_read_repair_shape_weight);
-  ROCKS_LOG_INFO(
-      log, " experimental_compaction_spatial_soft_expansion_ratio: %f",
-      experimental_compaction_spatial_soft_expansion_ratio);
-  ROCKS_LOG_INFO(
-      log, " experimental_compaction_spatial_hard_expansion_ratio: %f",
-      experimental_compaction_spatial_hard_expansion_ratio);
-  ROCKS_LOG_INFO(
-      log, " experimental_compaction_spatial_hard_min_file_size: %" PRIu64,
-      experimental_compaction_spatial_hard_min_file_size);
-  ROCKS_LOG_INFO(log, " experimental_global_master_ghost: %d",
-                 static_cast<int>(experimental_global_master_ghost));
-  ROCKS_LOG_INFO(log, " experimental_global_verify_ghost: %d",
-                 static_cast<int>(experimental_global_verify_ghost));
+  ROCKS_LOG_INFO(log, " experimental_st_block_compaction_ratio: %f",
+                 experimental_st_block_compaction_ratio);
   ROCKS_LOG_INFO(log, " experimental_st_compaction: %d",
                  static_cast<int>(experimental_st_compaction));
   ROCKS_LOG_INFO(log,

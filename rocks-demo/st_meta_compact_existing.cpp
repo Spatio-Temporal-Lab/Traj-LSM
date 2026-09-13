@@ -28,16 +28,6 @@
 
 namespace {
 
-constexpr uint8_t kE7TypeGhostBit = 0x01;
-
-inline bool IsE7GhostByKeyType(const rocksdb::Slice& user_key) {
-  if (user_key.size() < 32 ||
-      static_cast<unsigned char>(user_key.data()[0]) != 0xE7) {
-    return false;
-  }
-  return (static_cast<uint8_t>(user_key.data()[1]) & kE7TypeGhostBit) != 0;
-}
-
 std::string QuoteArg(const std::string& s) {
   if (s.find_first_of(" \t\"") == std::string::npos) {
     return s;
@@ -107,8 +97,8 @@ inline bool LooksLikeStUserKey(const rocksdb::Slice& user_key) {
     return user_key.size() >= 13;
   }
   if (magic == 0xE7) {
-    // E7 layout is 31 bytes (legacy) or 32 bytes (with type_flags).
-    return user_key.size() >= 31;
+    // E7 layout is 27 bytes (no in-key t_start offset).
+    return user_key.size() >= 27;
   }
   return false;
 }
@@ -125,158 +115,6 @@ inline rocksdb::Slice UserKeyFromIteratorKey(const rocksdb::Slice& raw_key) {
     return raw_key;
   }
   return uk.empty() ? raw_key : uk;
-}
-
-struct GhostCompactResult {
-  uint64_t scanned = 0;
-  uint64_t ghosts_seen = 0;
-  uint64_t duplicate_merged = 0;
-  uint64_t masters_ok = 0;
-  uint64_t dangling = 0;
-  uint64_t meta_mismatch = 0;
-  uint64_t deletes = 0;
-};
-
-bool ParseBucketFromUserKey(const rocksdb::Slice& user_key, uint32_t bucket_width,
-                            uint32_t* out_bucket) {
-  if (out_bucket == nullptr || user_key.size() < 1) {
-    return false;
-  }
-  const unsigned char magic = static_cast<unsigned char>(user_key.data()[0]);
-  if (magic == 0xE7 && user_key.size() >= 5) {
-    const size_t payload_offset = user_key.size() >= 32 ? 2 : 1;
-    const unsigned char* p = reinterpret_cast<const unsigned char*>(
-        user_key.data() + payload_offset);
-    *out_bucket = (static_cast<uint32_t>(p[0]) << 24) |
-                  (static_cast<uint32_t>(p[1]) << 16) |
-                  (static_cast<uint32_t>(p[2]) << 8) |
-                  (static_cast<uint32_t>(p[3]));
-    return true;
-  }
-  if (magic == 0xE6 && user_key.size() >= 5 && bucket_width > 0) {
-    const unsigned char* p =
-        reinterpret_cast<const unsigned char*>(user_key.data() + 1);
-    const uint32_t t_start = (static_cast<uint32_t>(p[0]) << 24) |
-                             (static_cast<uint32_t>(p[1]) << 16) |
-                             (static_cast<uint32_t>(p[2]) << 8) |
-                             (static_cast<uint32_t>(p[3]));
-    *out_bucket = t_start / bucket_width;
-    return true;
-  }
-  return false;
-}
-
-GhostCompactResult CompactGlobalGhosts(rocksdb::DB* db, bool verify_meta,
-                                      bool merge_duplicates, bool dry_run, uint64_t max_probes,
-                                      uint64_t max_deletes) {
-  GhostCompactResult r;
-  if (db == nullptr) {
-    return r;
-  }
-  rocksdb::ReadOptions ro;
-  ro.total_order_seek = true;
-  std::unique_ptr<rocksdb::Iterator> it(db->NewIterator(ro));
-  rocksdb::WriteBatch batch;
-  const rocksdb::WriteOptions wo;
-  const rocksdb::Options db_opt = db->GetOptions();
-  const uint32_t bucket_width =
-      db_opt.experimental_compaction_event_time_bucket_width == 0
-          ? 3600u
-          : db_opt.experimental_compaction_event_time_bucket_width;
-  std::unordered_set<std::string> seen_bucket_master;
-
-  for (it->SeekToFirst(); it->Valid(); it->Next()) {
-    if (r.scanned >= max_probes) {
-      break;
-    }
-    ++r.scanned;
-    const rocksdb::Slice user_key = UserKeyFromIteratorKey(it->key());
-    if (user_key.size() < 1) {
-      continue;
-    }
-    const unsigned char magic = static_cast<unsigned char>(user_key.data()[0]);
-    if (magic != 0xE6 && magic != 0xE7) {
-      continue;
-    }
-    if (magic == 0xE7 && !IsE7GhostByKeyType(user_key)) {
-      // V1: key-first ghost check for E7.
-      continue;
-    }
-    segval::DecodedSegmentValue decoded{};
-    const std::string value_blob(it->value().data(), it->value().size());
-    if (!segval::DecodeSegmentValue(value_blob, &decoded) || decoded.is_legacy) {
-      continue;
-    }
-    if (magic != 0xE7 && !decoded.is_ghost) {
-      continue;
-    }
-    ++r.ghosts_seen;
-    if (merge_duplicates && !decoded.master_key.empty()) {
-      uint32_t bucket = 0;
-      if (ParseBucketFromUserKey(user_key, bucket_width, &bucket)) {
-        const std::string dedupe_key =
-            std::to_string(bucket) + "|" + decoded.master_key;
-        if (!seen_bucket_master.insert(dedupe_key).second) {
-          ++r.duplicate_merged;
-          if (!dry_run && r.deletes < max_deletes) {
-            batch.Delete(user_key);
-            ++r.deletes;
-          }
-          continue;
-        }
-      }
-    }
-    if (decoded.master_key.empty()) {
-      ++r.dangling;
-      if (!dry_run && r.deletes < max_deletes) {
-        batch.Delete(user_key);
-        ++r.deletes;
-      }
-      continue;
-    }
-
-    std::string master_value;
-    rocksdb::Status s = db->Get(ro, decoded.master_key, &master_value);
-    if (!s.ok()) {
-      ++r.dangling;
-      if (!dry_run && r.deletes < max_deletes) {
-        batch.Delete(user_key);
-        ++r.deletes;
-      }
-      continue;
-    }
-    ++r.masters_ok;
-
-    if (verify_meta) {
-      segval::DecodedSegmentValue master{};
-      if (!segval::DecodeSegmentValue(master_value, &master) || master.is_legacy ||
-          master.is_ghost) {
-        ++r.meta_mismatch;
-        if (!dry_run && r.deletes < max_deletes) {
-          batch.Delete(user_key);
-          ++r.deletes;
-        }
-        continue;
-      }
-      if (master.header.t_start != decoded.header.t_start ||
-          master.header.t_end != decoded.header.t_end ||
-          master.header.x_min != decoded.header.x_min ||
-          master.header.x_max != decoded.header.x_max ||
-          master.header.y_min != decoded.header.y_min ||
-          master.header.y_max != decoded.header.y_max) {
-        ++r.meta_mismatch;
-        if (!dry_run && r.deletes < max_deletes) {
-          batch.Delete(user_key);
-          ++r.deletes;
-        }
-      }
-    }
-  }
-
-  if (!dry_run && batch.GetDataSize() > 0) {
-    (void)db->Write(wo, &batch);
-  }
-  return r;
 }
 
 bool HasLegacyE6Keys(rocksdb::DB* db, size_t sample_limit = 100000) {
@@ -334,7 +172,7 @@ void ProbeUserKeys(rocksdb::DB* db, size_t sample_limit = 4096) {
       continue;
     }
     const uint8_t magic = static_cast<uint8_t>(k.data()[0]);
-    if (magic == 0xE7 && k.size() >= 17) {
+    if (magic == 0xE7 && k.size() >= 13) {
       ++e7;
       const size_t payload_offset = k.size() >= 32 ? 2 : 1;
       const unsigned char* p =
@@ -343,13 +181,8 @@ void ProbeUserKeys(rocksdb::DB* db, size_t sample_limit = 4096) {
                                  (static_cast<uint32_t>(p[1]) << 16) |
                                  (static_cast<uint32_t>(p[2]) << 8) |
                                  (static_cast<uint32_t>(p[3]));
-      const unsigned char* offp =
-          reinterpret_cast<const unsigned char*>(k.data() + payload_offset + 12);
-      const uint32_t t_start_offset = (static_cast<uint32_t>(offp[0]) << 24) |
-                                      (static_cast<uint32_t>(offp[1]) << 16) |
-                                      (static_cast<uint32_t>(offp[2]) << 8) |
-                                      (static_cast<uint32_t>(offp[3]));
-      const uint32_t t = bucket_id * bucket_width + t_start_offset;
+      // E7 key no longer carries t_start offset; use coarse bucket start.
+      const uint32_t t = bucket_id * bucket_width;
       if (!have_t_e7) {
         first_t_e7 = t;
         have_t_e7 = true;
@@ -401,12 +234,8 @@ void ReportStCompactionOptions(rocksdb::DB* db, const char* label) {
             << " max_span=" << o.experimental_compaction_event_time_max_span
             << " max_point_keys="
             << o.experimental_compaction_event_time_max_point_keys
-            << " spatial_soft_ratio="
-            << o.experimental_compaction_spatial_soft_expansion_ratio
-            << " spatial_hard_ratio="
-            << o.experimental_compaction_spatial_hard_expansion_ratio
-            << " spatial_hard_min_file_size="
-            << o.experimental_compaction_spatial_hard_min_file_size
+            << " block_compaction_ratio="
+            << o.experimental_st_block_compaction_ratio
             << " st_compaction=" << static_cast<int>(o.experimental_st_compaction)
             << " st_level_trigger_ratio="
             << o.experimental_st_compaction_level_trigger_ratio
@@ -422,8 +251,6 @@ void ReportStCompactionOptions(rocksdb::DB* db, const char* label) {
       << " st_level_aware_policy "
       << "bucket_span(L1=2,L2-3=4,L4+=16)"
       << " time_span_factor(L1=0.5x,L2-3=1.0x,L4+=2.0x)"
-      << " spatial_ratio_factor(L1=1.0x,L2-3=1.35x,L4+=1.8x)"
-      << " spatial_hard_min_file_factor(L1=1.0x,L2-3=1.25x,L4+=1.75x)"
       << "\n";
 }
 
@@ -445,20 +272,11 @@ int main(int argc, char** argv) {
   uint32_t st_min_keys_per_file = 0;
   uint32_t st_max_span_sec = 0;
   uint32_t st_max_point_keys = 0;
-  double st_spatial_soft_ratio = 0.0;
-  double st_spatial_hard_ratio = 0.0;
-  uint64_t st_spatial_hard_min_file_size = 0;
+  double st_block_compaction_ratio = 0.0;
   bool read_repair_first = false;
   uint64_t read_repair_min_reads = 0;
   double read_repair_shape_weight = 1.0;
   std::string compaction_style_str = "leveled";
-  bool global_ghost_compact = false;
-  bool global_ghost_compact_dry_run = false;
-  bool global_ghost_verify_meta = false;
-  bool global_ghost_merge_duplicates = true;
-  bool expect_no_ghost_values = false;
-  uint64_t global_ghost_max_probes = 1'000'000;
-  uint64_t global_ghost_max_deletes = 100'000;
   bool allow_legacy_e6 = false;
   bool post_verify_kv_vs_file_meta = false;
   bool post_read_bench = false;
@@ -587,35 +405,14 @@ int main(int argc, char** argv) {
       dry_run = true;
       continue;
     }
-    if (std::strcmp(argv[i], "--st-spatial-soft-ratio") == 0 && i + 1 < argc) {
+    if (std::strcmp(argv[i], "--st-block-compaction-ratio") == 0 && i + 1 < argc) {
       char* e = nullptr;
       const double v = std::strtod(argv[++i], &e);
       if (e == argv[i] || *e != '\0' || v < 0.0) {
-        std::cerr << "Invalid --st-spatial-soft-ratio (>=0)\n";
+        std::cerr << "Invalid --st-block-compaction-ratio (>=0)\n";
         return 1;
       }
-      st_spatial_soft_ratio = v;
-      continue;
-    }
-    if (std::strcmp(argv[i], "--st-spatial-hard-ratio") == 0 && i + 1 < argc) {
-      char* e = nullptr;
-      const double v = std::strtod(argv[++i], &e);
-      if (e == argv[i] || *e != '\0' || v < 0.0) {
-        std::cerr << "Invalid --st-spatial-hard-ratio (>=0)\n";
-        return 1;
-      }
-      st_spatial_hard_ratio = v;
-      continue;
-    }
-    if (std::strcmp(argv[i], "--st-spatial-hard-min-file-mb") == 0 &&
-        i + 1 < argc) {
-      char* e = nullptr;
-      const unsigned long long v = std::strtoull(argv[++i], &e, 10);
-      if (e == argv[i] || *e != '\0' || v > 1024ull * 1024ull) {
-        std::cerr << "Invalid --st-spatial-hard-min-file-mb\n";
-        return 1;
-      }
-      st_spatial_hard_min_file_size = static_cast<uint64_t>(v) * 1048576ull;
+      st_block_compaction_ratio = v;
       continue;
     }
     if (std::strcmp(argv[i], "--read-repair-first") == 0) {
@@ -641,47 +438,6 @@ int main(int argc, char** argv) {
         return 1;
       }
       read_repair_shape_weight = v;
-      continue;
-    }
-    if (std::strcmp(argv[i], "--global-ghost-compact") == 0) {
-      global_ghost_compact = true;
-      continue;
-    }
-    if (std::strcmp(argv[i], "--global-ghost-compact-dry-run") == 0) {
-      global_ghost_compact = true;
-      global_ghost_compact_dry_run = true;
-      continue;
-    }
-    if (std::strcmp(argv[i], "--global-ghost-verify-meta") == 0) {
-      global_ghost_verify_meta = true;
-      continue;
-    }
-    if (std::strcmp(argv[i], "--global-ghost-no-merge-duplicates") == 0) {
-      global_ghost_merge_duplicates = false;
-      continue;
-    }
-    if (std::strcmp(argv[i], "--expect-no-ghost-values") == 0) {
-      expect_no_ghost_values = true;
-      continue;
-    }
-    if (std::strcmp(argv[i], "--global-ghost-max-probes") == 0 && i + 1 < argc) {
-      char* e = nullptr;
-      const unsigned long long v = std::strtoull(argv[++i], &e, 10);
-      if (e == argv[i] || *e != '\0') {
-        std::cerr << "Invalid --global-ghost-max-probes\n";
-        return 1;
-      }
-      global_ghost_max_probes = static_cast<uint64_t>(v);
-      continue;
-    }
-    if (std::strcmp(argv[i], "--global-ghost-max-deletes") == 0 && i + 1 < argc) {
-      char* e = nullptr;
-      const unsigned long long v = std::strtoull(argv[++i], &e, 10);
-      if (e == argv[i] || *e != '\0') {
-        std::cerr << "Invalid --global-ghost-max-deletes\n";
-        return 1;
-      }
-      global_ghost_max_deletes = static_cast<uint64_t>(v);
       continue;
     }
     if (std::strcmp(argv[i], "--allow-legacy-e6") == 0) {
@@ -807,13 +563,6 @@ int main(int argc, char** argv) {
              "  --read-repair-first  enable read-repair-first file pick ordering\n"
              "  --read-repair-min-reads N  minimum sampled reads before read-repair scoring applies\n"
              "  --read-repair-shape-weight W  shape penalty weight for read-repair score\n"
-             "  --global-ghost-compact  after CompactRange, scan & delete dangling/inconsistent ghosts (E7 V3)\n"
-             "  --global-ghost-compact-dry-run  report only; do not delete\n"
-             "  --global-ghost-verify-meta  delete ghosts when master meta mismatches\n"
-             "  --global-ghost-no-merge-duplicates  disable dedupe by (bucket,master_key)\n"
-             "  --expect-no-ghost-values  fail if any ghost value is observed during ghost scan\n"
-             "  --global-ghost-max-probes N  cap scanned records (default 1e6)\n"
-             "  --global-ghost-max-deletes N  cap deletes per run (default 1e5)\n"
              "  --allow-legacy-e6  allow running compaction on legacy E6 DBs (default: reject E6)\n"
              "  --post-verify-kv-vs-file-meta  run st_meta_compaction_verify after compaction\n"
              "  --post-read-bench  run st_meta_read_bench --verify-kv-results after compaction\n"
@@ -945,17 +694,9 @@ int main(int argc, char** argv) {
           std::to_string(st_max_point_keys);
     }
   }
-  if (st_spatial_soft_ratio > 0.0) {
-    cf_opts["experimental_compaction_spatial_soft_expansion_ratio"] =
-        std::to_string(st_spatial_soft_ratio);
-  }
-  if (st_spatial_hard_ratio > 0.0) {
-    cf_opts["experimental_compaction_spatial_hard_expansion_ratio"] =
-        std::to_string(st_spatial_hard_ratio);
-  }
-  if (st_spatial_hard_min_file_size > 0) {
-    cf_opts["experimental_compaction_spatial_hard_min_file_size"] =
-        std::to_string(st_spatial_hard_min_file_size);
+  if (st_block_compaction_ratio > 0.0) {
+    cf_opts["experimental_st_block_compaction_ratio"] =
+        std::to_string(st_block_compaction_ratio);
   }
   if (read_repair_first) {
     cf_opts["experimental_compaction_read_repair_first"] = "true";
@@ -1000,25 +741,6 @@ int main(int argc, char** argv) {
   }
 
   ReportFiles(db.get(), "AFTER");
-  if (global_ghost_compact) {
-    std::cout << "GlobalGhostCompact (scan E6/E7 ghosts)...\n";
-    GhostCompactResult gr = CompactGlobalGhosts(
-        db.get(), global_ghost_verify_meta, global_ghost_merge_duplicates,
-        global_ghost_compact_dry_run,
-        global_ghost_max_probes, global_ghost_max_deletes);
-    std::cout << "GlobalGhostCompact scanned=" << gr.scanned
-              << " ghosts_seen=" << gr.ghosts_seen
-              << " duplicate_merged=" << gr.duplicate_merged
-              << " masters_ok=" << gr.masters_ok
-              << " dangling=" << gr.dangling << " meta_mismatch=" << gr.meta_mismatch
-              << " deletes=" << gr.deletes
-              << (global_ghost_compact_dry_run ? " (dry-run)" : "") << "\n";
-    if (expect_no_ghost_values && gr.ghosts_seen > 0) {
-      std::cerr << "expect_no_ghost_values violated: ghosts_seen="
-                << gr.ghosts_seen << "\n";
-      return 5;
-    }
-  }
   if (post_verify_kv_vs_file_meta) {
     if (post_verify_exe.empty()) {
       post_verify_exe = SiblingExePath(argv[0], "st_meta_compaction_verify.exe");

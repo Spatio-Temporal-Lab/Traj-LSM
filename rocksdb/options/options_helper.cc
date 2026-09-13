@@ -244,10 +244,6 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
       moptions.experimental_compaction_event_time_min_keys_per_file;
   cf_opts->experimental_compaction_event_time_max_point_keys =
       moptions.experimental_compaction_event_time_max_point_keys;
-  cf_opts->experimental_global_master_ghost =
-      moptions.experimental_global_master_ghost;
-  cf_opts->experimental_global_verify_ghost =
-      moptions.experimental_global_verify_ghost;
   cf_opts->experimental_st_compaction = moptions.experimental_st_compaction;
   cf_opts->experimental_st_compaction_level_trigger_ratio =
       moptions.experimental_st_compaction_level_trigger_ratio;
@@ -263,12 +259,8 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
       moptions.experimental_compaction_read_repair_min_reads;
   cf_opts->experimental_compaction_read_repair_shape_weight =
       moptions.experimental_compaction_read_repair_shape_weight;
-  cf_opts->experimental_compaction_spatial_soft_expansion_ratio =
-      moptions.experimental_compaction_spatial_soft_expansion_ratio;
-  cf_opts->experimental_compaction_spatial_hard_expansion_ratio =
-      moptions.experimental_compaction_spatial_hard_expansion_ratio;
-  cf_opts->experimental_compaction_spatial_hard_min_file_size =
-      moptions.experimental_compaction_spatial_hard_min_file_size;
+  cf_opts->experimental_st_block_compaction_ratio =
+      moptions.experimental_st_block_compaction_ratio;
   cf_opts->experimental_st_block_mbr_flush_enable =
       moptions.experimental_st_block_mbr_flush_enable;
   cf_opts->memtable_protection_bytes_per_key =

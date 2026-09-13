@@ -64,16 +64,10 @@ AdvancedColumnFamilyOptions::AdvancedColumnFamilyOptions(const Options& options)
           options.experimental_compaction_read_repair_min_reads),
       experimental_compaction_read_repair_shape_weight(
           options.experimental_compaction_read_repair_shape_weight),
-      experimental_compaction_spatial_soft_expansion_ratio(
-          options.experimental_compaction_spatial_soft_expansion_ratio),
-      experimental_compaction_spatial_hard_expansion_ratio(
-          options.experimental_compaction_spatial_hard_expansion_ratio),
-      experimental_compaction_spatial_hard_min_file_size(
-          options.experimental_compaction_spatial_hard_min_file_size),
+      experimental_st_block_compaction_ratio(
+          options.experimental_st_block_compaction_ratio),
       experimental_st_block_mbr_flush_enable(
           options.experimental_st_block_mbr_flush_enable),
-      experimental_global_master_ghost(options.experimental_global_master_ghost),
-      experimental_global_verify_ghost(options.experimental_global_verify_ghost),
       experimental_st_compaction(options.experimental_st_compaction),
       experimental_st_compaction_level_trigger_ratio(
           options.experimental_st_compaction_level_trigger_ratio),
@@ -503,10 +497,6 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
   }
   ROCKS_LOG_HEADER(log, "        Options.experimental_mempurge_threshold: %f",
                    experimental_mempurge_threshold);
-  ROCKS_LOG_HEADER(log, "      Options.experimental_global_master_ghost: %d",
-                   static_cast<int>(experimental_global_master_ghost));
-  ROCKS_LOG_HEADER(log, "      Options.experimental_global_verify_ghost: %d",
-                   static_cast<int>(experimental_global_verify_ghost));
   ROCKS_LOG_HEADER(log, "      Options.experimental_st_compaction: %d",
                    static_cast<int>(experimental_st_compaction));
   ROCKS_LOG_HEADER(

@@ -356,6 +356,14 @@ class VersionStorageInfo {
     return files_[level];
   }
 
+  // ST: all files across levels sorted by st_file_meta.t_min (ascending).
+  // Built in PrepareForVersionAppend. The Global Index (manifest SST filter)
+  // binary-searches this list to find files intersecting a query time window
+  // instead of scanning every file (O(n) -> O(log n + candidates)).
+  const std::vector<FileMetaData*>& StTimeSortedFiles() const {
+    return st_time_sorted_files_;
+  }
+
   bool HasMissingEpochNumber() const;
   uint64_t GetMaxEpochNumberOfFiles() const;
   EpochNumberRequirement GetEpochNumberRequirement() const {
@@ -688,6 +696,7 @@ class VersionStorageInfo {
   void GenerateLevel0NonOverlapping();
   void GenerateBottommostFiles();
   void GenerateFileLocationIndex();
+  void GenerateStTimeSortedFiles();
 
   const InternalKeyComparator* internal_comparator_;
   const Comparator* user_comparator_;
@@ -709,6 +718,10 @@ class VersionStorageInfo {
   // In L0, files are ordered in decreasing epoch number, meaning
   // more recent updates are ordered first.
   std::vector<FileMetaData*>* files_;
+
+  // ST: files (all levels) sorted by st_file_meta.t_min, for the Global Index
+  // binary-search. Files without st_file_meta sort first (t_min defaults 0).
+  std::vector<FileMetaData*> st_time_sorted_files_;
 
   // Map of all table files in version. Maps file number to (level, position on
   // level).

@@ -80,7 +80,7 @@ inline bool LooksLikeStUserKey(const rocksdb::Slice& user_key) {
     return user_key.size() >= 25;
   }
   if (magic == kMagicSegmentTzidKey) {
-    return user_key.size() >= 31;
+    return user_key.size() >= 27;
   }
   return false;
 }
@@ -142,12 +142,6 @@ struct PointTruthEval {
   bool in_window = false;
   bool decode_failed = false;
   bool legacy_segment_value = false;
-  bool ghost_segment_value = false;
-  bool ghost_missing_master_key = false;
-  bool ghost_master_lookup_failed = false;
-  bool ghost_master_decode_failed = false;
-  bool ghost_master_is_ghost = false;
-  bool ghost_master_meta_mismatch = false;
 };
 
 PointTruthEval EvalPointTruthInWindow(rocksdb::DB* db,
@@ -158,6 +152,8 @@ PointTruthEval EvalPointTruthInWindow(rocksdb::DB* db,
                                       float x_min, float x_max, float y_min,
                                       float y_max) {
   PointTruthEval out;
+  (void)db;
+  (void)read_options;
   if (user_key.size() < 1) {
     return out;
   }
@@ -174,30 +170,15 @@ PointTruthEval EvalPointTruthInWindow(rocksdb::DB* db,
   }
 
   out.supported = true;
-  segval::MaterializedSegmentValue materialized{};
-  if (!segval::DecodeAndMaterializeSegmentValue(db, read_options, user_key, value,
-                                                &materialized)) {
+  segval::DecodedSegmentValue decoded{};
+  if (!segval::DecodeSegmentValue(std::string(value.data(), value.size()),
+                                  &decoded)) {
     out.decode_failed = true;
     return out;
   }
-  const segval::DecodedSegmentValue& decoded = materialized.decoded;
   if (decoded.is_legacy) {
     out.legacy_segment_value = true;
     return out;
-  }
-  if (materialized.was_ghost) {
-    out.ghost_segment_value = true;
-    out.ghost_missing_master_key = decoded.master_key.empty();
-    out.ghost_master_lookup_failed =
-        !materialized.master_lookup_ok && !decoded.master_key.empty();
-    out.ghost_master_decode_failed = materialized.master_decode_failed;
-    out.ghost_master_is_ghost = materialized.master_is_ghost;
-    out.ghost_master_meta_mismatch = materialized.master_meta_mismatch;
-    if (out.ghost_missing_master_key || out.ghost_master_lookup_failed ||
-        out.ghost_master_decode_failed || out.ghost_master_is_ghost ||
-        out.ghost_master_meta_mismatch) {
-      return out;
-    }
   }
   for (const auto& p : decoded.points) {
     if (p.unix_s >= t_min && p.unix_s <= t_max && p.lon >= x_min &&
@@ -213,14 +194,10 @@ inline bool IsSegmentUserKeyMagic(unsigned char magic) {
   return magic == kMagicSegmentLegacyKey || magic == kMagicSegmentTzidKey;
 }
 
-rocksdb::Options BenchOpenOptions(int block_cache_mb, bool large_cache,
-                                  bool experimental_global_master_ghost,
-                                  bool experimental_global_verify_ghost) {
+rocksdb::Options BenchOpenOptions(int block_cache_mb, bool large_cache) {
   rocksdb::Options o;
   o.create_if_missing = false;
   o.statistics = rocksdb::CreateDBStatistics();
-  o.experimental_global_master_ghost = experimental_global_master_ghost;
-  o.experimental_global_verify_ghost = experimental_global_verify_ghost;
   rocksdb::BlockBasedTableOptions tb;
   tb.experimental_spatio_temporal_meta_in_index_value = true;
   const int mb =
@@ -267,10 +244,7 @@ bool ComputeGlobalCountsFromRawKv(
   *masters = 0;
   *ghosts = 0;
 
-  rocksdb::Options raw_opt =
-      BenchOpenOptions(block_cache_mb, large_cache,
-                       /*experimental_global_master_ghost=*/false,
-                       /*experimental_global_verify_ghost=*/false);
+  rocksdb::Options raw_opt = BenchOpenOptions(block_cache_mb, large_cache);
   std::unique_ptr<rocksdb::DB> raw_db;
   rocksdb::Status s = rocksdb::DB::OpenForReadOnly(raw_opt, db_path, &raw_db);
   if (!s.ok()) {
@@ -293,11 +267,7 @@ bool ComputeGlobalCountsFromRawKv(
     if (!segval::DecodeSegmentValue(std::string(v.data(), v.size()), &decoded)) {
       continue;
     }
-    if (decoded.is_ghost) {
-      ++(*ghosts);
-    } else {
-      ++(*masters);
-    }
+    ++(*masters);
   }
   return it->status().ok();
 }
@@ -337,8 +307,6 @@ int main(int argc, char** argv) {
   uint64_t ref_spatial_segments = 0;
   float ref_segment_kv_min_ratio = 0.25f;
   float ref_segment_kv_max_ratio = 8.0f;
-  bool experimental_global_master_ghost = false;
-  bool experimental_global_verify_ghost = false;
   bool global_manifest_counts_fallback_scan = false;
   bool sst_manifest_key_level = true;
   bool sst_manifest_adaptive_key_gate = false;
@@ -496,14 +464,6 @@ int main(int argc, char** argv) {
         std::cerr << "Invalid --ref-segment-kv-max-ratio\n";
         return 1;
       }
-      continue;
-    }
-    if (std::strcmp(a, "--experimental-global-master-ghost") == 0) {
-      experimental_global_master_ghost = true;
-      continue;
-    }
-    if (std::strcmp(a, "--experimental-global-verify-ghost") == 0) {
-      experimental_global_verify_ghost = true;
       continue;
     }
     if (std::strcmp(a, "--global-manifest-counts-fallback-scan") == 0) {
@@ -671,8 +631,6 @@ int main(int argc, char** argv) {
              "  --large-cache            use at least 64MB block cache\n"
              "  --verify-kv-results     full vs prune: compare in-window (key,value) set\n"
              "  --verify-kv-results-strict-exit  return non-zero when verify result is FAIL\n"
-             "  --experimental-global-master-ghost  preserve Global master/ghost options when reopening DB\n"
-             "  --experimental-global-verify-ghost  reopen with Global ghost verification (requires master-ghost)\n"
              "  --global-manifest-counts-fallback-scan  when manifest counts are 0, compute in-window master/ghost from raw KV scan\n"
              "  --sst-manifest-key-level <0|1>  in sst_manifest mode, enable/disable key-level (default 1)\n"
              "  --sst-manifest-adaptive-key-gate  in sst_manifest mode, auto-disable key-level for high-overlap files\n"
@@ -712,11 +670,6 @@ int main(int argc, char** argv) {
     std::cerr << "Cannot use both --no-full-scan and --no-prune-scan\n";
     return 1;
   }
-  if (experimental_global_verify_ghost && !experimental_global_master_ghost) {
-    std::cerr << "--experimental-global-verify-ghost requires "
-                 "--experimental-global-master-ghost\n";
-    return 1;
-  }
   if (iterator_repeat != 1 && !run_prune) {
     std::cerr << "--iterator-repeat requires prune scan (omit --no-prune-scan)\n";
     return 1;
@@ -730,10 +683,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  rocksdb::Options opt =
-      BenchOpenOptions(block_cache_mb, large_cache,
-                       experimental_global_master_ghost,
-                       experimental_global_verify_ghost);
+  rocksdb::Options opt = BenchOpenOptions(block_cache_mb, large_cache);
   std::unique_ptr<rocksdb::DB> db;
   rocksdb::Status s = rocksdb::DB::OpenForReadOnly(opt, db_path, &db);
   if (!s.ok()) {
@@ -800,12 +750,6 @@ int main(int argc, char** argv) {
   uint64_t verify_full_decode_failed = 0;
   uint64_t verify_full_legacy_segment_value = 0;
   uint64_t verify_full_unsupported_key = 0;
-  uint64_t verify_full_ghost_segment_value = 0;
-  uint64_t verify_full_ghost_missing_master_key = 0;
-  uint64_t verify_full_ghost_master_lookup_failed = 0;
-  uint64_t verify_full_ghost_master_decode_failed = 0;
-  uint64_t verify_full_ghost_master_is_ghost = 0;
-  uint64_t verify_full_ghost_master_meta_mismatch = 0;
 
   if (run_full) {
     query_dedup_full.Reset();
@@ -860,24 +804,6 @@ int main(int argc, char** argv) {
           }
           if (pe.legacy_segment_value) {
             ++verify_full_legacy_segment_value;
-          }
-          if (pe.ghost_segment_value) {
-            ++verify_full_ghost_segment_value;
-          }
-          if (pe.ghost_missing_master_key) {
-            ++verify_full_ghost_missing_master_key;
-          }
-          if (pe.ghost_master_lookup_failed) {
-            ++verify_full_ghost_master_lookup_failed;
-          }
-          if (pe.ghost_master_decode_failed) {
-            ++verify_full_ghost_master_decode_failed;
-          }
-          if (pe.ghost_master_is_ghost) {
-            ++verify_full_ghost_master_is_ghost;
-          }
-          if (pe.ghost_master_meta_mismatch) {
-            ++verify_full_ghost_master_meta_mismatch;
           }
           if (pe.in_window) {
             if (query_segment_uid_dedup &&
@@ -936,12 +862,6 @@ int main(int argc, char** argv) {
   uint64_t verify_prune_decode_failed = 0;
   uint64_t verify_prune_legacy_segment_value = 0;
   uint64_t verify_prune_unsupported_key = 0;
-  uint64_t verify_prune_ghost_segment_value = 0;
-  uint64_t verify_prune_ghost_missing_master_key = 0;
-  uint64_t verify_prune_ghost_master_lookup_failed = 0;
-  uint64_t verify_prune_ghost_master_decode_failed = 0;
-  uint64_t verify_prune_ghost_master_is_ghost = 0;
-  uint64_t verify_prune_ghost_master_meta_mismatch = 0;
 
   if (run_prune) {
     uint64_t global_masters = 0;
@@ -1204,12 +1124,6 @@ int main(int argc, char** argv) {
       verify_prune_decode_failed = 0;
       verify_prune_legacy_segment_value = 0;
       verify_prune_unsupported_key = 0;
-      verify_prune_ghost_segment_value = 0;
-      verify_prune_ghost_missing_master_key = 0;
-      verify_prune_ghost_master_lookup_failed = 0;
-      verify_prune_ghost_master_decode_failed = 0;
-      verify_prune_ghost_master_is_ghost = 0;
-      verify_prune_ghost_master_meta_mismatch = 0;
       std::unique_ptr<rocksdb::Iterator> it(db->NewIterator(prune));
       for (it->SeekToFirst(); it->Valid(); it->Next()) {
         ++count_prune;
@@ -1227,24 +1141,6 @@ int main(int argc, char** argv) {
           }
           if (pe.legacy_segment_value) {
             ++verify_prune_legacy_segment_value;
-          }
-          if (pe.ghost_segment_value) {
-            ++verify_prune_ghost_segment_value;
-          }
-          if (pe.ghost_missing_master_key) {
-            ++verify_prune_ghost_missing_master_key;
-          }
-          if (pe.ghost_master_lookup_failed) {
-            ++verify_prune_ghost_master_lookup_failed;
-          }
-          if (pe.ghost_master_decode_failed) {
-            ++verify_prune_ghost_master_decode_failed;
-          }
-          if (pe.ghost_master_is_ghost) {
-            ++verify_prune_ghost_master_is_ghost;
-          }
-          if (pe.ghost_master_meta_mismatch) {
-            ++verify_prune_ghost_master_meta_mismatch;
           }
           if (!pe.in_window) {
             continue;
@@ -1342,19 +1238,7 @@ int main(int argc, char** argv) {
               << (has_global_manifest_counts ? 1 : 0)
               << " global_manifest_generation=" << global_manifest_set_generation
               << " global_masters=" << global_masters
-              << " global_ghosts=" << global_ghosts
-              << " verify_prune_ghost_segment_value="
-              << verify_prune_ghost_segment_value
-              << " verify_prune_ghost_missing_master_key="
-              << verify_prune_ghost_missing_master_key
-              << " verify_prune_ghost_master_lookup_failed="
-              << verify_prune_ghost_master_lookup_failed
-              << " verify_prune_ghost_master_decode_failed="
-              << verify_prune_ghost_master_decode_failed
-              << " verify_prune_ghost_master_is_ghost="
-              << verify_prune_ghost_master_is_ghost
-              << " verify_prune_ghost_master_meta_mismatch="
-              << verify_prune_ghost_master_meta_mismatch << "\n";
+              << " global_ghosts=" << global_ghosts << "\n";
     std::cout << "prune window t=[" << prune_t_min << "," << prune_t_max << "] x=["
               << prune_x_min << "," << prune_x_max << "] y=[" << prune_y_min << ","
               << prune_y_max << "]\n";
@@ -1393,12 +1277,7 @@ int main(int argc, char** argv) {
     }
     const bool strict_ok =
         ref_ok && verify_prune_decode_failed == 0 &&
-        verify_prune_legacy_segment_value == 0 &&
-        verify_prune_ghost_missing_master_key == 0 &&
-        verify_prune_ghost_master_lookup_failed == 0 &&
-        verify_prune_ghost_master_decode_failed == 0 &&
-        verify_prune_ghost_master_is_ghost == 0 &&
-        verify_prune_ghost_master_meta_mismatch == 0;
+        verify_prune_legacy_segment_value == 0;
     std::cout << "verify_kv_results mode=prune_only correctness="
               << (strict_ok ? "OK" : "FAIL")
               << " ref_ok=" << (ref_ok ? "OK" : "FAIL")
@@ -1481,17 +1360,7 @@ int main(int argc, char** argv) {
     const bool strict_ok = ok && ref_ok && verify_full_decode_failed == 0 &&
                            verify_prune_decode_failed == 0 &&
                            verify_full_legacy_segment_value == 0 &&
-                           verify_prune_legacy_segment_value == 0 &&
-                           verify_full_ghost_missing_master_key == 0 &&
-                           verify_prune_ghost_missing_master_key == 0 &&
-                           verify_full_ghost_master_lookup_failed == 0 &&
-                           verify_prune_ghost_master_lookup_failed == 0 &&
-                           verify_full_ghost_master_decode_failed == 0 &&
-                           verify_prune_ghost_master_decode_failed == 0 &&
-                           verify_full_ghost_master_is_ghost == 0 &&
-                           verify_prune_ghost_master_is_ghost == 0 &&
-                           verify_full_ghost_master_meta_mismatch == 0 &&
-                           verify_prune_ghost_master_meta_mismatch == 0;
+                           verify_prune_legacy_segment_value == 0;
     std::cout << "verify_kv_results correctness="
               << (strict_ok ? "OK" : "FAIL")
               << " ref_ok=" << (ref_ok ? "OK" : "FAIL")
@@ -1508,28 +1377,6 @@ int main(int argc, char** argv) {
               << " prune_decode_failed=" << verify_prune_decode_failed
               << " full_legacy_segment_value=" << verify_full_legacy_segment_value
               << " prune_legacy_segment_value=" << verify_prune_legacy_segment_value
-              << " full_ghost_segment_value=" << verify_full_ghost_segment_value
-              << " prune_ghost_segment_value=" << verify_prune_ghost_segment_value
-              << " full_ghost_missing_master_key="
-              << verify_full_ghost_missing_master_key
-              << " prune_ghost_missing_master_key="
-              << verify_prune_ghost_missing_master_key
-              << " full_ghost_master_lookup_failed="
-              << verify_full_ghost_master_lookup_failed
-              << " prune_ghost_master_lookup_failed="
-              << verify_prune_ghost_master_lookup_failed
-              << " full_ghost_master_decode_failed="
-              << verify_full_ghost_master_decode_failed
-              << " prune_ghost_master_decode_failed="
-              << verify_prune_ghost_master_decode_failed
-              << " full_ghost_master_is_ghost="
-              << verify_full_ghost_master_is_ghost
-              << " prune_ghost_master_is_ghost="
-              << verify_prune_ghost_master_is_ghost
-              << " full_ghost_master_meta_mismatch="
-              << verify_full_ghost_master_meta_mismatch
-              << " prune_ghost_master_meta_mismatch="
-              << verify_prune_ghost_master_meta_mismatch
               << " full_unsupported_key=" << verify_full_unsupported_key
               << " prune_unsupported_key=" << verify_prune_unsupported_key
               << "\n";
@@ -1550,22 +1397,10 @@ int main(int argc, char** argv) {
     if (!strict_ok && ok && ref_ok &&
         (verify_full_decode_failed > 0 || verify_prune_decode_failed > 0 ||
          verify_full_legacy_segment_value > 0 ||
-         verify_prune_legacy_segment_value > 0 ||
-         verify_full_ghost_missing_master_key > 0 ||
-         verify_prune_ghost_missing_master_key > 0 ||
-         verify_full_ghost_master_lookup_failed > 0 ||
-         verify_prune_ghost_master_lookup_failed > 0 ||
-         verify_full_ghost_master_decode_failed > 0 ||
-         verify_prune_ghost_master_decode_failed > 0 ||
-         verify_full_ghost_master_is_ghost > 0 ||
-         verify_prune_ghost_master_is_ghost > 0 ||
-         verify_full_ghost_master_meta_mismatch > 0 ||
-         verify_prune_ghost_master_meta_mismatch > 0)) {
+         verify_prune_legacy_segment_value > 0)) {
       std::cout << "verify_kv_results detail: point-truth verification found "
-                   "segment values that are undecodable, legacy(no point list), "
-                   "or ghost follow-up failures/mismatches; rebuild segment DB "
-                   "with Global master/ghost-compatible segment values for strict "
-                   "correctness.\n";
+                   "segment values that are undecodable or legacy(no point list); "
+                   "rebuild segment DB for strict correctness.\n";
     }
     if (verify_kv_results_strict_exit && !strict_ok) {
       return 2;

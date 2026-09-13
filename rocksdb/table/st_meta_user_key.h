@@ -31,9 +31,9 @@ constexpr unsigned char kSpatioTemporalUserKeyMagic = 0xE5;
 // Legacy segment key schema kept for runtime compatibility with existing DBs.
 constexpr unsigned char kSpatioTemporalSegmentKeyLegacyMagic = 0xE6;
 constexpr unsigned char kSpatioTemporalSegmentKeyTzidMagic = 0xE7;
-constexpr uint8_t kSpatioTemporalE7TypeGhostBit = 0x01;
-constexpr size_t kSpatioTemporalE7KeyBytesV0 = 31;  // legacy E7 without type byte
-constexpr size_t kSpatioTemporalE7KeyBytesV1 = 32;  // current E7 with type byte
+// E7 key is 27 bytes: magic + bucket_id + zorder + vehicle_id + segment_seq + chunk_seq.
+// No type byte and no in-key t_start offset (coarse bucket start only).
+constexpr size_t kSpatioTemporalE7KeyBytes = 27;
 constexpr uint32_t kSpatioTemporalE7DefaultBucketSeconds = 3600;
 // event_time_bucket_lookback == this value => bucket_id 0 (maximally conservative).
 constexpr uint32_t kSpatioTemporalE7PruneSeekLookbackAll = UINT32_MAX;
@@ -59,7 +59,7 @@ inline bool IsTmanStSegmentUserKey(const Slice& user_key) {
 }
 
 inline bool IsE7SegmentUserKey(const Slice& user_key) {
-  return user_key.size() >= kSpatioTemporalE7KeyBytesV0 &&
+  return user_key.size() >= kSpatioTemporalE7KeyBytes &&
          static_cast<unsigned char>(user_key.data()[0]) ==
              kSpatioTemporalSegmentKeyTzidMagic;
 }
@@ -67,32 +67,6 @@ inline bool IsE7SegmentUserKey(const Slice& user_key) {
 // Mind.md / rocks-demo segment key (E7) or TMan ST RowKey.
 inline bool IsStDesignSegmentUserKey(const Slice& user_key) {
   return IsE7SegmentUserKey(user_key) || IsTmanStSegmentUserKey(user_key);
-}
-
-inline bool TryDecodeE7TypeFlags(const Slice& user_key, uint8_t* out_flags) {
-  if (out_flags == nullptr || user_key.size() < 1 ||
-      static_cast<unsigned char>(user_key.data()[0]) !=
-          kSpatioTemporalSegmentKeyTzidMagic) {
-    return false;
-  }
-  if (user_key.size() >= kSpatioTemporalE7KeyBytesV1) {
-    *out_flags = static_cast<uint8_t>(user_key.data()[1]);
-    return true;
-  }
-  if (user_key.size() >= kSpatioTemporalE7KeyBytesV0) {
-    // Backward-compatible fallback for old E7 keys that had no type byte.
-    *out_flags = 0;
-    return true;
-  }
-  return false;
-}
-
-inline bool IsE7GhostByKeyType(const Slice& user_key) {
-  uint8_t flags = 0;
-  if (!TryDecodeE7TypeFlags(user_key, &flags)) {
-    return false;
-  }
-  return (flags & kSpatioTemporalE7TypeGhostBit) != 0;
 }
 
 // Logical segment id for cross-bucket dedup (Mind.md); excludes bucket_id.
@@ -115,7 +89,7 @@ struct StSegmentUidHash {
   }
 };
 
-// Decodes segment_uid from E7 user key bytes [18:32). Ghost keys still decode.
+// Decodes segment_uid from E7 user key bytes [13:27).
 inline bool TryDecodeE7SegmentUid(const Slice& user_key, StSegmentUid* uid) {
   if (uid == nullptr || !IsE7SegmentUserKey(user_key)) {
     return false;
@@ -123,17 +97,17 @@ inline bool TryDecodeE7SegmentUid(const Slice& user_key, StSegmentUid* uid) {
   const char* p = user_key.data();
   uint64_t vid = 0;
   for (int i = 0; i < 8; ++i) {
-    vid = (vid << 8) | static_cast<unsigned char>(p[18 + i]);
+    vid = (vid << 8) | static_cast<unsigned char>(p[13 + i]);
   }
   const uint32_t seg =
-      (static_cast<uint32_t>(static_cast<unsigned char>(p[26])) << 24) |
-      (static_cast<uint32_t>(static_cast<unsigned char>(p[27])) << 16) |
-      (static_cast<uint32_t>(static_cast<unsigned char>(p[28])) << 8) |
-      static_cast<uint32_t>(static_cast<unsigned char>(p[29]));
+      (static_cast<uint32_t>(static_cast<unsigned char>(p[21])) << 24) |
+      (static_cast<uint32_t>(static_cast<unsigned char>(p[22])) << 16) |
+      (static_cast<uint32_t>(static_cast<unsigned char>(p[23])) << 8) |
+      static_cast<uint32_t>(static_cast<unsigned char>(p[24]));
   const uint16_t chunk =
       static_cast<uint16_t>(
-          (static_cast<unsigned char>(p[30]) << 8) |
-          static_cast<unsigned char>(p[31]));
+          (static_cast<unsigned char>(p[25]) << 8) |
+          static_cast<unsigned char>(p[26]));
   uid->vehicle_id = vid;
   uid->segment_seq = seg;
   uid->chunk_seq = chunk;
@@ -193,11 +167,7 @@ void CollectSpatioTemporalPointsFromKeyValue(
 void BuildBitmapFromPoints(const std::vector<SpatioTemporalPoint>& points,
                            SpatioTemporalBlockMeta* meta);
 
-// bucket_width_sec==0 uses kSpatioTemporalE7DefaultBucketSeconds (3600).
-bool TryDecodeE7KeyStartTime(const Slice& user_key, uint32_t* t_start,
-                             uint32_t bucket_width_sec = 0);
-
-// E7 host calendar bucket_id from key bytes [2:6) big-endian.
+// E7 host calendar bucket_id from key bytes [1:5) big-endian.
 bool TryDecodeE7HostBucketId(const Slice& user_key, uint32_t* bucket_id);
 
 // Host calendar bucket floor(t_start / bucket_width) from segment value header.
@@ -238,7 +208,7 @@ bool KeyValueHasPointInSpatioTemporalWindow(
     const Slice& user_key, const Slice& value,
     const ReadOptions::ExperimentalSpatioTemporalPruneScan& q);
 
-// Builds the minimum E7 user key (32B v1) for index Seek during prune scan:
+// Builds the minimum E7 user key (27B) for index Seek during prune scan:
 // bucket_id = max(0, floor(q_t_min / bucket_width) - lookback), zorder/ids zeroed.
 // Conservative: lookback covers cross-bucket replicas with host buckets before q_t_min.
 void AppendE7PruneSeekLowerBoundUserKey(uint32_t q_t_min,

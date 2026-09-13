@@ -13,20 +13,32 @@
 rocks-demo/build/
 rocksdb/build/
 rocksdb/build_vs/
+rocksdb/build_vs_tests/
 rocksdb_vanilla/build/
 rocksdb_vanilla/build_snappy3/
+rocksdb/.github/
 
 # Independent sub-projects (not part of ST-LSM engine)
 /TMan-spatial/
 /TMan-tsp/
 /Tman-RocksDB/
+/start-db-dev/
+/rocksdb_vanilla/
+/vcpkg/
 
 # TMan build artifacts
 /TMan-*.jar
 /downloads/
 
-# Tools / experiment scripts (not part of engine)
+# Experiment helper trees and non-code materials
 /tools/
+/docs/
+/paper/
+/CLAUDE.md
+/SERVER_SYSTEMS_STATUS.md
+/持久化.md
+*.md
+*.xlsx
 
 # Experiment result reports (docs/)
 docs/*result*.md
@@ -49,6 +61,8 @@ docs/Wuxi_TDrive_数据集信息.xlsx
 *.tar.gz
 
 # IDE
+.vscode/
+**/.vscode/
 .vs/
 *.VC.db
 *.opendb
@@ -57,6 +71,7 @@ docs/Wuxi_TDrive_数据集信息.xlsx
 .idea/
 
 # Compiled artifacts
+/st_meta_read_bench_linux
 *.exe
 *.pdb
 *.ilk
@@ -83,6 +98,7 @@ __pycache__/
 # OS
 Thumbs.db
 Desktop.ini
+~$*.xlsx
 
 # Temp / log files
 *.log

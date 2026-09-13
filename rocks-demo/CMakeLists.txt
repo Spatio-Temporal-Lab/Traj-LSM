@@ -448,14 +448,6 @@ target_link_libraries(st_bucket_ingest_build PRIVATE
   shlwapi
   rpcrt4)
 
-add_executable(st_global_ghost_compact st_global_ghost_compact.cpp)
-target_include_directories(st_global_ghost_compact PRIVATE "${ROCKSDB_ROOT}/include"
-  "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(st_global_ghost_compact PRIVATE
-  "${ROCKSDB_LIB}"
-  shlwapi
-  rpcrt4)
-
 # Compaction throughput benchmark: 5 strategies, write + read comparison.
 add_executable(st_compute_e7_index st_compute_e7_index.cpp)
 target_include_directories(st_compute_e7_index PRIVATE

@@ -58,12 +58,27 @@ void ParseSegmentIdForE7(const std::string& segment_id, uint64_t* vehicle_id,
   if (*chunk_seq == 0 && !chunk_parsed) *chunk_seq = 1;
 }
 
-uint64_t MakeSimpleZOrderStart(const std::vector<segval::SegmentPoint>& points) {
+uint64_t MakeZOrderStart(const std::vector<segval::SegmentPoint>& points) {
   if (points.empty()) return 0;
+  double cx = 0.0, cy = 0.0;
+  for (const auto& p : points) {
+    cx += static_cast<double>(p.lon);
+    cy += static_cast<double>(p.lat);
+  }
+  const double n = static_cast<double>(points.size());
+  cx /= n; cy /= n;
+  const float flon = static_cast<float>(cx);
+  const float flat = static_cast<float>(cy);
   uint32_t lon_bits = 0, lat_bits = 0;
-  std::memcpy(&lon_bits, &points.front().lon, sizeof(lon_bits));
-  std::memcpy(&lat_bits, &points.front().lat, sizeof(lat_bits));
-  return (static_cast<uint64_t>(lon_bits) << 32) | static_cast<uint64_t>(lat_bits);
+  std::memcpy(&lon_bits, &flon, sizeof(lon_bits));
+  std::memcpy(&lat_bits, &flat, sizeof(lat_bits));
+  uint64_t code = 0;
+  for (int i = 31; i >= 0; --i) {
+    code = (code << 2) |
+           ((static_cast<uint64_t>(lon_bits >> i) & 1U) << 1) |
+           (static_cast<uint64_t>(lat_bits >> i) & 1U);
+  }
+  return code;
 }
 
 }  // namespace
@@ -93,7 +108,7 @@ int main(int argc, char* argv[]) {
 
   std::string line;
   std::getline(in, line);
-  out << line << ",e7_bucket_id,e7_zorder,e7_t_start_offset,e7_vehicle_id,e7_segment_seq,e7_chunk_seq\n";
+  out << line << ",e7_bucket_id,e7_zorder,e7_vehicle_id,e7_segment_seq,e7_chunk_seq\n";
 
   uint64_t cnt = 0;
   while (std::getline(in, line)) {
@@ -109,13 +124,12 @@ int main(int argc, char* argv[]) {
 
     std::vector<segval::SegmentPoint> points;
     spill.Get(sid, &points);
-    uint64_t zorder = MakeSimpleZOrderStart(points);
+    uint64_t zorder = MakeZOrderStart(points);
     uint32_t bucket_id = t_start / bucket_sec;
-    uint32_t tso = t_start - bucket_id * bucket_sec;
     uint64_t vid = 0; uint32_t seq = 0; uint16_t chk = 0;
     ParseSegmentIdForE7(sid, &vid, &seq, &chk);
 
-    out << line << ',' << bucket_id << ',' << zorder << ',' << tso << ',' << vid << ',' << seq << ',' << chk << '\n';
+    out << line << ',' << bucket_id << ',' << zorder << ',' << vid << ',' << seq << ',' << chk << '\n';
     if (++cnt % 50000 == 0) std::cout << "  " << cnt << " rows...\n";
   }
   std::cout << "Done. " << cnt << " rows -> " << out_path << "\n";

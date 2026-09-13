@@ -6,7 +6,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location $Root
 
-$py = Join-Path $Root 'tools\verify_repeat_results.py'
+$py = Join-Path $Root 'tools\benchmark\verify_repeat_results.py'
 if (-not (Test-Path $py)) {
   throw "Missing verify tool script: $py"
 }

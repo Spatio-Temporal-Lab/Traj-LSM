@@ -4329,6 +4329,19 @@ void VersionStorageInfo::GenerateLevelFilesBrief() {
   }
 }
 
+void VersionStorageInfo::GenerateStTimeSortedFiles() {
+  st_time_sorted_files_.clear();
+  for (int level = 0; level < num_levels_; ++level) {
+    for (FileMetaData* f : files_[level]) {
+      st_time_sorted_files_.push_back(f);
+    }
+  }
+  std::sort(st_time_sorted_files_.begin(), st_time_sorted_files_.end(),
+            [](const FileMetaData* a, const FileMetaData* b) {
+              return a->st_file_meta.t_min < b->st_file_meta.t_min;
+            });
+}
+
 void VersionStorageInfo::PrepareForVersionAppend(
     const ImmutableOptions& immutable_options,
     const MutableCFOptions& mutable_cf_options) {
@@ -4341,6 +4354,7 @@ void VersionStorageInfo::PrepareForVersionAppend(
   GenerateLevel0NonOverlapping();
   GenerateBottommostFiles();
   GenerateFileLocationIndex();
+  GenerateStTimeSortedFiles();
 }
 
 void Version::PrepareAppend(const ReadOptions& read_options,
@@ -7087,8 +7101,6 @@ bool TryBuildPendingManifestGlobalCounts(
   uint64_t masters = 0;
   uint64_t ghosts = 0;
   bool any_global_enabled = false;
-  bool verify_ghost = false;
-  std::unordered_set<uint32_t> global_enabled_cf_ids;
   std::unordered_map<uint32_t, uint32_t> bucket_width_by_cf_id;
   for (auto cfd : *column_family_set) {
     if (cfd->IsDropped() || !cfd->initialized()) {
@@ -7098,16 +7110,9 @@ bool TryBuildPendingManifestGlobalCounts(
     const uint32_t cfd_id = cfd->GetID();
     bucket_width_by_cf_id[cfd_id] =
         mopts.experimental_compaction_event_time_bucket_width;
-    if (mopts.experimental_global_master_ghost) {
-      any_global_enabled = true;
-      global_enabled_cf_ids.insert(cfd_id);
-      if (mopts.experimental_global_verify_ghost) {
-        verify_ghost = true;
-      }
-    }
   }
-  // Maintenance tools often open with experimental_global_master_ghost=false
-  // but still append MANIFEST records. If we bail out entirely, MANIFEST_SET
+  // Maintenance tools may append MANIFEST records without enabling the global
+  // master/ghost mode. If we bail out entirely, MANIFEST_SET
   // stores zeros and APIs like GetCurrentManifestGlobalCountsFilteredByTimeRange
   // become misleading. Treat SSTs that carry file-level ST bounds (including
   // ingested SSTs once ExtractStFileBoundsFromTableProperties runs) as signals
@@ -7148,8 +7153,6 @@ bool TryBuildPendingManifestGlobalCounts(
       continue;
     }
     const uint32_t edit_cf_id = e->GetColumnFamily();
-    const bool cf_mutable_global =
-        global_enabled_cf_ids.find(edit_cf_id) != global_enabled_cf_ids.end();
     uint32_t bucket_width = 0;
     auto bw_it = bucket_width_by_cf_id.find(edit_cf_id);
     if (bw_it != bucket_width_by_cf_id.end()) {
@@ -7158,7 +7161,7 @@ bool TryBuildPendingManifestGlobalCounts(
     const bool can_estimate_ghosts = (bucket_width > 0);
     for (const auto& nf : e->GetNewFiles()) {
       const auto& f = nf.second;
-      if (!cf_mutable_global && !f.has_st_file_meta) {
+      if (!f.has_st_file_meta) {
         continue;
       }
       ++masters;
@@ -7177,7 +7180,7 @@ bool TryBuildPendingManifestGlobalCounts(
   }
   *out_masters = masters;
   *out_ghosts = ghosts;
-  *out_verify_ghost = verify_ghost;
+  *out_verify_ghost = false;
   return true;
 }
 

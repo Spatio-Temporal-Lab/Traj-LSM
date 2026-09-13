@@ -202,36 +202,6 @@ void MergeSpatioTemporalMetaFromSegmentValue(
 
 }  // namespace
 
-bool TryDecodeE7KeyStartTime(const Slice& user_key, uint32_t* t_start,
-                             uint32_t bucket_width_sec) {
-  if (t_start == nullptr || user_key.size() < kSpatioTemporalE7KeyBytesV0 ||
-      static_cast<unsigned char>(user_key[0]) != kSpatioTemporalSegmentKeyTzidMagic) {
-    return false;
-  }
-  const uint32_t kE7BucketSeconds =
-      bucket_width_sec == 0 ? kSpatioTemporalE7DefaultBucketSeconds
-                              : bucket_width_sec;
-  const size_t payload_offset =
-      user_key.size() >= kSpatioTemporalE7KeyBytesV1 ? 2 : 1;
-  if (user_key.size() < payload_offset + 16) {
-    return false;
-  }
-  const char* p = user_key.data() + payload_offset;
-  const uint32_t bucket_id =
-      (static_cast<uint32_t>(static_cast<unsigned char>(p[0])) << 24) |
-      (static_cast<uint32_t>(static_cast<unsigned char>(p[1])) << 16) |
-      (static_cast<uint32_t>(static_cast<unsigned char>(p[2])) << 8) |
-      static_cast<uint32_t>(static_cast<unsigned char>(p[3]));
-  p += 12;  // skip zorder
-  const uint32_t t_start_offset =
-      (static_cast<uint32_t>(static_cast<unsigned char>(p[0])) << 24) |
-      (static_cast<uint32_t>(static_cast<unsigned char>(p[1])) << 16) |
-      (static_cast<uint32_t>(static_cast<unsigned char>(p[2])) << 8) |
-      static_cast<uint32_t>(static_cast<unsigned char>(p[3]));
-  *t_start = bucket_id * kE7BucketSeconds + t_start_offset;
-  return true;
-}
-
 namespace {
 
 bool E7HostBucketFromSegmentValue(const Slice& value, uint32_t bucket_width_sec,
@@ -292,16 +262,15 @@ bool TryDecodeE7HostBucketFromValue(const Slice& value,
 }
 
 bool TryDecodeE7HostBucketId(const Slice& user_key, uint32_t* bucket_id) {
-  if (bucket_id == nullptr || user_key.size() < kSpatioTemporalE7KeyBytesV0 ||
+  if (bucket_id == nullptr || user_key.size() < kSpatioTemporalE7KeyBytes ||
       static_cast<unsigned char>(user_key[0]) != kSpatioTemporalSegmentKeyTzidMagic) {
     return false;
   }
-  const size_t payload_offset =
-      user_key.size() >= kSpatioTemporalE7KeyBytesV1 ? 2 : 1;
-  if (user_key.size() < payload_offset + 4) {
+  constexpr size_t kPayloadOffset = 1;  // magic byte only
+  if (user_key.size() < kPayloadOffset + 4) {
     return false;
   }
-  const char* p = user_key.data() + payload_offset;
+  const char* p = user_key.data() + kPayloadOffset;
   *bucket_id = (static_cast<uint32_t>(static_cast<unsigned char>(p[0])) << 24) |
                (static_cast<uint32_t>(static_cast<unsigned char>(p[1])) << 16) |
                (static_cast<uint32_t>(static_cast<unsigned char>(p[2])) << 8) |
@@ -440,13 +409,12 @@ void AppendE7PruneSeekLowerBoundUserKey(uint32_t q_t_min,
   } else if (bucket_lookback > 0) {
     bucket_id = (bucket_id >= bucket_lookback) ? (bucket_id - bucket_lookback) : 0;
   }
-  out_user_key->assign(kSpatioTemporalE7KeyBytesV1, '\0');
+  out_user_key->assign(kSpatioTemporalE7KeyBytes, '\0');
   (*out_user_key)[0] = static_cast<char>(kSpatioTemporalSegmentKeyTzidMagic);
-  (*out_user_key)[1] = '\0';
-  (*out_user_key)[2] = static_cast<char>((bucket_id >> 24) & 0xff);
-  (*out_user_key)[3] = static_cast<char>((bucket_id >> 16) & 0xff);
-  (*out_user_key)[4] = static_cast<char>((bucket_id >> 8) & 0xff);
-  (*out_user_key)[5] = static_cast<char>(bucket_id & 0xff);
+  (*out_user_key)[1] = static_cast<char>((bucket_id >> 24) & 0xff);
+  (*out_user_key)[2] = static_cast<char>((bucket_id >> 16) & 0xff);
+  (*out_user_key)[3] = static_cast<char>((bucket_id >> 8) & 0xff);
+  (*out_user_key)[4] = static_cast<char>(bucket_id & 0xff);
 }
 
 bool TryDecodeSpatioTemporalUserKeyTime(const Slice& user_key,
@@ -469,7 +437,16 @@ bool TryDecodeSpatioTemporalUserKeyTime(const Slice& user_key,
     return GetFixed32(&s, t_sec);  // little-endian
   }
   if (magic == kSpatioTemporalSegmentKeyTzidMagic) {
-    return TryDecodeE7KeyStartTime(user_key, t_sec);
+    // E7 key carries only the coarse calendar bucket (no in-key t_start).
+    // Return the bucket start as a conservative time estimate; callers only use
+    // t_sec / bucket_width (=> bucket_id) for event-time split decisions, which
+    // is invariant to whether we return bucket start or the exact t_start.
+    uint32_t bucket_id = 0;
+    if (!TryDecodeE7HostBucketId(user_key, &bucket_id)) {
+      return false;
+    }
+    *t_sec = bucket_id * kSpatioTemporalE7DefaultBucketSeconds;
+    return true;
   }
   // Legacy E6 segment keys encode t_start big-endian for memcmp ordering.
   Slice s(p + 1, user_key.size() - 1);
@@ -518,15 +495,16 @@ bool UserKeySpatioTemporalDisjointFromPruneScan(
   }
   if (magic == kSpatioTemporalSegmentKeyTzidMagic) {
     // E7 key no longer guarantees t_end/MBR in-key. Key-level pruning may only
-    // reject records that start after the query window ends.
-    uint32_t t_start = 0;
+    // reject records whose bucket starts after the query window ends
+    // (conservative — no false negatives).
+    uint32_t bucket_id = 0;
     const uint32_t bw = q.event_time_bucket_width_sec == 0
                             ? kSpatioTemporalE7DefaultBucketSeconds
                             : q.event_time_bucket_width_sec;
-    if (!TryDecodeE7KeyStartTime(user_key, &t_start, bw)) {
+    if (!TryDecodeE7HostBucketId(user_key, &bucket_id)) {
       return false;
     }
-    return t_start > q.t_max;
+    return bucket_id * bw > q.t_max;
   }
   if (user_key.size() < 25) {
     return false;
@@ -598,15 +576,13 @@ bool UserKeySpatioTemporalInWindow(const Slice& user_key, uint32_t t_min,
     return true;
   }
   if (magic == kSpatioTemporalSegmentKeyTzidMagic) {
-    uint32_t t_start = 0;
-    if (!TryDecodeE7KeyStartTime(user_key, &t_start, 0)) {
-      static int cnt = 0;
-      if (cnt++ < 5) fprintf(stderr, "STI: E7 decode fail sz=%zu\n", user_key.size());
+    // Coarse calendar bucket only; keep conservative (bucket start <= t_max) and
+    // let value verification / block-level metadata make the final decision.
+    uint32_t bucket_id = 0;
+    if (!TryDecodeE7HostBucketId(user_key, &bucket_id)) {
       return false;
     }
-    // No t_end/MBR in key; keep this conservative and let value verification or
-    // block-level metadata make the final decision.
-    return t_start <= t_max;
+    return bucket_id * kSpatioTemporalE7DefaultBucketSeconds <= t_max;
   }
   if (user_key.size() < 25) {
     return false;

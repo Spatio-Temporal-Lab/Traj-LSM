@@ -994,6 +994,13 @@ class IndexBlockIter final : public BlockIter<IndexValue> {
                                         uint64_t* stop_counter = nullptr);
   void EnsureSuffixMaxComputed();
 
+  // ST-LSM forward truncation: position the iterator on the rightmost index
+  // entry with prefix_max_t_end < q_t_min (i.e. the first entry whose data
+  // block can overlap the query window), using restart-point binary search over
+  // the monotonically non-decreasing prefix_max_t_end field. Falls back to
+  // SeekToFirst() when the optimization cannot be applied.
+  void SeekToFirstPotentialOverlap(uint32_t q_t_min);
+
   void PrevImpl() override;
   void NextImpl() override;
   void SeekToFirstImpl() override;

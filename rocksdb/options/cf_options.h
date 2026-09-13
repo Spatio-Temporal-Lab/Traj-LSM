@@ -150,18 +150,10 @@ struct MutableCFOptions {
             options.experimental_compaction_read_repair_min_reads),
         experimental_compaction_read_repair_shape_weight(
             options.experimental_compaction_read_repair_shape_weight),
-        experimental_compaction_spatial_soft_expansion_ratio(
-            options.experimental_compaction_spatial_soft_expansion_ratio),
-        experimental_compaction_spatial_hard_expansion_ratio(
-            options.experimental_compaction_spatial_hard_expansion_ratio),
-        experimental_compaction_spatial_hard_min_file_size(
-            options.experimental_compaction_spatial_hard_min_file_size),
+        experimental_st_block_compaction_ratio(
+            options.experimental_st_block_compaction_ratio),
         experimental_st_block_mbr_flush_enable(
             options.experimental_st_block_mbr_flush_enable),
-        experimental_global_master_ghost(
-            options.experimental_global_master_ghost),
-        experimental_global_verify_ghost(
-            options.experimental_global_verify_ghost),
         experimental_st_compaction(options.experimental_st_compaction),
         experimental_st_compaction_level_trigger_ratio(
             options.experimental_st_compaction_level_trigger_ratio),
@@ -271,12 +263,8 @@ struct MutableCFOptions {
         experimental_compaction_read_repair_first(false),
         experimental_compaction_read_repair_min_reads(0),
         experimental_compaction_read_repair_shape_weight(1.0),
-        experimental_compaction_spatial_soft_expansion_ratio(0.0),
-        experimental_compaction_spatial_hard_expansion_ratio(0.0),
-        experimental_compaction_spatial_hard_min_file_size(0),
+        experimental_st_block_compaction_ratio(0.0),
         experimental_st_block_mbr_flush_enable(true),
-        experimental_global_master_ghost(false),
-        experimental_global_verify_ghost(false),
         experimental_st_compaction(false),
         experimental_st_compaction_level_trigger_ratio(0.9),
         experimental_st_compaction_l1_l2_tiered(false),
@@ -393,12 +381,8 @@ struct MutableCFOptions {
   bool experimental_compaction_read_repair_first;
   uint64_t experimental_compaction_read_repair_min_reads;
   double experimental_compaction_read_repair_shape_weight;
-  double experimental_compaction_spatial_soft_expansion_ratio;
-  double experimental_compaction_spatial_hard_expansion_ratio;
-  uint64_t experimental_compaction_spatial_hard_min_file_size;
+  double experimental_st_block_compaction_ratio;
   bool experimental_st_block_mbr_flush_enable;
-  bool experimental_global_master_ghost;
-  bool experimental_global_verify_ghost;
   bool experimental_st_compaction;
   double experimental_st_compaction_level_trigger_ratio;
   bool experimental_st_compaction_l1_l2_tiered;

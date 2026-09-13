@@ -19,8 +19,6 @@
 namespace segval {
 
 static constexpr uint32_t kSegmentValueMagicV2 = 0x32676553;  // bytes 'S','e','g','2'
-static constexpr uint32_t kSegmentValueMagicV3 = 0x33676553;  // bytes 'S','e','g','3'
-static constexpr uint8_t kSegmentValueFlagGhost = 0x01;
 
 #pragma pack(push, 1)
 struct SegmentValueHeader {
@@ -65,8 +63,6 @@ struct DecodedSegmentValue {
   SegmentValueHeader header{};
   std::vector<SegmentPoint> points;
   bool is_legacy = false;
-  bool is_ghost = false;
-  std::string master_key;
 };
 
 inline bool DecodeSegmentValue(const std::string& blob, DecodedSegmentValue* out) {
@@ -75,8 +71,6 @@ inline bool DecodeSegmentValue(const std::string& blob, DecodedSegmentValue* out
   }
   out->points.clear();
   out->is_legacy = false;
-  out->is_ghost = false;
-  out->master_key.clear();
   if (blob.size() == sizeof(SegmentValueHeader)) {
     std::memcpy(&out->header, blob.data(), sizeof(SegmentValueHeader));
     out->is_legacy = true;
@@ -87,126 +81,25 @@ inline bool DecodeSegmentValue(const std::string& blob, DecodedSegmentValue* out
   }
   uint32_t magic = 0;
   std::memcpy(&magic, blob.data(), 4);
-  if (magic != kSegmentValueMagicV2 && magic != kSegmentValueMagicV3) {
+  if (magic != kSegmentValueMagicV2) {
     return false;
   }
-  if (magic == kSegmentValueMagicV2) {
-    std::memcpy(&out->header, blob.data() + 4, sizeof(SegmentValueHeader));
-    const size_t expected =
-        4 + sizeof(SegmentValueHeader) +
-        static_cast<size_t>(out->header.point_count) * 12;
-    if (blob.size() != expected) {
-      return false;
-    }
-    out->points.resize(out->header.point_count);
-    size_t off = 4 + sizeof(SegmentValueHeader);
-    for (uint32_t i = 0; i < out->header.point_count; ++i) {
-      std::memcpy(&out->points[i].unix_s, blob.data() + off, 4);
-      std::memcpy(&out->points[i].lon, blob.data() + off + 4, 4);
-      std::memcpy(&out->points[i].lat, blob.data() + off + 8, 4);
-      off += 12;
-    }
-    out->is_legacy = false;
-    out->is_ghost = false;
-    return true;
-  }
-  // V3 layout:
-  // [magic(4)][header(28)][flags(1)][master_key_len(4)][master_key][points...]
-  if (blob.size() < 4 + sizeof(SegmentValueHeader) + 1 + 4) {
+  std::memcpy(&out->header, blob.data() + 4, sizeof(SegmentValueHeader));
+  const size_t expected =
+      4 + sizeof(SegmentValueHeader) +
+      static_cast<size_t>(out->header.point_count) * 12;
+  if (blob.size() != expected) {
     return false;
   }
-  size_t off = 4;
-  std::memcpy(&out->header, blob.data() + off, sizeof(SegmentValueHeader));
-  off += sizeof(SegmentValueHeader);
-  const uint8_t flags = static_cast<uint8_t>(blob[off]);
-  off += 1;
-  uint32_t master_key_len = 0;
-  std::memcpy(&master_key_len, blob.data() + off, 4);
-  off += 4;
-  if (off + static_cast<size_t>(master_key_len) > blob.size()) {
-    return false;
-  }
-  out->is_ghost = ((flags & kSegmentValueFlagGhost) != 0);
-  if (master_key_len > 0) {
-    out->master_key.assign(blob.data() + off, master_key_len);
-  }
-  off += master_key_len;
-  const size_t points_bytes =
-      static_cast<size_t>(out->header.point_count) * static_cast<size_t>(12);
-  const size_t remaining = blob.size() - off;
-  if (out->is_ghost) {
-    // Ghost values may omit the point payload entirely and rely on master_key
-    // follow-up for full materialization. We also accept fully materialized
-    // ghosts for transition/debug use.
-    if (remaining != 0 && remaining != points_bytes) {
-      return false;
-    }
-  } else if (remaining != points_bytes) {
-    return false;
-  }
-  if (remaining == points_bytes) {
-    out->points.resize(out->header.point_count);
-    for (uint32_t i = 0; i < out->header.point_count; ++i) {
-      std::memcpy(&out->points[i].unix_s, blob.data() + off, 4);
-      std::memcpy(&out->points[i].lon, blob.data() + off + 4, 4);
-      std::memcpy(&out->points[i].lat, blob.data() + off + 8, 4);
-      off += 12;
-    }
-  }
-  if (out->is_ghost && out->master_key.empty()) {
-    // Ghost entries must carry a master-key reference.
-    return false;
-  }
-  out->is_legacy = false;
-  return true;
-}
-
-inline std::string EncodeSegmentValueV3(const SegmentValueHeader& head,
-                                        const std::vector<SegmentPoint>& points,
-                                        bool is_ghost,
-                                        const std::string& master_key) {
-  const size_t expected_points = static_cast<size_t>(head.point_count);
-  const bool points_match = (points.size() == expected_points);
-  const bool ghost_without_payload = is_ghost && points.empty();
-  if (!points_match && !ghost_without_payload) {
-    return {};
-  }
-  if (is_ghost && master_key.empty()) {
-    return {};
-  }
-  if (master_key.size() > static_cast<size_t>(UINT32_MAX)) {
-    return {};
-  }
-  std::string out;
-  out.resize(4 + sizeof(SegmentValueHeader) + 1 + 4 + master_key.size() +
-             points.size() * 12);
-  size_t off = 0;
-  std::memcpy(out.data() + off, &kSegmentValueMagicV3, 4);
-  off += 4;
-  std::memcpy(out.data() + off, &head, sizeof(head));
-  off += sizeof(head);
-  const uint8_t flags = is_ghost ? kSegmentValueFlagGhost : 0;
-  out[off] = static_cast<char>(flags);
-  off += 1;
-  const uint32_t master_key_len = static_cast<uint32_t>(master_key.size());
-  std::memcpy(out.data() + off, &master_key_len, 4);
-  off += 4;
-  if (!master_key.empty()) {
-    std::memcpy(out.data() + off, master_key.data(), master_key.size());
-    off += master_key.size();
-  }
-  for (const auto& p : points) {
-    std::memcpy(out.data() + off, &p.unix_s, 4);
-    std::memcpy(out.data() + off + 4, &p.lon, 4);
-    std::memcpy(out.data() + off + 8, &p.lat, 4);
+  out->points.resize(out->header.point_count);
+  size_t off = 4 + sizeof(SegmentValueHeader);
+  for (uint32_t i = 0; i < out->header.point_count; ++i) {
+    std::memcpy(&out->points[i].unix_s, blob.data() + off, 4);
+    std::memcpy(&out->points[i].lon, blob.data() + off + 4, 4);
+    std::memcpy(&out->points[i].lat, blob.data() + off + 8, 4);
     off += 12;
   }
-  return out;
-}
-
-inline std::string EncodeGhostSegmentValueV3(const SegmentValueHeader& head,
-                                             const std::string& master_key) {
-  return EncodeSegmentValueV3(head, /*points=*/{}, /*is_ghost=*/true, master_key);
+  return true;
 }
 
 // segments_points.csv: segment_id, dataset, point_index, unix_time_s, lon, lat, ...

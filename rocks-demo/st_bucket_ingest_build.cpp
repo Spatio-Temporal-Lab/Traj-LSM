@@ -64,8 +64,6 @@ static void ClearLegacyManifestShardEnv() {
 
 rocksdb::Options MakeDbOptions(bool create_if_missing,
                                bool disable_auto_compactions,
-                               bool experimental_global_master_ghost,
-                               bool experimental_global_verify_ghost,
                                bool experimental_st_compaction,
                                uint32_t bucket_sec,
                                int max_level_bytes_mb = 0,
@@ -73,8 +71,6 @@ rocksdb::Options MakeDbOptions(bool create_if_missing,
   rocksdb::Options o;
   o.create_if_missing = create_if_missing;
   o.disable_auto_compactions = disable_auto_compactions;
-  o.experimental_global_master_ghost = experimental_global_master_ghost;
-  o.experimental_global_verify_ghost = experimental_global_verify_ghost;
   o.experimental_st_compaction = experimental_st_compaction;
   if (bucket_sec > 0) {
     o.experimental_compaction_event_time_bucket_width = bucket_sec;
@@ -434,17 +430,6 @@ void ParseSegmentIdForE7(const std::string& segment_id, uint64_t* vehicle_id,
   }
 }
 
-uint64_t MakeSimpleZOrderStart(const std::vector<segval::SegmentPoint>& points) {
-  if (points.empty()) {
-    return 0;
-  }
-  uint32_t lon_bits = 0;
-  uint32_t lat_bits = 0;
-  std::memcpy(&lon_bits, &points.front().lon, sizeof(lon_bits));
-  std::memcpy(&lat_bits, &points.front().lat, sizeof(lat_bits));
-  return (static_cast<uint64_t>(lon_bits) << 32) | static_cast<uint64_t>(lat_bits);
-}
-
 struct MetaRowFields {
   uint32_t t_start = 0;
   uint32_t t_end = 0;
@@ -458,7 +443,6 @@ struct MetaRowFields {
   bool has_e7_precomputed = false;
   uint32_t e7_bucket_id = 0;
   uint64_t e7_zorder = 0;
-  uint32_t e7_t_start_offset = 0;
   uint64_t e7_vehicle_id = 0;
   uint32_t e7_segment_seq = 0;
   uint16_t e7_chunk_seq = 0;
@@ -480,55 +464,41 @@ bool TryParseMetaLine(const std::string& line, MetaRowFields* out) {
   out->x_max = static_cast<float>(std::stod(f[6]));
   out->y_min = static_cast<float>(std::stod(f[7]));
   out->y_max = static_cast<float>(std::stod(f[8]));
-  // Parse pre-computed E7 fields if available (columns 10-15)
-  if (f.size() >= 16) {
+  // Parse pre-computed E7 fields if available (columns 10-14)
+  if (f.size() >= 15) {
     out->has_e7_precomputed = true;
     out->e7_bucket_id     = static_cast<uint32_t>(std::stoul(f[10]));
     out->e7_zorder        = std::stoull(f[11]);
-    out->e7_t_start_offset = static_cast<uint32_t>(std::stoul(f[12]));
-    out->e7_vehicle_id    = std::stoull(f[13]);
-    out->e7_segment_seq   = static_cast<uint32_t>(std::stoul(f[14]));
-    out->e7_chunk_seq     = static_cast<uint16_t>(std::stoul(f[15]));
+    out->e7_vehicle_id    = std::stoull(f[12]);
+    out->e7_segment_seq   = static_cast<uint32_t>(std::stoul(f[13]));
+    out->e7_chunk_seq     = static_cast<uint16_t>(std::stoul(f[14]));
   }
   return true;
 }
 
 bool PeekRowMinHostBucket(const std::string& line, uint32_t bucket_sec,
-                          bool legacy_ghost_ingest, uint32_t* min_host_bucket) {
+                          uint32_t* min_host_bucket) {
   MetaRowFields row;
   if (!TryParseMetaLine(line, &row) || min_host_bucket == nullptr ||
       bucket_sec == 0) {
     return false;
   }
-  if (legacy_ghost_ingest) {
-    *min_host_bucket = row.t_start / bucket_sec;
-    return true;
-  }
   *min_host_bucket = st_cross_bucket::CanonicalBucketId(row.t_start, bucket_sec);
   return true;
 }
 
-uint32_t RowMinHostBucket(const MetaRowFields& row, uint32_t bucket_sec,
-                          bool legacy_ghost_ingest) {
-  if (legacy_ghost_ingest) {
-    return row.t_start / bucket_sec;
-  }
+uint32_t RowMinHostBucket(const MetaRowFields& row, uint32_t bucket_sec) {
   return st_cross_bucket::CanonicalBucketId(row.t_start, bucket_sec);
 }
 
-uint32_t RowMaxHostBucket(const MetaRowFields& row, uint32_t bucket_sec,
-                          bool legacy_ghost_ingest) {
-  if (legacy_ghost_ingest) {
-    return row.t_end / bucket_sec;
-  }
+uint32_t RowMaxHostBucket(const MetaRowFields& row, uint32_t bucket_sec) {
   return st_cross_bucket::CanonicalBucketId(row.t_start, bucket_sec);
 }
 
 rocksdb::Status BuildKvsForMetaRow(
     const MetaRowFields& row,
     const std::vector<segval::SegmentPoint>& points, uint32_t bucket_sec,
-    bool legacy_ghost_ingest, bool cross_bucket_replicate,
-    bool experimental_global_master_ghost, UserKeySchema user_key_schema,
+    bool cross_bucket_replicate, UserKeySchema user_key_schema,
     const st_tman::StKeyBuildConfig* st_key_cfg,
     const st_tman::TmanLocsKeyTable* tman_locs_keys, std::vector<Kv>* kvs,
     uint64_t* cross_bucket_replica_extra) {
@@ -540,9 +510,6 @@ rocksdb::Status BuildKvsForMetaRow(
     return rocksdb::Status::InvalidArgument("point_count mismatch segment_id=" +
                                           row.segment_id);
   }
-  const uint32_t b0 = row.t_start / bucket_sec;
-  const uint32_t b1 = row.t_end / bucket_sec;
-
   segval::SegmentValueHeader head{};
   head.t_start = row.t_start;
   head.t_end = row.t_end;
@@ -564,37 +531,7 @@ rocksdb::Status BuildKvsForMetaRow(
     zorder_start = row.e7_zorder;
   } else {
     ParseSegmentIdForE7(row.segment_id, &vehicle_id, &segment_seq, &chunk_seq);
-    zorder_start = MakeSimpleZOrderStart(points);
-  }
-
-  if (legacy_ghost_ingest) {
-    Kv kv;
-    kv.key = StSegmentKeyTzid(row.t_start, zorder_start, vehicle_id, segment_seq,
-                              chunk_seq, bucket_sec);
-    if (experimental_global_master_ghost) {
-      kv.val = segval::EncodeSegmentValueV3(head, points, /*is_ghost=*/false,
-                                            /*master_key=*/"");
-    } else {
-      kv.val = segval::EncodeSegmentValueV2(head, points);
-    }
-    if (kv.val.empty()) {
-      return rocksdb::Status::Corruption("Encode segment value failed");
-    }
-    const std::string master_key = kv.key;
-    kvs->push_back(std::move(kv));
-    if (experimental_global_master_ghost && b1 > b0) {
-      for (uint32_t ghost_bucket = b0 + 1; ghost_bucket <= b1; ++ghost_bucket) {
-        Kv ghost_kv;
-        ghost_kv.key = StSegmentGhostKeyTzid(ghost_bucket, zorder_start, vehicle_id,
-                                             segment_seq, chunk_seq);
-        ghost_kv.val = segval::EncodeGhostSegmentValueV3(head, master_key);
-        if (ghost_kv.val.empty()) {
-          return rocksdb::Status::Corruption("EncodeGhostSegmentValueV3 failed");
-        }
-        kvs->push_back(std::move(ghost_kv));
-      }
-    }
-    return rocksdb::Status::OK();
+    zorder_start = MakeZOrderStart(points);
   }
 
   const std::string encoded = st_cross_bucket::EncodeFullSegmentValue(head, points);
@@ -793,26 +730,6 @@ static rocksdb::Status FlushAndMaybeRunStLadder(
                                  manifest_host_bucket);
 }
 
-static void CountMastersGhosts(const std::vector<Kv>& vec,
-                             bool experimental_global_master_ghost,
-                             uint64_t* masters, uint64_t* ghosts) {
-  if (masters == nullptr || ghosts == nullptr) {
-    return;
-  }
-  if (!experimental_global_master_ghost) {
-    *masters += static_cast<uint64_t>(vec.size());
-    return;
-  }
-  for (const auto& kv : vec) {
-    segval::DecodedSegmentValue decoded{};
-    if (segval::DecodeSegmentValue(kv.val, &decoded) && decoded.is_ghost) {
-      ++(*ghosts);
-    } else {
-      ++(*masters);
-    }
-  }
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -823,10 +740,7 @@ int main(int argc, char** argv) {
   uint32_t bucket_sec = 86400;
   bool reset_out_dir = false;
   bool reset_target_db = false;
-  bool experimental_global_master_ghost = false;
-  bool experimental_global_verify_ghost = false;
   bool experimental_st_compaction = false;
-  bool legacy_ghost_ingest = false;
   bool stream_ingest = false;
   bool stream_ingest_flush_only = false;
   bool ingest_per_bucket_flush = false;
@@ -868,13 +782,6 @@ int main(int argc, char** argv) {
       reset_out_dir = true;
     } else if (a == "--reset-target-db") {
       reset_target_db = true;
-    } else if (a == "--experimental-global-master-ghost") {
-      experimental_global_master_ghost = true;
-      legacy_ghost_ingest = true;
-    } else if (a == "--experimental-global-verify-ghost") {
-      experimental_global_verify_ghost = true;
-    } else if (a == "--legacy-ghost-ingest") {
-      legacy_ghost_ingest = true;
     } else if (a == "--experimental-st-compaction") {
       experimental_st_compaction = true;
     } else if (a == "--st-l1-l2-tiered") {
@@ -939,10 +846,7 @@ int main(int argc, char** argv) {
              "  [--max-rows -1]\n"
              "  [--reset-out-sst-dir]\n"
              "  [--reset-target-db]\n"
-             "  [--experimental-global-master-ghost]  (deprecated: implies --legacy-ghost-ingest)\n"
-             "  [--legacy-ghost-ingest]  ghost refs in non-start buckets (deprecated)\n"
              "  [--cross-bucket-replicate]  legacy: full value in every intersecting bucket\n"
-             "  [--experimental-global-verify-ghost]\n"
              "  [--experimental-st-compaction]\n"
              "      ST ladder: synchronous CompactFiles (L0 per-file -> L1; Lx->Lx+1 when\n"
              "      level_bytes >= ratio*MaxBytesForLevel). Default: one memtable stream/batch,\n"
@@ -996,18 +900,10 @@ int main(int argc, char** argv) {
   }
   ClearLegacyManifestShardEnv();
   std::cout << "Manifest: single MANIFEST-* (CURRENT -> MANIFEST, per-SST st_file_meta)\n";
-  if (experimental_global_verify_ghost && !experimental_global_master_ghost) {
-    std::cerr << "--experimental-global-verify-ghost requires "
-                 "--experimental-global-master-ghost\n";
-    return 1;
-  }
-  if (legacy_ghost_ingest) {
-    std::cerr << "WARNING: --legacy-ghost-ingest (deprecated)\n";
-  }
   if (user_key_schema == UserKeySchema::kTmanSt ||
       user_key_schema == UserKeySchema::kTmanLocs) {
-    if (legacy_ghost_ingest || cross_bucket_replicate) {
-      std::cerr << "tman_st/tman_locs keys incompatible with ghost/replicate ingest\n";
+    if (cross_bucket_replicate) {
+      std::cerr << "tman_st/tman_locs keys incompatible with replicate ingest\n";
       return 1;
     }
     if (user_key_schema == UserKeySchema::kTmanLocs) {
@@ -1039,7 +935,7 @@ int main(int argc, char** argv) {
 #endif
     std::cout << "User key: E7 (legacy)\n";
   }
-  if (cross_bucket_replicate && !legacy_ghost_ingest) {
+  if (cross_bucket_replicate) {
     std::cout << "WARN: --cross-bucket-replicate (legacy; K>>N write amp)\n";
   }
   if (ingest_per_bucket_flush) {
@@ -1057,8 +953,7 @@ int main(int argc, char** argv) {
   }
 
   rocksdb::Options stage_opts = MakeDbOptions(
-      !st_ladder_drain_only, true, experimental_global_master_ghost,
-      experimental_global_verify_ghost, experimental_st_compaction, bucket_sec,
+      !st_ladder_drain_only, true, experimental_st_compaction, bucket_sec,
       max_level_bytes_mb, block_size);
   std::cout << "Opening staging DB (before points preload): " << target_db << "\n"
             << std::flush;
@@ -1270,8 +1165,6 @@ int main(int argc, char** argv) {
   int64_t rows = 0;
   uint64_t cross_bucket_replica_extra = 0;
   uint64_t total_entries = 0;
-  uint64_t total_masters = 0;
-  uint64_t total_ghosts = 0;
   size_t bucket_flush_events = 0;
   std::vector<uint32_t> buckets_touched;
 
@@ -1329,13 +1222,13 @@ int main(int argc, char** argv) {
       uint32_t next_min_b = UINT32_MAX;
       if (more_rows &&
           !PeekRowMinHostBucket(sorted_lines[i + 1].second, bucket_sec,
-                                legacy_ghost_ingest, &next_min_b)) {
+                                &next_min_b)) {
         next_min_b = UINT32_MAX;
       }
 
       std::vector<Kv> row_kvs;
-      s = BuildKvsForMetaRow(row, row_points, bucket_sec, legacy_ghost_ingest,
-                             cross_bucket_replicate, experimental_global_master_ghost,
+      s = BuildKvsForMetaRow(row, row_points, bucket_sec,
+                             cross_bucket_replicate,
                              user_key_schema, &st_key_cfg, &tman_locs_keys, &row_kvs,
                              &cross_bucket_replica_extra);
       if (!s.ok()) {
@@ -1351,13 +1244,11 @@ int main(int argc, char** argv) {
         }
       }
       total_entries += static_cast<uint64_t>(row_kvs.size());
-      CountMastersGhosts(row_kvs, experimental_global_master_ghost, &total_masters,
-                         &total_ghosts);
 
       const uint32_t row_min_b =
-          RowMinHostBucket(row, bucket_sec, legacy_ghost_ingest);
+          RowMinHostBucket(row, bucket_sec);
       const uint32_t row_max_b =
-          RowMaxHostBucket(row, bucket_sec, legacy_ghost_ingest);
+          RowMaxHostBucket(row, bucket_sec);
       // Flush when the next segment starts in a later host bucket (CSV sorted by
       // t_start). Use row_min_b, not row_max_b — cross-bucket replicas span far.
       if (buckets_touched.empty() ||
@@ -1601,8 +1492,8 @@ int main(int argc, char** argv) {
         return 1;
       }
       std::vector<Kv> row_kvs;
-      s = BuildKvsForMetaRow(row, row_points, bucket_sec, legacy_ghost_ingest,
-                             cross_bucket_replicate, experimental_global_master_ghost,
+      s = BuildKvsForMetaRow(row, row_points, bucket_sec,
+                             cross_bucket_replicate,
                              user_key_schema, &st_key_cfg, &tman_locs_keys, &row_kvs,
                              &cross_bucket_replica_extra);
       if (!s.ok()) {
@@ -1610,15 +1501,7 @@ int main(int argc, char** argv) {
                   << s.ToString() << "\n";
         return 1;
       }
-      if (legacy_ghost_ingest) {
-        const uint32_t b0 = row.t_start / bucket_sec;
-        size_t ki = 0;
-        bucket_kvs[b0].push_back(std::move(row_kvs[ki++]));
-        for (; ki < row_kvs.size(); ++ki) {
-          const uint32_t ghost_b = b0 + static_cast<uint32_t>(ki);
-          bucket_kvs[ghost_b].push_back(std::move(row_kvs[ki]));
-        }
-      } else if (cross_bucket_replicate) {
+      if (cross_bucket_replicate) {
         const auto [range_b0, range_b1] =
             st_cross_bucket::IntersectingBucketRange(row.t_start, row.t_end,
                                                      bucket_sec);
@@ -1671,8 +1554,6 @@ int main(int argc, char** argv) {
         }
         ++bucket_flush_events;
         total_entries += static_cast<uint64_t>(vec.size());
-        CountMastersGhosts(vec, experimental_global_master_ghost, &total_masters,
-                           &total_ghosts);
         std::cout << "Bucket " << b << " flushed entries=" << vec.size() << "\n";
       }
     } else {
@@ -1699,8 +1580,6 @@ int main(int argc, char** argv) {
         }
       }
       total_entries += static_cast<uint64_t>(all_kvs.size());
-      CountMastersGhosts(all_kvs, experimental_global_master_ghost, &total_masters,
-                         &total_ghosts);
       const uint64_t eof_host_bucket =
           buckets_touched.empty()
               ? std::numeric_limits<uint64_t>::max()
@@ -1770,8 +1649,7 @@ int main(int argc, char** argv) {
             << " bucket_flush_events=" << bucket_flush_events << " rows=" << rows
             << " ingested_live_sst=" << live.size()
             << " total_entries=" << total_entries
-            << " cross_bucket_replica_extra=" << cross_bucket_replica_extra
-            << " masters=" << total_masters << " ghosts=" << total_ghosts << "\n";
+            << " cross_bucket_replica_extra=" << cross_bucket_replica_extra << "\n";
 
   s = stage_db->Close();
   if (!s.ok()) {

@@ -93,13 +93,19 @@ struct Result {
 };
 
 // ============================================================================
-// Z-order helper (mirrors st_bucket_ingest_build.cpp MakeSimpleZOrderStart)
+// Z-order helper: Morton interleave of lon/lat float bits (true 2D order)
 // ============================================================================
 static uint64_t MakeZOrder(float lon, float lat) {
   uint32_t lon_bits = 0, lat_bits = 0;
   std::memcpy(&lon_bits, &lon, sizeof(lon_bits));
   std::memcpy(&lat_bits, &lat, sizeof(lat_bits));
-  return (static_cast<uint64_t>(lon_bits) << 32) | static_cast<uint64_t>(lat_bits);
+  uint64_t code = 0;
+  for (int i = 31; i >= 0; --i) {
+    code = (code << 2) |
+           ((static_cast<uint64_t>(lon_bits >> i) & 1U) << 1) |
+           (static_cast<uint64_t>(lat_bits >> i) & 1U);
+  }
+  return code;
 }
 
 // ============================================================================
@@ -198,14 +204,13 @@ static void GenerateData(std::mt19937_64& rng, int total,
 
     // ── Key (E7) ──
     uint32_t bucket_id = t_start / bucket_sec;
-    uint32_t t_start_offset = t_start - bucket_id * bucket_sec;
     uint64_t zorder = MakeZOrder(cx, cy);
     uint64_t vehicle_id = 20000000000000ULL + static_cast<uint64_t>(i);
     uint32_t segment_seq = static_cast<uint32_t>(i % 100000);
     uint16_t chunk_seq = 1;
 
-    std::string key = StSegmentKeyTzidRaw(bucket_id, zorder, t_start_offset,
-                                          vehicle_id, segment_seq, chunk_seq, 0);
+    std::string key = StSegmentKeyTzidRaw(bucket_id, zorder, vehicle_id,
+                                          segment_seq, chunk_seq);
 
     out.push_back({std::move(key), std::move(val),
                    t_start, t_end, hdr.x_min, hdr.x_max, hdr.y_min, hdr.y_max});
@@ -274,14 +279,22 @@ static std::vector<QueryWindow> LoadWindowsCSV(const std::string& path) {
 // Build an E7 seek key for the given bucket_id (all other fields zero)
 // ============================================================================
 static std::string BuildE7SeekKey(uint32_t bucket_id) {
-  std::string key(32, '\0');
-  key[0] = static_cast<char>(0xE7);
-  key[1] = 0;
-  key[2] = static_cast<char>((bucket_id >> 24) & 0xFF);
-  key[3] = static_cast<char>((bucket_id >> 16) & 0xFF);
-  key[4] = static_cast<char>((bucket_id >> 8) & 0xFF);
-  key[5] = static_cast<char>(bucket_id & 0xFF);
-  return key;
+  return StSegmentKeyTzidRaw(bucket_id, /*zorder_start=*/0,
+                             /*vehicle_id=*/0, /*segment_seq=*/0,
+                             /*chunk_seq=*/0);
+}
+
+static bool TryDecodeE7BucketId(const std::string& key, uint32_t* bucket_id) {
+  if (bucket_id == nullptr || key.size() < 5 ||
+      static_cast<unsigned char>(key[0]) != 0xE7) {
+    return false;
+  }
+  const auto* d = reinterpret_cast<const uint8_t*>(key.data());
+  *bucket_id = (static_cast<uint32_t>(d[1]) << 24) |
+               (static_cast<uint32_t>(d[2]) << 16) |
+               (static_cast<uint32_t>(d[3]) << 8) |
+               static_cast<uint32_t>(d[4]);
+  return true;
 }
 
 // ============================================================================
@@ -302,8 +315,6 @@ static void ApplyOptions(rst::Options& o, const Config& cfg,
   o.experimental_st_compaction_real_tiered_l1_l2 = false;
   o.experimental_st_compaction_tiered_max_runs_per_level = cfg.max_runs;
   o.experimental_st_compaction_level_trigger_ratio = 0.9;
-  o.experimental_global_verify_ghost = false;
-  o.experimental_global_master_ghost = false;
   o.experimental_compaction_event_time_max_span = 86400;  // 24h, basically no time-cut
   o.experimental_compaction_event_time_split = true;       // enable SST key-count cut
   o.experimental_compaction_event_time_bucket_width = 3600;  // 1h bucket for split tracking
@@ -520,12 +531,9 @@ static Result Run(const std::string& root, const Config& cfg,
       int64_t query_kv_count = 0;       // keys from prune scan
       int64_t query_hit_count = 0;      // keys passing point truth
       for (it->Seek(seek_key); it->Valid(); it->Next()) {
-        if (it->key().size() >= 6) {
-          const auto* d = reinterpret_cast<const uint8_t*>(it->key().data());
-          uint32_t cur_bucket = (static_cast<uint32_t>(d[2]) << 24) |
-                                (static_cast<uint32_t>(d[3]) << 16) |
-                                (static_cast<uint32_t>(d[4]) << 8) |
-                                static_cast<uint32_t>(d[5]);
+        uint32_t cur_bucket = 0;
+        const std::string cur_key(it->key().data(), it->key().size());
+        if (TryDecodeE7BucketId(cur_key, &cur_bucket)) {
           if (cur_bucket > max_bucket) break;
         }
         query_kv_count++;
@@ -663,12 +671,9 @@ static Result Run(const std::string& root, const Config& cfg,
           uint32_t max_bucket = w.t_max / bucket_sec + 1;
           std::unique_ptr<rst::Iterator> it(db->NewIterator(ro));
           for (it->Seek(window_seek_keys[wi]); it->Valid(); it->Next()) {
-            if (it->key().size() >= 6) {
-              const auto* d = reinterpret_cast<const uint8_t*>(it->key().data());
-              uint32_t cb = (static_cast<uint32_t>(d[2]) << 24) |
-                            (static_cast<uint32_t>(d[3]) << 16) |
-                            (static_cast<uint32_t>(d[4]) << 8) |
-                            static_cast<uint32_t>(d[5]);
+            uint32_t cb = 0;
+            const std::string cur_key(it->key().data(), it->key().size());
+            if (TryDecodeE7BucketId(cur_key, &cb)) {
               if (cb > max_bucket) break;
             }
             // Point truth

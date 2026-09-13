@@ -49,7 +49,7 @@ inline Slice UserKeyFromIteratorKey(const Slice& raw) {
   if (m == kMagicPoint && uk.size() < 13) {
     return raw;
   }
-  if (m == kMagicSegmentTzid && uk.size() < 31) {
+  if (m == kMagicSegmentTzid && uk.size() < 27) {
     return raw;
   }
   return uk;
@@ -88,7 +88,7 @@ bool ConsumeFixed32BigEndian(Slice* s, uint32_t* out) {
 }
 
 bool TryDecodeE7KeyStartTime(const Slice& user_key, uint32_t* t_start) {
-  if (t_start == nullptr || user_key.size() < 31 ||
+  if (t_start == nullptr || user_key.size() < 27 ||
       static_cast<unsigned char>(user_key.data()[0]) != kMagicSegmentTzid) {
     return false;
   }
@@ -99,15 +99,8 @@ bool TryDecodeE7KeyStartTime(const Slice& user_key, uint32_t* t_start) {
   if (!ConsumeFixed32BigEndian(&s, &bucket_id)) {
     return false;
   }
-  if (s.size() < 8) {
-    return false;
-  }
-  s.remove_prefix(8);
-  uint32_t t_start_offset = 0;
-  if (!ConsumeFixed32BigEndian(&s, &t_start_offset)) {
-    return false;
-  }
-  *t_start = bucket_id * kE7BucketSeconds + t_start_offset;
+  // E7 key no longer carries t_start offset; use coarse bucket start (conservative).
+  *t_start = bucket_id * kE7BucketSeconds;
   return true;
 }
 

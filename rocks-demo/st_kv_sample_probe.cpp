@@ -21,7 +21,7 @@ rocksdb::Slice UserKey(const rocksdb::Slice& ikey) {
     return ikey;
   }
   const unsigned char m = static_cast<unsigned char>(ikey.data()[0]);
-  if (m == 0xE7 && ikey.size() >= 31 && ikey.size() <= 32) {
+  if (m == 0xE7 && ikey.size() >= 27 && ikey.size() <= 32) {
     return ikey;
   }
   if (m != 0xE5 && m != 0xE6 && m != 0xE7 && ikey.size() >= 11 &&

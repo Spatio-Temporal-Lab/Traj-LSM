@@ -107,6 +107,76 @@ void IndexBlockIter::EnsureSuffixMaxComputed() {
   }
 }
 
+void IndexBlockIter::SeekToFirstPotentialOverlap(uint32_t q_t_min) {
+  // Binary-search forward truncation over prefix_max_t_end.
+  //
+  // Each index entry carries prefix_max_t_end = max{t_end of all data blocks
+  // before this entry}. It is monotonically non-decreasing, so the set of
+  // entries with prefix_max_t_end < q_t_min forms a contiguous prefix of the
+  // block. We want the rightmost entry in that prefix: every block before it
+  // ends strictly before the query window, and it is the first entry whose data
+  // block can overlap. This replaces the old O(num_entries) linear Prev() walk
+  // with O(log num_restarts + block_restart_interval).
+  //
+  // We cannot Seek on the *value* field (prefix_max_t_end lives in the index
+  // value, not the key), so we binary search over restart points — each covers
+  // block_restart_interval_ entries — then do a bounded forward scan plus a
+  // single Prev() to land exactly on the target entry.
+  if (q_t_min == 0 || !decode_index_st_meta_tail_ || num_restarts_ == 0) {
+    SeekToFirst();
+    return;
+  }
+
+  // True when the entry currently under the iterator is strictly below q_t_min.
+  // An entry without st_meta is treated as "not below" so we never prune past
+  // it (its t_end is unknown and may overlap the query).
+  auto entry_below = [&]() -> bool {
+    if (!Valid()) {
+      return false;
+    }
+    const IndexValue& v = value();
+    return v.has_st_meta && v.st_meta.prefix_max_t_end < q_t_min;
+  };
+
+  // Binary search the first restart point whose first entry is NOT below.
+  uint32_t lo = 0, hi = num_restarts_;
+  while (lo < hi) {
+    uint32_t mid = lo + (hi - lo) / 2;
+    SeekToRestartPoint(mid);
+    ParseNextIndexKey();
+    if (entry_below()) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+
+  if (lo == 0) {
+    // The first restart's first entry is already not below: no earlier block
+    // can overlap, so start from the very beginning.
+    SeekToFirst();
+    return;
+  }
+
+  // The crossing lies inside restart point lo-1. Scan forward from its first
+  // entry to the first entry that is NOT below, then step back one.
+  SeekToRestartPoint(lo - 1);
+  ParseNextIndexKey();
+  while (entry_below()) {
+    ParseNextIndexKey();
+  }
+  if (!Valid()) {
+    // Every entry is below (unreachable when the caller's landing entry has
+    // prefix_max_t_end >= q_t_min, but keep the fallback safe).
+    SeekToLast();
+    return;
+  }
+  Prev();
+  if (!Valid()) {
+    SeekToFirst();
+  }
+}
+
 void IndexBlockIter::NextImpl() { ParseNextIndexKey(); }
 
 void IndexBlockIter::PrevImpl() {

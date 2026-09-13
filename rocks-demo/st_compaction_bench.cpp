@@ -35,7 +35,6 @@
 
 #include "db/manifest_ops.h"
 #include "segment_value_codec.hpp"
-#include "segment_value_global.hpp"
 #include "table/st_meta_user_key.h"
 
 namespace {
@@ -58,7 +57,7 @@ inline bool LooksLikeStUserKey(const rocksdb::Slice& user_key) {
   const unsigned char magic = static_cast<unsigned char>(user_key.data()[0]);
   if (magic == kMagicPointKey) return user_key.size() >= 13;
   if (magic == kMagicSegmentLegacyKey) return user_key.size() >= 25;
-  if (magic == kMagicSegmentTzidKey) return user_key.size() >= 31;
+  if (magic == kMagicSegmentTzidKey) return user_key.size() >= 27;
   return false;
 }
 
@@ -153,12 +152,10 @@ bool ValueInWindow(rocksdb::DB* db, const rocksdb::ReadOptions& ro,
   }
   if (magic != kMagicSegmentLegacyKey && magic != kMagicSegmentTzidKey) return false;
 
-  segval::MaterializedSegmentValue materialized{};
-  if (!segval::DecodeAndMaterializeSegmentValue(db, ro, user_key, value, &materialized))
+  segval::DecodedSegmentValue decoded{};
+  if (!segval::DecodeSegmentValue(std::string(value.data(), value.size()), &decoded))
     return false;
-  const segval::DecodedSegmentValue& decoded = materialized.decoded;
   if (decoded.is_legacy) return false;
-  if (materialized.was_ghost) return false;
   for (const auto& p : decoded.points) {
     if (p.unix_s >= t_min && p.unix_s <= t_max &&
         p.lon >= x_min && p.lon <= x_max &&

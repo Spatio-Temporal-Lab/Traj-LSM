@@ -406,30 +406,14 @@ struct AdvancedColumnFamilyOptions {
   // Weight multiplier for ST shape penalty (perimeter^2 / area).
   // Effective score ~= sampled_reads * (1 + weight * shape_penalty).
   double experimental_compaction_read_repair_shape_weight = 1.0;
-  // If > 0, also enables ST Data Block MBR flush policy when
-  // experimental_spatio_temporal_meta_in_index_value is on. Ratio =
-  // (union_area - block_mbr_area) / max(block_mbr_area, eps). File-level spatial
-  // SST split is deprecated; this threshold drives FlushBlockPolicy only.
-  // When meta-in-index is on but this is 0, block policy uses default 2.5.
-  double experimental_compaction_spatial_soft_expansion_ratio = 0.0;
-  // Deprecated: file-level hard spatial SST split (unused; block policy only).
-  double experimental_compaction_spatial_hard_expansion_ratio = 0.0;
-  // Deprecated with file-level spatial split.
-  uint64_t experimental_compaction_spatial_hard_min_file_size = 0;
+  // ST Data Block MBR flush expansion threshold (effective when
+  // experimental_spatio_temporal_meta_in_index_value is on). Ratio =
+  // (union_area - block_mbr_area) / max(block_mbr_area, eps). When 0, the
+  // block policy uses a default of 2.5.
+  double experimental_st_block_compaction_ratio = 0.0;
   // Enable ST MBR / bucket_id Data Block flush when building tables with
   // experimental_spatio_temporal_meta_in_index_value (ingest + compaction).
   bool experimental_st_block_mbr_flush_enable = true;
-  // [experimental]
-  // Enable Global manifest semantics for trajectory segment indexing:
-  // master records live in their start-time shard, and other shards may carry
-  // ghost references (Master_Key + copied meta) instead of duplicating values.
-  // This option only toggles Global-manifest behavior; Local (block/file) prune
-  // remains controlled by existing ST options.
-  //
-  // Default: false
-  //
-  // Dynamically changeable through SetOptions() API
-  bool experimental_global_master_ghost = false;
   // [experimental]
   // When true with leveled compaction, use ST-compaction scheduling from
   // Mind.md: L1+ trigger at (ratio * MaxBytesForLevel), whole-layer inputs for
@@ -484,15 +468,6 @@ struct AdvancedColumnFamilyOptions {
   //
   // Dynamically changeable through SetOptions() API
   bool experimental_st_compaction_stfp_enable = false;
-  // [experimental]
-  // If true, enforce ghost metadata consistency checks against the single
-  // MasterMeta source during write path. Mismatch triggers fail-fast instead of
-  // silently accepting inconsistent ghost copies.
-  //
-  // Default: false
-  //
-  // Dynamically changeable through SetOptions() API
-  bool experimental_global_verify_ghost = false;
 
   // existing_value - pointer to previous value (from both memtable and sst).
   //                  nullptr if key doesn't exist

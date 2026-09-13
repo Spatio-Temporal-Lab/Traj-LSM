@@ -176,8 +176,8 @@ class StMbrFlushBlockPolicy : public RetargetableFlushBlockPolicy {
   }
 
   static double ResolveExpansionRatio(const MutableCFOptions& moptions) {
-    if (moptions.experimental_compaction_spatial_soft_expansion_ratio > 0.0) {
-      return moptions.experimental_compaction_spatial_soft_expansion_ratio;
+    if (moptions.experimental_st_block_compaction_ratio > 0.0) {
+      return moptions.experimental_st_block_compaction_ratio;
     }
     return kDefaultBlockMbrExpansionRatio;
   }
@@ -233,7 +233,7 @@ std::unique_ptr<FlushBlockPolicy> NewDefaultOrStMbrFlushBlockPolicy(
   const bool st_block_flush =
       table_options.experimental_spatio_temporal_meta_in_index_value &&
       (moptions.experimental_st_block_mbr_flush_enable ||
-       moptions.experimental_compaction_spatial_soft_expansion_ratio > 0.0);
+       moptions.experimental_st_block_compaction_ratio > 0.0);
   if (st_block_flush) {
     return NewStMbrCombinedFlushBlockPolicy(table_options, moptions,
                                             data_block_builder);

@@ -17,14 +17,13 @@ inline uint32_t StEnvU32(const char* name, uint32_t def) {
 // Mind.md (final): Level-aware ST compaction output policy.
 //
 // Physical compaction (SST layer) policy recap:
-// - Level-aware relax for three constraint families:
+// - Level-aware relax for two constraint families:
 //   1) Cross-bucket: unrestricted (no bucket-span output cut)
 //   2) Time expansion: max_time_expansion[level]
-//   3) Spatial expansion: max_mbr_expansion[level] (soft/hard)
 //
 // Hard vs soft constraints (enforced in CompactionOutputs):
-// - Hard: time-span, max-keys, hard-spatial (must cut)
-// - Soft: bucket-span, soft-spatial (may be gated by min_keys)
+// - Hard: time-span, max-keys (must cut)
+// - Soft: bucket-span (may be gated by min_keys)
 //
 // This header centralizes the level-aware knobs used by both
 // CompactionOutputs (output splitting) and the compaction picker preference
@@ -33,8 +32,6 @@ struct StEventSplitLevelPolicy {
   uint32_t max_bucket_span = UINT32_MAX;  // no cross-bucket output cut
   uint32_t effective_max_time_span = 0;   // seconds; derived from base max span
   uint32_t effective_max_keys = UINT32_MAX;  // per-file ST key count cap
-  double spatial_ratio_mul = 1.0;
-  double hard_min_file_size_mul = 1.0;
 };
 
 // Level-aware SST size pyramid: upper levels → many small files (good prune
@@ -91,20 +88,6 @@ inline StEventSplitLevelPolicy ComputeStEventSplitLevelPolicy(
         widened > static_cast<uint64_t>(UINT32_MAX)
             ? UINT32_MAX
             : static_cast<uint32_t>(widened);
-  }
-
-  // ── Spatial expansion relax ──
-  // Env override: ST_SPATIAL_RATIO (multiplies all level defaults)
-  double env_spatial = std::getenv("ST_SPATIAL_RATIO") ? std::stod(std::getenv("ST_SPATIAL_RATIO")) : 1.0;
-  if (output_level >= 4) {
-    p.spatial_ratio_mul = 1.8 * env_spatial;
-    p.hard_min_file_size_mul = 1.75;
-  } else if (output_level >= 2) {
-    p.spatial_ratio_mul = 1.35 * env_spatial;
-    p.hard_min_file_size_mul = 1.25;
-  } else {
-    p.spatial_ratio_mul = 1.0 * env_spatial;
-    p.hard_min_file_size_mul = 1.0;
   }
 
   return p;

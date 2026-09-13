@@ -1305,27 +1305,41 @@ StManifestSstFilterResult ManifestFilterSstByStFileMeta(
     float q_x_min, float q_x_max, float q_y_min, float q_y_max) {
   StManifestSstFilterResult out;
 
-  for (int level = 0; level < vstorage.num_levels(); ++level) {
-    for (const auto& f : vstorage.LevelFiles(level)) {
-      ++out.total_files;
-      if (!f->has_st_file_meta) {
-        ++out.missing_meta;
-        out.file_numbers.insert(f->fd.GetNumber());
-        continue;
-      }
-      const auto& m = f->st_file_meta;
-      const bool time_disjoint = (m.t_max < q_t_min || m.t_min > q_t_max);
-      const bool space_disjoint =
-          (m.x_max < q_x_min || m.x_min > q_x_max || m.y_max < q_y_min ||
-           m.y_min > q_y_max);
-      if (time_disjoint) ++out.time_disjoint;
-      if (space_disjoint) ++out.space_disjoint;
-      if (time_disjoint || space_disjoint) {
-        continue;
-      }
-      ++out.passed;
+  // Files across levels sorted by st_file_meta.t_min (built in
+  // VersionStorageInfo::PrepareForVersionAppend). Binary-search the upper
+  // bound instead of scanning every file.
+  const auto& sorted = vstorage.StTimeSortedFiles();
+  out.total_files = static_cast<uint64_t>(sorted.size());
+
+  // First file with t_min > q_t_max; files after this start strictly after
+  // the query window and are time-disjoint (skipped without per-file check).
+  auto upper = std::upper_bound(
+      sorted.begin(), sorted.end(), q_t_max,
+      [](uint32_t t, const FileMetaData* f) {
+        return t < f->st_file_meta.t_min;
+      });
+  out.time_disjoint += static_cast<uint64_t>(sorted.end() - upper);
+
+  for (auto it = sorted.begin(); it != upper; ++it) {
+    const FileMetaData* f = *it;
+    if (!f->has_st_file_meta) {
+      ++out.missing_meta;
       out.file_numbers.insert(f->fd.GetNumber());
+      continue;
     }
+    const auto& m = f->st_file_meta;
+    // t_min <= q_t_max already guaranteed by the bound; check t_max and MBR.
+    const bool time_disjoint = (m.t_max < q_t_min);
+    const bool space_disjoint =
+        (m.x_max < q_x_min || m.x_min > q_x_max || m.y_max < q_y_min ||
+         m.y_min > q_y_max);
+    if (time_disjoint) ++out.time_disjoint;
+    if (space_disjoint) ++out.space_disjoint;
+    if (time_disjoint || space_disjoint) {
+      continue;
+    }
+    ++out.passed;
+    out.file_numbers.insert(f->fd.GetNumber());
   }
   return out;
 }
