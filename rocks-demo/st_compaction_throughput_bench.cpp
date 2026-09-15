@@ -322,8 +322,9 @@ static void ApplyOptions(rst::Options& o, const Config& cfg,
   o.level_compaction_dynamic_level_bytes = false;  // required by event_time_split
   o.level0_file_num_compaction_trigger = 1;  // trigger L0→L1 immediately
   o.target_file_size_base = 64ULL << 20;     // 64 MB SST files
-  o.max_bytes_for_level_base = 64ULL << 20;   // L1 = 64 MB
-  o.max_bytes_for_level_multiplier = 4;       // L2=256MB, L3=1GB, L4=4GB
+  o.max_bytes_for_level_base = 1ULL << 30;
+  o.max_bytes_for_level_multiplier = 10;
+  o.target_file_size_multiplier = 1;
   o.num_levels = 7;
   o.compression = rst::kNoCompression;
   o.write_buffer_size = 64ULL << 20;   // 64MB memtable
@@ -842,6 +843,7 @@ int main(int argc, char** argv) {
     {"Hybrid-L1+L2(R4)",    true,      true,         2,         4,         false},
     {"STFP-R4",             true,      true,        -1,         4,         true},
     {"STFP-R6",             true,      true,        -1,         6,         true},
+    {"STFP-R8",             true,      true,        -1,         8,         true},
   };
   const int N = sizeof(cfgs) / sizeof(cfgs[0]);
   // results[config_idx][repeat_idx]

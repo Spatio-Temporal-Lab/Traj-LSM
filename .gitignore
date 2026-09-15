@@ -3,6 +3,7 @@
 /db_ingest/
 /Result/
 /dist/
+/server_upload/
 
 # Build trees
 /build/

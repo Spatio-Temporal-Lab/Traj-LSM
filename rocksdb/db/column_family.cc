@@ -1294,7 +1294,8 @@ void ColumnFamilyData::CreateNewMemtable(SequenceNumber earliest_seq) {
 
 bool ColumnFamilyData::NeedsCompaction() const {
   return !mutable_cf_options_.disable_auto_compactions &&
-         compaction_picker_->NeedsCompaction(current_->storage_info());
+         compaction_picker_->NeedsCompaction(current_->storage_info(),
+                                            mutable_cf_options_);
 }
 
 Compaction* ColumnFamilyData::PickCompaction(

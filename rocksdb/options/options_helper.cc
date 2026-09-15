@@ -251,8 +251,14 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
       moptions.experimental_st_compaction_l1_l2_tiered;
   cf_opts->experimental_st_compaction_tiered_max_level =
       moptions.experimental_st_compaction_tiered_max_level;
+  cf_opts->experimental_st_compaction_tiered_min_level =
+      moptions.experimental_st_compaction_tiered_min_level;
+  cf_opts->experimental_st_compaction_real_tiered_l1_l2 =
+      moptions.experimental_st_compaction_real_tiered_l1_l2;
   cf_opts->experimental_st_compaction_tiered_max_runs_per_level =
       moptions.experimental_st_compaction_tiered_max_runs_per_level;
+  cf_opts->experimental_st_compaction_stfp_enable =
+      moptions.experimental_st_compaction_stfp_enable;
   cf_opts->experimental_compaction_read_repair_first =
       moptions.experimental_compaction_read_repair_first;
   cf_opts->experimental_compaction_read_repair_min_reads =

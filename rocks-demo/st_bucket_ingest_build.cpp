@@ -85,6 +85,10 @@ rocksdb::Options MakeDbOptions(bool create_if_missing,
     // Match VersionStorageInfo::CalculateBaseBytes static branch so ladder
     // thresholds agree with ST compaction scores.
     o.level_compaction_dynamic_level_bytes = false;
+    o.max_bytes_for_level_base = 1ULL << 30;
+    o.max_bytes_for_level_multiplier = 10;
+    o.target_file_size_base = 64ULL << 20;
+    o.target_file_size_multiplier = 1;
     // Large memtable for unified EOF flush (avoid per-bucket micro-SST).
     o.write_buffer_size = 256 * 1024 * 1024;
     o.max_write_buffer_number = 4;
@@ -754,7 +758,7 @@ int main(int argc, char** argv) {
   bool st_l1_l2_tiered = false;
   bool st_real_tiered = false;
   int st_tiered_max_level = 0;
-  int st_tiered_max_runs_per_level = 0;
+  int st_tiered_max_runs_per_level = 4;
   std::vector<std::pair<std::string, std::string>> st_custom_opts;
   int max_level_bytes_mb = 0;
   uint64_t block_size = 0;
@@ -1022,6 +1026,18 @@ int main(int argc, char** argv) {
       std::cerr << "SetOptions(custom) failed: " << s.ToString() << "\n";
       return 1;
     }
+  }
+
+  if (experimental_st_compaction) {
+    const auto effective_options = stage_db->GetOptions(cf);
+    std::cout << "ST capacity: base_bytes="
+              << effective_options.max_bytes_for_level_base
+              << " multiplier=" << effective_options.max_bytes_for_level_multiplier
+              << " target_sst_bytes=" << effective_options.target_file_size_base
+              << " max_runs="
+              << effective_options.experimental_st_compaction_tiered_max_runs_per_level
+              << " auto_compactions=" << !effective_options.disable_auto_compactions
+              << "\n";
   }
 
   if (st_ladder_drain_only) {

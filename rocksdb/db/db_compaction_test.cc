@@ -1369,6 +1369,56 @@ TEST_F(DBCompactionTest, ZeroSeqIdCompaction) {
   ASSERT_OK(Put("", ""));
 }
 
+TEST_F(DBCompactionTest, STRunCountSchedulesBelowCapacity) {
+  Options options = CurrentOptions();
+  options.compaction_style = kCompactionStyleLevel;
+  options.level_compaction_dynamic_level_bytes = false;
+  options.disable_auto_compactions = true;
+  options.max_bytes_for_level_base = 1ULL << 30;
+  options.max_bytes_for_level_multiplier = 10;
+  options.target_file_size_base = 64ULL << 20;
+  options.experimental_st_compaction = true;
+  options.experimental_st_compaction_l1_l2_tiered = true;
+  options.experimental_st_compaction_stfp_enable = false;
+  for (int max_runs : {4, 8}) {
+    DestroyAndReopen(options);
+    ASSERT_OK(dbfull()->SetOptions({
+        {"experimental_st_compaction_real_tiered_l1_l2", "true"},
+        {"experimental_st_compaction_tiered_max_runs_per_level",
+         std::to_string(max_runs)},
+    }));
+    for (int file_index = 0; file_index <= max_runs; ++file_index) {
+      ASSERT_OK(Put(Key(file_index), "value"));
+      ASSERT_OK(Flush());
+      MoveFilesToLevel(1);
+    }
+    ASSERT_EQ(0, NumTableFilesAtLevel(0));
+    ASSERT_EQ(max_runs + 1, NumTableFilesAtLevel(1));
+    ASSERT_EQ(0, NumTableFilesAtLevel(2));
+    ASSERT_TRUE(db_->GetOptions().experimental_st_compaction_real_tiered_l1_l2);
+    uint64_t pending = 0;
+    ASSERT_TRUE(db_->GetIntProperty("rocksdb.compaction-pending", &pending));
+    ASSERT_EQ(1U, pending);
+    ASSERT_OK(dbfull()->SetOptions(
+        {{"experimental_st_compaction_tiered_max_runs_per_level", "0"}}));
+    ASSERT_TRUE(db_->GetIntProperty("rocksdb.compaction-pending", &pending));
+    ASSERT_EQ(0U, pending);
+    ASSERT_TRUE(db_->GetOptions().experimental_st_compaction_real_tiered_l1_l2);
+    ASSERT_OK(dbfull()->SetOptions(
+        {{"experimental_st_compaction_tiered_max_runs_per_level",
+          std::to_string(max_runs)}}));
+    ASSERT_OK(dbfull()->SetOptions({{"disable_auto_compactions", "false"}}));
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    ASSERT_LE(NumTableFilesAtLevel(1), max_runs);
+    ASSERT_GT(NumTableFilesAtLevel(2), 0);
+    for (int file_index = 0; file_index <= max_runs; ++file_index) {
+      ASSERT_EQ("value", Get(Key(file_index)));
+    }
+    ASSERT_TRUE(db_->GetIntProperty("rocksdb.compaction-pending", &pending));
+    ASSERT_EQ(0U, pending);
+  }
+}
+
 TEST_F(DBCompactionTest, ManualCompactionUnknownOutputSize) {
   // github issue #2249
   Options options = CurrentOptions();

@@ -773,6 +773,39 @@ WritePressure ComputeWritePressure(const VersionStorageInfo* vstorage,
   return WritePressure::NORMAL;
 }
 
+int FindSTRunCountLevel(const VersionStorageInfo* vstorage,
+                       const MutableCFOptions& options,
+                       const ImmutableOptions& ioptions) {
+  const int max_runs =
+      options.experimental_st_compaction_tiered_max_runs_per_level;
+  if (!options.experimental_st_compaction_l1_l2_tiered ||
+      !options.experimental_st_compaction_real_tiered_l1_l2 || max_runs <= 0 ||
+      ComputeWritePressure(vstorage,
+                           options.level0_file_num_compaction_trigger) ==
+          WritePressure::HIGH) {
+    return -1;
+  }
+  const int min_level =
+      std::max(1, options.experimental_st_compaction_tiered_min_level);
+  int max_level = std::min(
+      vstorage->MaxInputLevel(),
+      vstorage->MaxOutputLevel(ioptions.cf_allow_ingest_behind ||
+                              ioptions.allow_ingest_behind) - 1);
+  if (options.experimental_st_compaction_tiered_max_level > 0) {
+    max_level = std::min(
+        max_level, options.experimental_st_compaction_tiered_max_level);
+  }
+  for (int level = min_level; level <= max_level; ++level) {
+    int active_runs = 0;
+    for (const auto* file : vstorage->LevelFiles(level)) {
+      if (file != nullptr && !file->being_compacted && ++active_runs > max_runs) {
+        return level;
+      }
+    }
+  }
+  return -1;
+}
+
 void LevelCompactionBuilder::SetupInitialFiles() {
   // Find the compactions by size on all levels.
   bool skipped_l0_to_base = false;
@@ -939,26 +972,17 @@ void LevelCompactionBuilder::SetupInitialFiles() {
     const int max_runs =
         mutable_cf_options_.experimental_st_compaction_tiered_max_runs_per_level;
     if (max_runs > 0) {  // 0 = unlimited, never trigger
-      int tiered_min =
-          mutable_cf_options_.experimental_st_compaction_tiered_min_level;
-      if (tiered_min <= 0) tiered_min = 1;
-      for (int lvl = std::max(tiered_min, 1);
-           lvl < vstorage_->num_levels() - 1; ++lvl) {
+      const int lvl =
+          FindSTRunCountLevel(vstorage_, mutable_cf_options_, ioptions_);
+      if (lvl >= 0) {
         const auto& files = vstorage_->LevelFiles(lvl);
-        // Count non-compacting files as runs
-        int active_runs = 0;
-        for (auto* f : files) {
-          if (f != nullptr && !f->being_compacted) ++active_runs;
-        }
-        if (active_runs <= max_runs) continue;
-
         // Select a batch of runs to merge (one compaction job).
         // NOTE: batch may span multiple calendar buckets. Cross-bucket
         // SST coexistence is by design — st_file_meta time windows
         // guarantee recall regardless of which bucket a segment lives in.
         std::vector<FileMetaData*> merge_batch;
         SelectBestMergeBatch(files, max_runs, &merge_batch);
-        if (merge_batch.size() < 2) continue;
+        if (merge_batch.size() < 2) return;
 
         // Found a level with too many runs. Compact the selected batch
         // to the next level in one job (tiered: no output-level files
@@ -970,7 +994,6 @@ void LevelCompactionBuilder::SetupInitialFiles() {
         output_level_ = (lvl >= max_out) ? lvl : lvl + 1;
         start_level_ = lvl;
         compaction_reason_ = CompactionReason::kLevelMaxLevelSize;
-        break;
       }
     }
   }
@@ -1888,6 +1911,13 @@ bool LevelCompactionBuilder::TryPickWholeLevelNonL0ST() {
   return true;
 }
 }  // namespace
+
+bool LevelCompactionPicker::NeedsCompaction(
+    const VersionStorageInfo* vstorage,
+    const MutableCFOptions& mutable_cf_options) const {
+  return NeedsCompaction(vstorage) ||
+         FindSTRunCountLevel(vstorage, mutable_cf_options, ioptions_) >= 0;
+}
 
 Compaction* LevelCompactionPicker::PickCompaction(
     const std::string& cf_name, const MutableCFOptions& mutable_cf_options,

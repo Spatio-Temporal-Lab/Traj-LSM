@@ -91,6 +91,13 @@ class CompactionPicker {
 
   virtual bool NeedsCompaction(const VersionStorageInfo* vstorage) const = 0;
 
+  virtual bool NeedsCompaction(
+      const VersionStorageInfo* vstorage,
+      const MutableCFOptions& mutable_cf_options) const {
+    (void)mutable_cf_options;
+    return NeedsCompaction(vstorage);
+  }
+
   // Sanitize the input set of compaction input files and convert it to
   // `std::vector<CompactionInputFiles>` in the output parameter
   // `converted_input_files`.

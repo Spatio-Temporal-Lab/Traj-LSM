@@ -493,6 +493,107 @@ TEST_F(CompactionPickerTest, NeedsCompactionLevel) {
   }
 }
 
+TEST_F(CompactionPickerTest, STRunCountBelowCapacity) {
+  mutable_cf_options_.experimental_st_compaction = true;
+  mutable_cf_options_.experimental_st_compaction_l1_l2_tiered = true;
+  mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2 = true;
+  mutable_cf_options_.experimental_st_compaction_stfp_enable = false;
+  mutable_cf_options_.max_bytes_for_level_base = 1ULL << 30;
+  mutable_cf_options_.max_bytes_for_level_multiplier = 10;
+  for (int max_runs : {4, 8}) {
+    mutable_cf_options_.experimental_st_compaction_tiered_max_runs_per_level =
+        max_runs;
+    NewVersionStorage(ioptions_.num_levels, kCompactionStyleLevel);
+    for (int file_index = 0; file_index <= max_runs; ++file_index) {
+      const std::string key = std::to_string(100 + file_index);
+      Add(1, file_index + 1, key.c_str(), key.c_str(), 64ULL << 20);
+    }
+    UpdateVersionStorageInfo();
+    ASSERT_LT(vstorage_->CompactionScore(0), 0.7);
+    ASSERT_FALSE(level_compaction_picker.NeedsCompaction(vstorage_.get()));
+    CompactionPicker* picker = &level_compaction_picker;
+    ASSERT_TRUE(picker->NeedsCompaction(vstorage_.get(), mutable_cf_options_));
+    std::unique_ptr<Compaction> compaction(picker->PickCompaction(
+        cf_name_, mutable_cf_options_, mutable_db_options_, {}, nullptr,
+        vstorage_.get(), &log_buffer_, ""));
+    ASSERT_NE(nullptr, compaction);
+    ASSERT_EQ(1, compaction->start_level());
+    ASSERT_EQ(2, compaction->output_level());
+    ASSERT_GE(compaction->num_input_files(0), 2U);
+    picker->ReleaseCompactionFiles(compaction.get(), Status::OK());
+  }
+}
+
+TEST_F(CompactionPickerTest, STRunCountEligibilityAndMutableOptions) {
+  mutable_cf_options_.experimental_st_compaction = true;
+  mutable_cf_options_.experimental_st_compaction_l1_l2_tiered = true;
+  mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2 = true;
+  mutable_cf_options_.experimental_st_compaction_stfp_enable = false;
+  mutable_cf_options_.max_bytes_for_level_base = 1ULL << 30;
+  for (int level : {1, 2, ioptions_.num_levels - 1}) {
+    NewVersionStorage(ioptions_.num_levels, kCompactionStyleLevel);
+    for (int file_index = 0; file_index < 9; ++file_index) {
+      const std::string key = std::to_string(100 + file_index);
+      Add(level, file_index + 1, key.c_str(), key.c_str(), 1ULL << 20);
+    }
+    UpdateVersionStorageInfo();
+    const bool eligible_level = level < ioptions_.num_levels - 1;
+    for (int max_runs : {0, 4, 8, 9}) {
+      mutable_cf_options_.experimental_st_compaction_tiered_max_runs_per_level =
+          max_runs;
+      ASSERT_EQ(eligible_level && max_runs > 0 && max_runs < 9,
+                level_compaction_picker.NeedsCompaction(
+                    vstorage_.get(), mutable_cf_options_));
+    }
+    mutable_cf_options_.experimental_st_compaction_tiered_max_runs_per_level = 8;
+    vstorage_->LevelFiles(level).front()->being_compacted = true;
+    ASSERT_FALSE(level_compaction_picker.NeedsCompaction(
+        vstorage_.get(), mutable_cf_options_));
+    vstorage_->LevelFiles(level).front()->being_compacted = false;
+    mutable_cf_options_.experimental_st_compaction_tiered_max_level = 1;
+    ASSERT_EQ(level == 1, level_compaction_picker.NeedsCompaction(
+                              vstorage_.get(), mutable_cf_options_));
+    mutable_cf_options_.experimental_st_compaction_tiered_max_level = 0;
+    mutable_cf_options_.experimental_st_compaction_tiered_min_level = 2;
+    ASSERT_EQ(level == 2, level_compaction_picker.NeedsCompaction(
+                              vstorage_.get(), mutable_cf_options_));
+    mutable_cf_options_.experimental_st_compaction_tiered_min_level = 0;
+    mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2 = false;
+    ASSERT_FALSE(level_compaction_picker.NeedsCompaction(
+        vstorage_.get(), mutable_cf_options_));
+    mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2 = true;
+    mutable_cf_options_.experimental_st_compaction_l1_l2_tiered = false;
+    ASSERT_FALSE(level_compaction_picker.NeedsCompaction(
+        vstorage_.get(), mutable_cf_options_));
+    mutable_cf_options_.experimental_st_compaction_l1_l2_tiered = true;
+  }
+}
+
+TEST_F(CompactionPickerTest, STRunCountDefersUnderHighWritePressure) {
+  mutable_cf_options_.experimental_st_compaction = true;
+  mutable_cf_options_.experimental_st_compaction_l1_l2_tiered = true;
+  mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2 = true;
+  mutable_cf_options_.experimental_st_compaction_stfp_enable = false;
+  mutable_cf_options_.experimental_st_compaction_tiered_max_runs_per_level = 4;
+  mutable_cf_options_.level0_file_num_compaction_trigger = 2;
+  mutable_cf_options_.max_bytes_for_level_base = 1ULL << 30;
+  NewVersionStorage(ioptions_.num_levels, kCompactionStyleLevel);
+  for (int file_index = 0; file_index < 5; ++file_index) {
+    const std::string key = std::to_string(100 + file_index);
+    Add(1, file_index + 1, key.c_str(), key.c_str(), 1ULL << 20);
+  }
+  for (int file_index = 0; file_index < 4; ++file_index) {
+    Add(0, file_index + 10, "a", "z", 1ULL << 20);
+    files_.back()->being_compacted = true;
+  }
+  UpdateVersionStorageInfo();
+  ASSERT_FALSE(level_compaction_picker.NeedsCompaction(
+      vstorage_.get(), mutable_cf_options_));
+  mutable_cf_options_.level0_file_num_compaction_trigger = 4;
+  ASSERT_TRUE(level_compaction_picker.NeedsCompaction(
+      vstorage_.get(), mutable_cf_options_));
+}
+
 TEST_F(CompactionPickerTest, Level0TriggerDynamic) {
   int num_levels = ioptions_.num_levels;
   ioptions_.level_compaction_dynamic_level_bytes = true;

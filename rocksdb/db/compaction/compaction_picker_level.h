@@ -30,6 +30,9 @@ class LevelCompactionPicker : public CompactionPicker {
       bool /*require_max_output_level*/ = false) override;
 
   bool NeedsCompaction(const VersionStorageInfo* vstorage) const override;
+  bool NeedsCompaction(
+      const VersionStorageInfo* vstorage,
+      const MutableCFOptions& mutable_cf_options) const override;
 };
 
 }  // namespace ROCKSDB_NAMESPACE
