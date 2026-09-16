@@ -18,6 +18,6 @@ else
   cmake --build "$build_dir" --target compaction_picker_test db_compaction_test --parallel "$jobs"
   export TEST_TMPDIR="$build_dir/test-data"
   mkdir -p "$TEST_TMPDIR"
-  "$build_dir/bin/compaction_picker_test" '--gtest_filter=*NeedsCompaction*:*STRunCount*'
-  "$build_dir/bin/db_compaction_test" '--gtest_filter=DBCompactionTest.STRunCountSchedulesBelowCapacity:DBCompactionTest.ManualCompactionUnknownOutputSize'
+  "$build_dir/bin/compaction_picker_test" '--gtest_filter=*NeedsCompaction*:*STFileCount*'
+  "$build_dir/bin/db_compaction_test" '--gtest_filter=DBCompactionTest.STFileCountSchedulesSameLevelBelowCapacity:DBCompactionTest.ManualCompactionUnknownOutputSize'
 fi

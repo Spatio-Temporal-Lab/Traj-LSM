@@ -243,7 +243,7 @@ void ReportStCompactionOptions(rocksdb::DB* db, const char* label) {
             << static_cast<int>(o.experimental_st_compaction_l1_l2_tiered)
             << " st_real_tiered="
             << static_cast<int>(o.experimental_st_compaction_real_tiered_l1_l2)
-            << " st_tiered_max_runs="
+            << " st_file_count_threshold="
             << o.experimental_st_compaction_tiered_max_runs_per_level
             << "\n";
   std::cout
@@ -265,7 +265,7 @@ int main(int argc, char** argv) {
   bool st_l1_l2_tiered = false;
   bool st_real_tiered = false;
   int st_tiered_max_level = 0;
-  int st_tiered_max_runs_per_level = 0;
+  int st_tiered_max_runs_per_level = 16;
   int max_level_bytes_mb = 0;
   bool no_force_bottommost = false;
   uint32_t st_bucket_sec = 0;
@@ -333,11 +333,13 @@ int main(int argc, char** argv) {
       st_tiered_max_level = static_cast<int>(v);
       continue;
     }
-    if (std::strcmp(argv[i], "--st-tiered-max-runs-per-level") == 0 && i + 1 < argc) {
+    if ((std::strcmp(argv[i], "--st-tiered-max-runs-per-level") == 0 ||
+         std::strcmp(argv[i], "--st-file-count") == 0) &&
+        i + 1 < argc) {
       char* e = nullptr;
       const long v = std::strtol(argv[++i], &e, 10);
       if (e == argv[i] || *e != '\0' || v < 0 || v > 1000) {
-        std::cerr << "Invalid --st-tiered-max-runs-per-level (0=unlimited)\n";
+        std::cerr << "Invalid --st-file-count (0=unlimited)\n";
         return 1;
       }
       st_tiered_max_runs_per_level = static_cast<int>(v);

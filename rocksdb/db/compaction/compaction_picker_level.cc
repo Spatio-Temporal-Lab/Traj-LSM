@@ -367,13 +367,11 @@ double MergePriorityScore(const FileMetaData* a, const FileMetaData* b) {
   return (alpha * iou_t + beta * iou_s) / std::max(size_den, 1e-6);
 }
 
-// Select a batch of overlapping files to merge from a level with too many
-// runs. Strategy: find the "center" file with the highest total merge
-// benefit (sum of scores with all other files), then greedily add its best
-// neighbors until enough runs are eliminated or no more good candidates.
-// Merging a batch in one job reduces compaction job count vs pair-by-pair.
+// Select a key-contiguous batch of files to merge in-place from a level with
+// too many files. Same-level output must not span over unselected files, so the
+// candidates are adjacent in level order and scored by ST proximity.
 void SelectBestMergeBatch(const std::vector<FileMetaData*>& level_files,
-                          int max_runs,
+                          int max_files,
                           std::vector<FileMetaData*>* out_selected) {
   out_selected->clear();
   const size_t n = level_files.size();
@@ -385,105 +383,48 @@ void SelectBestMergeBatch(const std::vector<FileMetaData*>& level_files,
     if (level_files[i] != nullptr && !level_files[i]->being_compacted)
       ++active;
   }
-  if (active <= max_runs) return;  // no merge needed
+  if (active <= max_files) return;  // no merge needed
 
-  // Compute total merge benefit per file (sum of scores with all others).
-  struct Candidate {
-    size_t index;
-    double total_score;
-    int    neighbor_count;  // files with score > 0
-  };
-  std::vector<Candidate> cands;
-  cands.reserve(n);
-  for (size_t i = 0; i < n; ++i) {
-    if (level_files[i] == nullptr || level_files[i]->being_compacted)
+  const int target_batch = std::max(2, active - max_files + 1);
+  double best_score = -1.0;
+  uint64_t best_bytes = std::numeric_limits<uint64_t>::max();
+  size_t best_begin = n;
+  size_t best_end = n;
+
+  for (size_t begin = 0; begin < n; ++begin) {
+    if (level_files[begin] == nullptr || level_files[begin]->being_compacted) {
       continue;
-    double sum = 0.0;
-    int neighbors = 0;
-    for (size_t j = 0; j < n; ++j) {
-      if (i == j) continue;
-      if (level_files[j] == nullptr || level_files[j]->being_compacted)
-        continue;
-      const double s = MergePriorityScore(level_files[i], level_files[j]);
-      sum += s;
-      if (s > 0.0) ++neighbors;
     }
-    cands.push_back({i, sum, neighbors});
-  }
-  if (cands.empty()) return;
-
-  // Pick the center: file with highest total_score (most overlap benefit).
-  std::sort(cands.begin(), cands.end(),
-            [](const Candidate& a, const Candidate& b) {
-              return a.total_score > b.total_score;  // descending
-            });
-
-  // Build a merge batch around the center.  Include the center plus
-  // enough neighbors to bring the run count down to max_runs.
-  const int need = active - max_runs;  // runs to eliminate
-  const size_t center = cands[0].index;
-  out_selected->push_back(
-      const_cast<FileMetaData*>(level_files[center]));
-
-  // Score all files against the center, sort by score descending.
-  std::vector<std::pair<double, size_t>> by_score;
-  for (size_t j = 0; j < n; ++j) {
-    if (j == center) continue;
-    if (level_files[j] == nullptr || level_files[j]->being_compacted)
-      continue;
-    const double s = MergePriorityScore(level_files[center], level_files[j]);
-    if (s > 0.0) {
-      by_score.push_back({s, j});
-    }
-  }
-  std::sort(by_score.begin(), by_score.end(),
-            [](const auto& a, const auto& b) {
-              return a.first > b.first;  // highest score first
-            });
-
-  // Add neighbors until we eliminate enough runs.
-  // Each added file merges one extra run into the batch (eliminating it).
-  int added = 0;
-  for (const auto& p : by_score) {
-    if (added >= need) break;
-    out_selected->push_back(
-        const_cast<FileMetaData*>(level_files[p.second]));
-    ++added;
-  }
-
-  // If we still haven't met the target and there are files without ST meta
-  // (score = 0.01), add those as a last resort.
-  if (added < need) {
-    for (size_t j = 0; j < n && added < need; ++j) {
-      if (j == center) continue;
-      if (level_files[j] == nullptr || level_files[j]->being_compacted)
-        continue;
-      // Check if already selected
-      bool already = false;
-      for (auto* f : *out_selected) {
-        if (f == level_files[j]) { already = true; break; }
-      }
-      if (already) continue;
-      const double s = MergePriorityScore(level_files[center],
-                                           level_files[j]);
-      if (s <= 0.0) {  // no-ST-meta files get 0.01
-        out_selected->push_back(
-            const_cast<FileMetaData*>(level_files[j]));
-        ++added;
-      }
-    }
-  }
-
-  // If batch is still just 1 file (no neighbors), add at least one more.
-  if (out_selected->size() < 2 && by_score.empty() && n >= 2) {
-    for (size_t j = 0; j < n; ++j) {
-      if (j != center && level_files[j] != nullptr &&
-          !level_files[j]->being_compacted) {
-        out_selected->push_back(
-            const_cast<FileMetaData*>(level_files[j]));
+    int count = 0;
+    double score = 0.0;
+    uint64_t bytes = 0;
+    FileMetaData* prev = nullptr;
+    size_t end = begin;
+    for (; end < n && count < target_batch; ++end) {
+      FileMetaData* file = level_files[end];
+      if (file == nullptr || file->being_compacted) {
         break;
       }
+      if (prev != nullptr) {
+        score += MergePriorityScore(prev, file);
+      }
+      bytes += file->fd.GetFileSize();
+      prev = file;
+      ++count;
     }
+    if (count == target_batch &&
+        (score > best_score ||
+         (score == best_score && bytes < best_bytes))) {
+      best_score = score;
+      best_bytes = bytes;
+      best_begin = begin;
+      best_end = end;
+    }
+  }
+  if (best_begin == n) return;
+
+  for (size_t i = best_begin; i < best_end; ++i) {
+    out_selected->push_back(const_cast<FileMetaData*>(level_files[i]));
   }
 }
 
@@ -773,13 +714,13 @@ WritePressure ComputeWritePressure(const VersionStorageInfo* vstorage,
   return WritePressure::NORMAL;
 }
 
-int FindSTRunCountLevel(const VersionStorageInfo* vstorage,
-                       const MutableCFOptions& options,
-                       const ImmutableOptions& ioptions) {
-  const int max_runs =
+int FindSTFileCountLevel(const VersionStorageInfo* vstorage,
+                         const MutableCFOptions& options,
+                         const ImmutableOptions& ioptions) {
+  const int max_files =
       options.experimental_st_compaction_tiered_max_runs_per_level;
   if (!options.experimental_st_compaction_l1_l2_tiered ||
-      !options.experimental_st_compaction_real_tiered_l1_l2 || max_runs <= 0 ||
+      !options.experimental_st_compaction_real_tiered_l1_l2 || max_files <= 0 ||
       ComputeWritePressure(vstorage,
                            options.level0_file_num_compaction_trigger) ==
           WritePressure::HIGH) {
@@ -796,9 +737,10 @@ int FindSTRunCountLevel(const VersionStorageInfo* vstorage,
         max_level, options.experimental_st_compaction_tiered_max_level);
   }
   for (int level = min_level; level <= max_level; ++level) {
-    int active_runs = 0;
+    int active_files = 0;
     for (const auto* file : vstorage->LevelFiles(level)) {
-      if (file != nullptr && !file->being_compacted && ++active_runs > max_runs) {
+      if (file != nullptr && !file->being_compacted &&
+          ++active_files > max_files) {
         return level;
       }
     }
@@ -846,42 +788,6 @@ void LevelCompactionBuilder::SetupInitialFiles() {
   constexpr double kIdleScoreThreshold = 0.7;
   const double effective_threshold =
       (wp == WritePressure::IDLE) ? kIdleScoreThreshold : 1.0;
-
-  // ── STFR Trigger A: intra-level neighbor merge (ALL non-L0 levels) ──
-  // Scan ALL non-L0, non-last levels for files with small ΔS (close in
-  // spatiotemporal position). Merge them in-place (output = start_level)
-  // to reduce run count without pushing data deeper.
-  if (start_level_inputs_.empty() &&
-      wp != WritePressure::HIGH &&
-      mutable_cf_options_.experimental_st_compaction_l1_l2_tiered &&
-      mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2 &&
-      mutable_cf_options_.experimental_st_compaction_stfp_enable) {
-    // Trigger A uses per-level envelope (not global) to avoid
-    // normalization collapse: a 20-year global span would flatten all
-    // local time differences to near-zero, making DeltaS meaningless.
-    for (int lvl = 1; lvl < vstorage_->num_levels() - 1; ++lvl) {
-      const auto& files = vstorage_->LevelFiles(lvl);
-      if (files.size() < 2) continue;
-      GlobalEnvelope env = ComputeLevelEnvelope(files);
-      if (!env.valid) continue;
-      std::vector<FileMetaData*> pair;
-      FindBestNeighborPair(files, env, &pair);
-      if (pair.size() >= 2) {
-        start_level_inputs_.level = lvl;
-        start_level_inputs_.files = std::move(pair);
-        // Intra-level: merge neighbors back into the same level.
-        output_level_ = lvl;
-        start_level_ = lvl;
-        compaction_reason_ = CompactionReason::kLevelMaxLevelSize;
-        break;
-      }
-    }
-  }
-
-  // ── STFR Trigger B: bloated file push-down (IDLE only, ALL non-L0 levels) ──
-  if (!start_level_inputs_.empty()) {
-    return;
-  }
 
   for (int i = 0; i < num_score_slots; i++) {
     start_level_score_ = vstorage_->CompactionScore(i);
@@ -957,41 +863,37 @@ void LevelCompactionBuilder::SetupInitialFiles() {
       break;
     }
   }
-  // ST run-count trigger: when an ST-tiered level has more files (runs)
-  // than tiered_max_runs_per_level, select the best pair of runs to merge
-  // based on time+spatial overlap (ST-aware merge selection). The merged
-  // output goes to the next level (standard L(n)→L(n+1) tiered compaction),
-  // which reduces the run count in this level.
+  // ST file-count trigger: when an ST-tiered level has more SSTables than
+  // the configured file-count limit, select a key-contiguous batch of
+  // spatio-temporally close SSTables and merge them back into the same level.
+  // This repairs same-level fragmentation without pushing data downward.
   // Skip under HIGH write pressure — write throughput takes priority.
-  // Run-count trigger: applies to ALL real_tiered strategies.
-  // STFP additionally enables Trigger A + B via stfp_enable.
+  // This is the only automatic same-level ST merge trigger.
   if (wp != WritePressure::HIGH &&
       start_level_inputs_.empty() &&
       mutable_cf_options_.experimental_st_compaction_l1_l2_tiered &&
       mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2) {
-    const int max_runs =
+    const int max_files =
         mutable_cf_options_.experimental_st_compaction_tiered_max_runs_per_level;
-    if (max_runs > 0) {  // 0 = unlimited, never trigger
+    if (max_files > 0) {  // 0 = unlimited, never trigger
       const int lvl =
-          FindSTRunCountLevel(vstorage_, mutable_cf_options_, ioptions_);
+          FindSTFileCountLevel(vstorage_, mutable_cf_options_, ioptions_);
       if (lvl >= 0) {
         const auto& files = vstorage_->LevelFiles(lvl);
-        // Select a batch of runs to merge (one compaction job).
+        // Select a same-level batch of SSTables to merge (one compaction job).
         // NOTE: batch may span multiple calendar buckets. Cross-bucket
         // SST coexistence is by design — st_file_meta time windows
         // guarantee recall regardless of which bucket a segment lives in.
         std::vector<FileMetaData*> merge_batch;
-        SelectBestMergeBatch(files, max_runs, &merge_batch);
+        SelectBestMergeBatch(files, max_files, &merge_batch);
         if (merge_batch.size() < 2) return;
 
-        // Found a level with too many runs. Compact the selected batch
-        // to the next level in one job (tiered: no output-level files
-        // are involved — enforced in SetupOtherInputsIfNeeded).
+        // Found a level with too many files. Compact the selected batch
+        // back to the same level in one job. No output-level files are
+        // involved; block-level ST splitting still applies to the output.
         start_level_inputs_.level = lvl;
         start_level_inputs_.files = std::move(merge_batch);
-        const int max_out = vstorage_->MaxOutputLevel(
-            ioptions_.cf_allow_ingest_behind || ioptions_.allow_ingest_behind);
-        output_level_ = (lvl >= max_out) ? lvl : lvl + 1;
+        output_level_ = lvl;
         start_level_ = lvl;
         compaction_reason_ = CompactionReason::kLevelMaxLevelSize;
       }
@@ -1222,24 +1124,21 @@ bool LevelCompactionBuilder::SetupOtherInputsIfNeeded() {
   // spans of files that do not interact with any pending compactions, so don't
   // need to consider other levels.
   if (output_level_ != 0) {
-    // Unified Soft-Tiered: when real_tiered_l1_l2 is enabled, skip
-    // output-level involvement entirely. Output files are NOT read or
-    // rewritten, reducing write amp. Multiple sorted runs per level are
-    // allowed — trajectory data has no duplicate keys, so version
-    // resolution is unnecessary. The old Adaptive hysteresis and
-    // per-level tiered cutoff are removed; all levels >= tiered_min
-    // use tiered uniformly.
-    bool is_real_tiered = false;
+    // ST file-count compaction is same-level, so it does not pull extra files
+    // from an output level. ST capacity compaction is inter-level and keeps
+    // the normal LSM overlap handling for the next level.
+    bool skip_output_level_inputs = false;
     if (mutable_cf_options_.experimental_st_compaction_l1_l2_tiered &&
         mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2 &&
-        start_level_ >= 1) {
+        start_level_ >= 1 && start_level_ == output_level_) {
       int tiered_min =
           mutable_cf_options_.experimental_st_compaction_tiered_min_level;
       if (tiered_min <= 0) tiered_min = 1;
       int tiered_max =
           mutable_cf_options_.experimental_st_compaction_tiered_max_level;
-      is_real_tiered = (start_level_ >= tiered_min &&
-                        (tiered_max <= 0 || start_level_ <= tiered_max));
+      skip_output_level_inputs =
+          (start_level_ >= tiered_min &&
+           (tiered_max <= 0 || start_level_ <= tiered_max));
     }
 
     output_level_inputs_.level = output_level_;
@@ -1249,7 +1148,7 @@ bool LevelCompactionBuilder::SetupOtherInputsIfNeeded() {
     if (round_robin_expanding) {
       SetupOtherFilesWithRoundRobinExpansion();
     }
-    if (!is_real_tiered && !is_l0_trivial_move_ &&
+    if (!skip_output_level_inputs && !is_l0_trivial_move_ &&
         !compaction_picker_->SetupOtherInputs(
             cf_name_, mutable_cf_options_, vstorage_, &start_level_inputs_,
             &output_level_inputs_, &parent_index_, base_index_,
@@ -1277,7 +1176,7 @@ bool LevelCompactionBuilder::SetupOtherInputsIfNeeded() {
       // of a currently running compaction, we cannot run it.
       return false;
     }
-    if (!is_real_tiered && !is_l0_trivial_move_) {
+    if (!skip_output_level_inputs && !is_l0_trivial_move_) {
       compaction_picker_->GetGrandparents(vstorage_, start_level_inputs_,
                                           output_level_inputs_, &grandparents_);
     }
@@ -1762,143 +1661,45 @@ bool LevelCompactionBuilder::PickSizeBasedIntraL0Compaction() {
 }
 
 
-// ST-aware level compaction: picks files from start_level_ for compaction.
-// Despite the "WholeLevel" name, when ST metadata is present this method
-// selects a spatially-proximate subset anchored at the earliest-t_min file,
-// not necessarily every file in the level. Non-ST files or files without
-// valid st_file_meta fall back to whole-level inclusion.
+// ST-aware level-capacity compaction: pick the whole non-L0 level and compact
+// it to the next level. Same-level ST fragmentation is handled separately by
+// the file-count trigger.
 bool LevelCompactionBuilder::TryPickWholeLevelNonL0ST() {
   assert(start_level_ > 0);
   start_level_inputs_.clear();
   start_level_inputs_.level = start_level_;
   const std::vector<FileMetaData*>& level_files =
       vstorage_->LevelFiles(start_level_);
-  std::vector<FileMetaData*> candidates;
-  candidates.reserve(level_files.size());
   for (auto* f : level_files) {
-    if (f != nullptr && !f->being_compacted) {
-      candidates.push_back(f);
+    if (f == nullptr) {
+      continue;
     }
+    if (f->being_compacted) {
+      start_level_inputs_.clear();
+      return false;
+    }
+    start_level_inputs_.files.push_back(f);
   }
-  if (candidates.empty()) {
+  if (start_level_inputs_.files.empty()) {
     return false;
   }
+
+  std::sort(start_level_inputs_.files.begin(), start_level_inputs_.files.end(),
+            [&](const FileMetaData* a, const FileMetaData* b) {
+              return ioptions_.internal_comparator.Compare(a->smallest,
+                                                           b->smallest) < 0;
+            });
 
   const int max_out = vstorage_->MaxOutputLevel(
       ioptions_.cf_allow_ingest_behind || ioptions_.allow_ingest_behind);
   const int out_level =
       (start_level_ >= max_out) ? start_level_ : start_level_ + 1;
-  const uint32_t base_time_norm =
-      mutable_cf_options_.experimental_compaction_event_time_max_span;
-  const uint32_t time_norm = std::max<uint32_t>(
-      1, ComputeStEventSplitLevelPolicy(out_level, base_time_norm)
-             .effective_max_time_span);
-  const double coarse_th = SpatialProximityCoarseEdgeThreshold(out_level);
-  constexpr double kMaxNeighborFineScore = 2.5;
-
-  FileMetaData* anchor = nullptr;
-  uint32_t anchor_t_min = UINT32_MAX;
-  for (FileMetaData* f : candidates) {
-    if (!f->has_st_file_meta) {
-      continue;
-    }
-    const uint32_t t = f->st_file_meta.t_min;
-    if (anchor == nullptr || t < anchor_t_min ||
-        (t == anchor_t_min &&
-         ioptions_.internal_comparator.Compare(f->smallest, anchor->smallest) <
-             0)) {
-      anchor = f;
-      anchor_t_min = t;
-    }
-  }
-  if (anchor == nullptr) {
-    anchor = candidates[0];
-    for (FileMetaData* f : candidates) {
-      if (ioptions_.internal_comparator.Compare(f->smallest, anchor->smallest) <
-          0) {
-        anchor = f;
-      }
-    }
-  }
-
-  std::vector<FileMetaData*> picked;
-  picked.push_back(anchor);
-  if (anchor->has_st_file_meta) {
-    const auto& am = anchor->st_file_meta;
-    const double base_edge = std::sqrt(std::max(ComputeMbrArea(am), 1e-12));
-    for (FileMetaData* f : candidates) {
-      if (f == anchor) {
-        continue;
-      }
-      bool include = false;
-      if (f->has_st_file_meta) {
-        const auto& fm = f->st_file_meta;
-        if (MbrIntersects(fm, am)) {
-          include = true;
-        } else {
-          const double d_edge = EdgeDistance(fm, am);
-          const double d_norm = d_edge / std::max(base_edge, 1e-6);
-          include = (d_norm <= coarse_th);
-        }
-        if (include) {
-          const double fine = SpatialProximityFineScore(f, anchor, time_norm);
-          include = fine <= kMaxNeighborFineScore;
-        }
-      } else if (ioptions_.internal_comparator.Compare(f->smallest,
-                                                         anchor->largest) <=
-                     0 &&
-                 ioptions_.internal_comparator.Compare(anchor->smallest,
-                                                     f->largest) <= 0) {
-        include = true;
-      }
-      if (include) {
-        picked.push_back(f);
-      }
-    }
-  } else {
-    picked = candidates;
-  }
-
-  std::sort(picked.begin(), picked.end(),
-            [&](const FileMetaData* a, const FileMetaData* b) {
-              return ioptions_.internal_comparator.Compare(a->smallest,
-                                                           b->smallest) < 0;
-            });
-  start_level_inputs_.files = std::move(picked);
-  if (start_level_inputs_.files.empty()) {
-    return false;
-  }
   if (!compaction_picker_->ExpandInputsToCleanCut(cf_name_, vstorage_,
                                                   &start_level_inputs_)) {
     start_level_inputs_.clear();
     return false;
   }
   output_level_ = out_level;
-
-  // Unified Soft-Tiered: when l1_l2_tiered + real_tiered_l1_l2 are both
-  // enabled, all levels >= tiered_min use tiered compaction uniformly.
-  // All picked files are kept (no 3-file soft cap). Output-level files
-  // are NOT involved (enforced in SetupOtherInputsIfNeeded). The old
-  // ComputeAdaptiveTieredMaxLevel hysteresis and per-level tiered_max
-  // cutoff are removed. Run-count is controlled by the new option
-  // experimental_st_compaction_tiered_max_runs_per_level.
-  int tiered_min = mutable_cf_options_.experimental_st_compaction_tiered_min_level;
-  if (tiered_min <= 0) tiered_min = 1;
-  int tiered_max = mutable_cf_options_.experimental_st_compaction_tiered_max_level;
-  bool is_tiered = (mutable_cf_options_.experimental_st_compaction_l1_l2_tiered &&
-                    mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2 &&
-                    start_level_ >= tiered_min &&
-                    (tiered_max <= 0 || start_level_ <= tiered_max));
-  if (is_tiered) {
-    // Real Tiered: keep ALL files (whole-level compaction).
-  } else if (mutable_cf_options_.experimental_st_compaction_l1_l2_tiered &&
-             !mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2 &&
-             start_level_ >= tiered_min) {
-    // Legacy soft-tiered path: capped at 3 files (for A/B comparison).
-    if (start_level_inputs_.files.size() > 3) {
-      start_level_inputs_.files.resize(3);
-    }
-  }
 
   if (compaction_picker_->FilesRangeOverlapWithCompaction(
           {start_level_inputs_}, output_level_,
@@ -1916,7 +1717,7 @@ bool LevelCompactionPicker::NeedsCompaction(
     const VersionStorageInfo* vstorage,
     const MutableCFOptions& mutable_cf_options) const {
   return NeedsCompaction(vstorage) ||
-         FindSTRunCountLevel(vstorage, mutable_cf_options, ioptions_) >= 0;
+         FindSTFileCountLevel(vstorage, mutable_cf_options, ioptions_) >= 0;
 }
 
 Compaction* LevelCompactionPicker::PickCompaction(

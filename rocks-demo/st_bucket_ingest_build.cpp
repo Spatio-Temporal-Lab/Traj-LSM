@@ -758,7 +758,7 @@ int main(int argc, char** argv) {
   bool st_l1_l2_tiered = false;
   bool st_real_tiered = false;
   int st_tiered_max_level = 0;
-  int st_tiered_max_runs_per_level = 4;
+  int st_tiered_max_runs_per_level = 16;
   std::vector<std::pair<std::string, std::string>> st_custom_opts;
   int max_level_bytes_mb = 0;
   uint64_t block_size = 0;
@@ -800,7 +800,9 @@ int main(int argc, char** argv) {
       if (eq != std::string::npos) {
         st_custom_opts.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
       }
-    } else if (a == "--st-tiered-max-runs-per-level" && i + 1 < argc) {
+    } else if ((a == "--st-tiered-max-runs-per-level" ||
+                a == "--st-file-count") &&
+               i + 1 < argc) {
       st_tiered_max_runs_per_level = std::stoi(argv[++i]);
     } else if (a == "--max-level-bytes-mb" && i + 1 < argc) {
       max_level_bytes_mb = std::stoi(argv[++i]);
@@ -1034,7 +1036,7 @@ int main(int argc, char** argv) {
               << effective_options.max_bytes_for_level_base
               << " multiplier=" << effective_options.max_bytes_for_level_multiplier
               << " target_sst_bytes=" << effective_options.target_file_size_base
-              << " max_runs="
+              << " file_count_threshold="
               << effective_options.experimental_st_compaction_tiered_max_runs_per_level
               << " auto_compactions=" << !effective_options.disable_auto_compactions
               << "\n";

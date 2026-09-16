@@ -451,20 +451,18 @@ struct AdvancedColumnFamilyOptions {
   //
   // Dynamically changeable through SetOptions() API
   bool experimental_st_compaction_real_tiered_l1_l2 = false;
-  // Maximum number of sorted runs allowed per non-L0 level under Tiered
+  // Maximum number of SSTable files allowed per non-L0 ST-tiered level
   // (experimental_st_compaction_l1_l2_tiered) compaction before triggering an
-  // intra-level merge. The merge selects runs with the highest time+spatial
-  // overlap (ST-aware) to maximize pruning efficiency. Merged runs stay in
+  // intra-level merge. The merge selects files with the highest time+spatial
+  // overlap (ST-aware) to maximize pruning efficiency. Merged files stay in
   // the same level (no cross-level read). 0 = unlimited (pure Tiered, never
-  // trigger intra-level merge). Default: 4.
+  // trigger intra-level merge). Default: 16.
   //
   // Dynamically changeable through SetOptions() API
-  int experimental_st_compaction_tiered_max_runs_per_level = 4;
-  // When true, enable STFP-specific compaction triggers: intra-level
-  // neighbor merge (Trigger A), bloated-file push-down (Trigger B), and
-  // ST-aware run-count merge. Only effective when l1_l2_tiered and
-  // real_tiered_l1_l2 are both true. Set to false for pure Hybrid or
-  // All-Tiered to isolate STFP's contribution.
+  int experimental_st_compaction_tiered_max_runs_per_level = 16;
+  // Historical STFP gate. Kept for option compatibility; same-level ST
+  // compaction is now controlled by the file-count threshold above, while
+  // level-capacity compaction moves the whole level downward.
   //
   // Dynamically changeable through SetOptions() API
   bool experimental_st_compaction_stfp_enable = false;

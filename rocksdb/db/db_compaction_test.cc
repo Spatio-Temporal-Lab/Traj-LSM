@@ -1369,7 +1369,7 @@ TEST_F(DBCompactionTest, ZeroSeqIdCompaction) {
   ASSERT_OK(Put("", ""));
 }
 
-TEST_F(DBCompactionTest, STRunCountSchedulesBelowCapacity) {
+TEST_F(DBCompactionTest, STFileCountSchedulesSameLevelBelowCapacity) {
   Options options = CurrentOptions();
   options.compaction_style = kCompactionStyleLevel;
   options.level_compaction_dynamic_level_bytes = false;
@@ -1380,20 +1380,20 @@ TEST_F(DBCompactionTest, STRunCountSchedulesBelowCapacity) {
   options.experimental_st_compaction = true;
   options.experimental_st_compaction_l1_l2_tiered = true;
   options.experimental_st_compaction_stfp_enable = false;
-  for (int max_runs : {4, 8}) {
+  for (int file_count_limit : {4, 8}) {
     DestroyAndReopen(options);
     ASSERT_OK(dbfull()->SetOptions({
         {"experimental_st_compaction_real_tiered_l1_l2", "true"},
         {"experimental_st_compaction_tiered_max_runs_per_level",
-         std::to_string(max_runs)},
+         std::to_string(file_count_limit)},
     }));
-    for (int file_index = 0; file_index <= max_runs; ++file_index) {
+    for (int file_index = 0; file_index <= file_count_limit; ++file_index) {
       ASSERT_OK(Put(Key(file_index), "value"));
       ASSERT_OK(Flush());
       MoveFilesToLevel(1);
     }
     ASSERT_EQ(0, NumTableFilesAtLevel(0));
-    ASSERT_EQ(max_runs + 1, NumTableFilesAtLevel(1));
+    ASSERT_EQ(file_count_limit + 1, NumTableFilesAtLevel(1));
     ASSERT_EQ(0, NumTableFilesAtLevel(2));
     ASSERT_TRUE(db_->GetOptions().experimental_st_compaction_real_tiered_l1_l2);
     uint64_t pending = 0;
@@ -1406,12 +1406,12 @@ TEST_F(DBCompactionTest, STRunCountSchedulesBelowCapacity) {
     ASSERT_TRUE(db_->GetOptions().experimental_st_compaction_real_tiered_l1_l2);
     ASSERT_OK(dbfull()->SetOptions(
         {{"experimental_st_compaction_tiered_max_runs_per_level",
-          std::to_string(max_runs)}}));
+          std::to_string(file_count_limit)}}));
     ASSERT_OK(dbfull()->SetOptions({{"disable_auto_compactions", "false"}}));
     ASSERT_OK(dbfull()->TEST_WaitForCompact());
-    ASSERT_LE(NumTableFilesAtLevel(1), max_runs);
-    ASSERT_GT(NumTableFilesAtLevel(2), 0);
-    for (int file_index = 0; file_index <= max_runs; ++file_index) {
+    ASSERT_LE(NumTableFilesAtLevel(1), file_count_limit);
+    ASSERT_EQ(0, NumTableFilesAtLevel(2));
+    for (int file_index = 0; file_index <= file_count_limit; ++file_index) {
       ASSERT_EQ("value", Get(Key(file_index)));
     }
     ASSERT_TRUE(db_->GetIntProperty("rocksdb.compaction-pending", &pending));

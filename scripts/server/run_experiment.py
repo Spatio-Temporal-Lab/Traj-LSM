@@ -15,21 +15,29 @@ def main():
     parser.add_argument("--data-root", type=Path, default=ROOT.parent / "data")
     parser.add_argument("--dataset", choices=["shared", "td_wx", "processed/smoke", "processed/base", "processed/expanded"], default="processed/base")
     parser.add_argument("--bin-dir", type=Path, default=ROOT / "build-server" / "bin")
-    parser.add_argument("--runs", type=int, choices=[0, 4, 8], default=4)
+    parser.add_argument("--file-count", type=int, default=16,
+                        help="Maximum SSTable files allowed in a non-L0 ST level before same-level merge; 0 disables it")
+    parser.add_argument("--runs", type=int, choices=[0, 4, 8, 12, 16],
+                        help="Compatibility alias for --file-count")
     parser.add_argument("--bucket-sec", type=int, default=3600)
     parser.add_argument("--block-size", type=int, default=32768)
     parser.add_argument("--block-compaction-ratio", type=float, default=0.3)
     parser.add_argument("--trigger-ratio", type=float, default=0.9)
     parser.add_argument("--level-base-mib", type=int, default=1024)
-    parser.add_argument("--stfp", action="store_true", help="Enable the independent Trigger A mechanism")
+    parser.add_argument("--stfp", action="store_true",
+                        help="Compatibility flag for older scripts; current ST-compaction uses file-count and capacity triggers")
     parser.add_argument("--max-rows", type=int)
     parser.add_argument("--max-windows", type=int)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.runs is not None:
+        args.file_count = args.runs
     if args.bucket_sec <= 0 or args.block_size <= 0 or args.level_base_mib <= 0 or args.repeats <= 0:
         parser.error("bucket, block, capacity and repeat values must be positive")
+    if args.file_count < 0:
+        parser.error("file-count must be non-negative")
     if not 0 < args.trigger_ratio <= 1 or not 0 <= args.block_compaction_ratio <= 1:
         parser.error("trigger ratio must be in (0, 1], block ratio in [0, 1]")
     if args.max_windows is not None and args.max_windows <= 0:
@@ -42,7 +50,7 @@ def main():
         if not required.is_file():
             parser.error(f"Missing input: {required}")
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    output = (args.output or ROOT / "results" / f"{args.dataset.replace('/', '_')}-R{args.runs}-{stamp}").resolve()
+    output = (args.output or ROOT / "results" / f"{args.dataset.replace('/', '_')}-F{args.file_count}-{stamp}").resolve()
     if output.exists():
         parser.error(f"Output already exists; choose a fresh directory: {output}")
     suffix = ".exe" if os.name == "nt" else ""
@@ -52,7 +60,7 @@ def main():
                  "--segment-points-csv", str(points), "--user-key-schema", "e7",
                  "--bucket-sec", str(args.bucket_sec), "--block-size", str(args.block_size),
                  "--experimental-st-compaction", "--st-l1-l2-tiered", "--st-real-tiered",
-                 "--st-tiered-max-runs-per-level", str(args.runs),
+                 "--st-tiered-max-runs-per-level", str(args.file_count),
                  "--max-level-bytes-mb", str(args.level_base_mib),
                  "--st-set-opt", f"experimental_st_compaction_level_trigger_ratio={args.trigger_ratio}",
                  "--st-set-opt", f"experimental_st_block_compaction_ratio={args.block_compaction_ratio}",
