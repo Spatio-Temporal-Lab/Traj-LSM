@@ -584,7 +584,7 @@ int main(int argc, char** argv) {
     std::string label, path;
     bool tiered_on, real_tiered;
     int tiered_max_level;
-    int tiered_max_runs;
+    double level_trigger_ratio;
   };
 
   std::vector<DbConfig> db_configs;
@@ -592,7 +592,7 @@ int main(int argc, char** argv) {
   if (!db_tiered.empty())  db_configs.push_back({"Tiered",  db_tiered,  true,  true,  0, 0});
   if (!db_hybrid1.empty()) db_configs.push_back({"Hybrid1", db_hybrid1, true,  true,  1, 0});
   if (!db_hybrid2.empty()) db_configs.push_back({"Hybrid2", db_hybrid2, true,  true,  2, 0});
-  if (!db_stfr.empty())    db_configs.push_back({"STFR",    db_stfr,    true,  true,  0, 6});
+  if (!db_stfr.empty())    db_configs.push_back({"STFR",    db_stfr,    true,  true,  0, 0.8});
 
   struct DbInfo {
     std::string label, path;
@@ -621,8 +621,8 @@ int main(int argc, char** argv) {
       }
       sopts["experimental_st_compaction_tiered_max_level"] =
           std::to_string(cfg.tiered_max_level);
-      sopts["experimental_st_compaction_tiered_max_runs_per_level"] =
-          std::to_string(cfg.tiered_max_runs);
+      sopts["experimental_st_compaction_level_trigger_ratio"] =
+          std::to_string(cfg.level_trigger_ratio);
     }
     info.db->SetOptions(sopts);
     std::cout << "  " << cfg.label << " opened, options applied\n";

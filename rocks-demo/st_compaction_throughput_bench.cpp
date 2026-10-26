@@ -61,7 +61,7 @@ struct Config {
   bool   tiered_on;       // experimental_st_compaction
   bool   real_tiered;     // experimental_st_compaction_real_tiered_l1_l2
   int    tiered_max_level; // -1 = all levels
-  int    max_runs;         // tiered_max_runs_per_level (0=unlimited)
+  double trigger_ratio;
   bool   stfp_enable;      // experimental_st_compaction_stfp_enable
 };
 
@@ -313,14 +313,13 @@ static void ApplyOptions(rst::Options& o, const Config& cfg,
   o.experimental_st_compaction_tiered_max_level = 0;
   o.experimental_st_compaction_tiered_min_level = 0;
   o.experimental_st_compaction_real_tiered_l1_l2 = false;
-  o.experimental_st_compaction_tiered_max_runs_per_level = cfg.max_runs;
-  o.experimental_st_compaction_level_trigger_ratio = 0.9;
+  o.experimental_st_compaction_level_trigger_ratio = cfg.trigger_ratio;
   o.experimental_compaction_event_time_max_span = 86400;  // 24h, basically no time-cut
   o.experimental_compaction_event_time_split = true;       // enable SST key-count cut
   o.experimental_compaction_event_time_bucket_width = 3600;  // 1h bucket for split tracking
-  o.experimental_compaction_event_time_max_point_keys = 0;  // no global cap, use per-level policy
+  o.experimental_compaction_event_time_max_point_keys = 0;  // no record-count cut
   o.level_compaction_dynamic_level_bytes = false;  // required by event_time_split
-  o.level0_file_num_compaction_trigger = 1;  // trigger L0→L1 immediately
+  o.level0_file_num_compaction_trigger = 4;  // batch L0 files, matching ingestion
   o.target_file_size_base = 64ULL << 20;     // 64 MB SST files
   o.max_bytes_for_level_base = 1ULL << 30;
   o.max_bytes_for_level_multiplier = 10;
@@ -386,8 +385,8 @@ static Result Run(const std::string& root, const Config& cfg,
         std::to_string(cfg.tiered_max_level);
     sopts["experimental_st_compaction_real_tiered_l1_l2"] =
         cfg.real_tiered ? "true" : "false";
-    sopts["experimental_st_compaction_tiered_max_runs_per_level"] =
-        std::to_string(cfg.max_runs);
+    sopts["experimental_st_compaction_level_trigger_ratio"] =
+        std::to_string(cfg.trigger_ratio);
     // STFP triggers only for STFP variants, not Hybrid
     sopts["experimental_st_compaction_stfp_enable"] =
         (cfg.stfp_enable ? "true" : "false");
@@ -836,14 +835,14 @@ int main(int argc, char** argv) {
 
   // ── Compaction strategies ──
   Config cfgs[] = {
-    // {label,              tiered_on, real_tiered, max_level, max_runs, stfp_enable}
-    {"All-Leveled",         false,     false,        0,         0,         false},
-    {"All-Tiered(R4)",      true,      true,        -1,         4,         false},
-    {"Hybrid-L1(R4)",       true,      true,         1,         4,         false},
-    {"Hybrid-L1+L2(R4)",    true,      true,         2,         4,         false},
-    {"STFP-R4",             true,      true,        -1,         4,         true},
-    {"STFP-R6",             true,      true,        -1,         6,         true},
-    {"STFP-R8",             true,      true,        -1,         8,         true},
+    // {label,              tiered_on, real_tiered, max_level, trigger_ratio, stfp_enable}
+    {"All-Leveled",         false,     false,        0,         0.0,       false},
+    {"All-Tiered",          true,      true,        -1,         0.0,       false},
+    {"Hybrid-L1",            true,      true,         1,         0.8,       false},
+    {"Hybrid-L1+L2",         true,      true,         2,         0.8,       false},
+    {"STFP-ratio60",         true,      true,        -1,         0.6,       true},
+    {"STFP-ratio80",         true,      true,        -1,         0.8,       true},
+    {"STFP-ratio90",         true,      true,        -1,         0.9,       true},
   };
   const int N = sizeof(cfgs) / sizeof(cfgs[0]);
   // results[config_idx][repeat_idx]

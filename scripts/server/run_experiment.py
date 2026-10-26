@@ -22,7 +22,6 @@ def main():
     parser.add_argument("--bucket-sec", type=int, default=3600)
     parser.add_argument("--block-size", type=int, default=32768)
     parser.add_argument("--block-compaction-ratio", type=float, default=0.3)
-    parser.add_argument("--trigger-ratio", type=float, default=0.9)
     parser.add_argument("--level-base-mib", type=int, default=1024)
     parser.add_argument("--stfp", action="store_true",
                         help="Compatibility flag for older scripts; current ST-compaction uses file-count and capacity triggers")
@@ -38,8 +37,8 @@ def main():
         parser.error("bucket, block, capacity and repeat values must be positive")
     if args.file_count < 0:
         parser.error("file-count must be non-negative")
-    if not 0 < args.trigger_ratio <= 1 or not 0 <= args.block_compaction_ratio <= 1:
-        parser.error("trigger ratio must be in (0, 1], block ratio in [0, 1]")
+    if not 0 <= args.block_compaction_ratio <= 1:
+        parser.error("block ratio must be in [0, 1]")
     if args.max_windows is not None and args.max_windows <= 0:
         parser.error("max-windows must be positive")
     dataset = args.data_root.resolve() / args.dataset
@@ -62,7 +61,6 @@ def main():
                  "--experimental-st-compaction", "--st-l1-l2-tiered", "--st-real-tiered",
                  "--st-tiered-max-runs-per-level", str(args.file_count),
                  "--max-level-bytes-mb", str(args.level_base_mib),
-                 "--st-set-opt", f"experimental_st_compaction_level_trigger_ratio={args.trigger_ratio}",
                  "--st-set-opt", f"experimental_st_block_compaction_ratio={args.block_compaction_ratio}",
                  "--st-set-opt", f"experimental_st_compaction_stfp_enable={str(args.stfp).lower()}",
                  "--out-sst-dir", str(output / "sst"), "--target-db", str(output / "db")]]

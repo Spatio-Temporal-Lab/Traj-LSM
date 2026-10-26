@@ -86,7 +86,8 @@ Status DecodeSpatioTemporalIndexTail(Slice* input,
       return Status::Corruption("bad prefix_max_t_end");
     }
   } else {
-    meta->prefix_max_t_end = 0;
+    // Unknown legacy prefix must never authorize skipping earlier blocks.
+    meta->prefix_max_t_end = UINT32_MAX;
   }
   return Status::OK();
 }

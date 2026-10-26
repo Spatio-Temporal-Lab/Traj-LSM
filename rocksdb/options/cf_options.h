@@ -155,8 +155,6 @@ struct MutableCFOptions {
         experimental_st_block_mbr_flush_enable(
             options.experimental_st_block_mbr_flush_enable),
         experimental_st_compaction(options.experimental_st_compaction),
-        experimental_st_compaction_level_trigger_ratio(
-            options.experimental_st_compaction_level_trigger_ratio),
         experimental_st_compaction_l1_l2_tiered(
             options.experimental_st_compaction_l1_l2_tiered),
         experimental_st_compaction_tiered_max_level(
@@ -165,8 +163,10 @@ struct MutableCFOptions {
             options.experimental_st_compaction_tiered_min_level),
         experimental_st_compaction_real_tiered_l1_l2(
             options.experimental_st_compaction_real_tiered_l1_l2),
-        experimental_st_compaction_tiered_max_runs_per_level(
-            options.experimental_st_compaction_tiered_max_runs_per_level),
+        experimental_st_compaction_alpha(
+            options.experimental_st_compaction_alpha),
+        experimental_st_compaction_level_trigger_ratio(
+            options.experimental_st_compaction_level_trigger_ratio),
         experimental_st_compaction_stfp_enable(
             options.experimental_st_compaction_stfp_enable),
         disable_auto_compactions(options.disable_auto_compactions),
@@ -266,12 +266,12 @@ struct MutableCFOptions {
         experimental_st_block_compaction_ratio(0.0),
         experimental_st_block_mbr_flush_enable(true),
         experimental_st_compaction(false),
-        experimental_st_compaction_level_trigger_ratio(0.9),
         experimental_st_compaction_l1_l2_tiered(false),
         experimental_st_compaction_tiered_max_level(0),
         experimental_st_compaction_tiered_min_level(0),
         experimental_st_compaction_real_tiered_l1_l2(false),
-        experimental_st_compaction_tiered_max_runs_per_level(4),
+        experimental_st_compaction_alpha(0.5),
+        experimental_st_compaction_level_trigger_ratio(0.8),
         experimental_st_compaction_stfp_enable(false),
         disable_auto_compactions(false),
         soft_pending_compaction_bytes_limit(0),
@@ -384,12 +384,12 @@ struct MutableCFOptions {
   double experimental_st_block_compaction_ratio;
   bool experimental_st_block_mbr_flush_enable;
   bool experimental_st_compaction;
-  double experimental_st_compaction_level_trigger_ratio;
   bool experimental_st_compaction_l1_l2_tiered;
   int experimental_st_compaction_tiered_max_level;
   int experimental_st_compaction_tiered_min_level;
   bool experimental_st_compaction_real_tiered_l1_l2;
-  int experimental_st_compaction_tiered_max_runs_per_level;
+  double experimental_st_compaction_alpha;
+  double experimental_st_compaction_level_trigger_ratio;
   bool experimental_st_compaction_stfp_enable;
 
   // Compaction related options

@@ -33,6 +33,11 @@ rocksdb/.github/
 
 # Experiment helper trees and non-code materials
 /tools/
+!/tools/
+tools/*
+!/tools/benchmark/
+tools/benchmark/*
+!/tools/benchmark/run_local_st_compaction_ablation.ps1
 /docs/
 /paper/
 /CLAUDE.md
@@ -102,5 +107,22 @@ Desktop.ini
 ~$*.xlsx
 
 # Temp / log files
+/rocks-demo/build_audit/
 *.log
 hs_err_pid*.log
+
+# Publication: source and experiment scripts only
+/tmp/
+/stlsm_tikv/
+/build-server*/
+/.claude/
+/st_verify_inventory.txt
+/ST-LSM*.txt
+*.tgz
+*.tex
+*.pdf
+*.docx
+
+
+# Keep all tools scripts local
+/tools/

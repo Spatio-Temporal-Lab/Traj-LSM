@@ -297,6 +297,9 @@ struct BlockBasedTableOptions {
   // carries block-local spatio-temporal metadata in the index block value.
   bool experimental_spatio_temporal_meta_in_index_value = true;
 
+  bool experimental_st_index_block_enable = false;
+  uint32_t experimental_st_index_bucket_seconds = 3600;
+
   // The index type that will be used for the data block.
   enum DataBlockIndexType : char {
     kDataBlockBinarySearch = 0,   // traditional block type

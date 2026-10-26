@@ -115,7 +115,7 @@ class CompactionPicker {
   // Free up the files that participated in a compaction
   //
   // Requirement: DB mutex held
-  void ReleaseCompactionFiles(Compaction* c, const Status& status);
+  virtual void ReleaseCompactionFiles(Compaction* c, const Status& status);
 
   // Returns true if any one of the specified files are being compacted
   bool AreFilesInCompaction(const std::vector<FileMetaData*>& files);

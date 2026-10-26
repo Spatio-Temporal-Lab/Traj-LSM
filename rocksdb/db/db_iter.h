@@ -318,7 +318,6 @@ class DBIter final : public Iterator {
   bool IsVisible(SequenceNumber sequence, const Slice& ts,
                  bool* more_recent = nullptr);
 
-  bool StQueryDedupAcceptUserKey(const Slice& user_key, const Slice& value);
 
   // Temporarily pin the blocks that we encounter until ReleaseTempPinnedData()
   // is called
@@ -594,8 +593,6 @@ class DBIter final : public Iterator {
   bool allow_unprepared_value_;
   bool is_blob_;
   bool arena_mode_;
-  const bool st_query_dedup_enable_;
-  StQuerySegmentUidDedup* const st_query_segment_uid_dedup_;
 
   SequenceNumber range_tomb_max_seq_;
   IterKey range_tomb_first_key_;

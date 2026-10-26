@@ -27,6 +27,12 @@ def main():
         parser.error("Upload directory must not overlap the input data or contain the repository")
     tracked = git("ls-files", "-z", "--", "rocksdb", "rocks-demo").decode("utf-8").split("\0")
     sources = [(ROOT / relative, Path("STLSM") / relative) for relative in tracked if relative]
+    # The server build includes this regression tool while it is being developed
+    # locally, before it is necessarily committed. Keep the source package
+    # self-contained for staged server compilation.
+    regression = ROOT / "rocks-demo" / "st_design_regression.cpp"
+    if regression.is_file() and not any(source == regression for source, _ in sources):
+        sources.append((regression, Path("STLSM/rocks-demo/st_design_regression.cpp")))
     sources.extend((source, Path("STLSM") / source.relative_to(ROOT))
                    for source in sorted((ROOT / "scripts" / "server").rglob("*"))
                    if source.is_file() and "__pycache__" not in source.parts)

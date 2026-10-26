@@ -940,7 +940,8 @@ class Version {
   void AddIteratorsForLevel(const ReadOptions& read_options,
                             const FileOptions& soptions,
                             MergeIteratorBuilder* merger_iter_builder,
-                            int level, bool allow_unprepared_value);
+                            int level, bool allow_unprepared_value,
+                            const StManifestSstFilterResult* file_filter);
 
   Status OverlapWithLevelIterator(const ReadOptions&, const FileOptions&,
                                   const Slice& smallest_user_key,

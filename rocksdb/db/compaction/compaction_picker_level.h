@@ -9,6 +9,9 @@
 
 #pragma once
 
+#include <mutex>
+#include <vector>
+
 #include "db/compaction/compaction_picker.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -33,6 +36,15 @@ class LevelCompactionPicker : public CompactionPicker {
   bool NeedsCompaction(
       const VersionStorageInfo* vstorage,
       const MutableCFOptions& mutable_cf_options) const override;
+  void ReleaseCompactionFiles(Compaction* c, const Status& status) override;
+  bool HasPendingSTIncomingFile(int level) const;
+  void ConsumePendingSTIncomingFile(int level);
+  void ClearPendingSTIncomingFiles(int level) const;
+  void RecordSTIncomingFiles(int level, size_t count);
+
+ private:
+  mutable std::mutex st_incoming_mutex_;
+  mutable std::vector<size_t> st_pending_incoming_files_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

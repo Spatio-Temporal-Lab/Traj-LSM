@@ -393,7 +393,6 @@ class VersionBuilder::Rep {
         version_edit_handler_(other.version_edit_handler_),
         track_found_and_missing_files_(other.track_found_and_missing_files_),
         allow_incomplete_valid_version_(other.allow_incomplete_valid_version_),
-        idempotent_manifest_file_edits_(other.idempotent_manifest_file_edits_),
         found_files_(other.found_files_),
         l0_missing_files_(other.l0_missing_files_),
         non_l0_missing_files_(other.non_l0_missing_files_),
@@ -402,6 +401,7 @@ class VersionBuilder::Rep {
         missing_blob_files_(other.missing_blob_files_),
         valid_version_available_(other.valid_version_available_),
         edited_in_atomic_group_(other.edited_in_atomic_group_),
+        idempotent_manifest_file_edits_(other.idempotent_manifest_file_edits_),
         version_updated_since_last_check_(
             other.version_updated_since_last_check_) {
     assert(ioptions_);

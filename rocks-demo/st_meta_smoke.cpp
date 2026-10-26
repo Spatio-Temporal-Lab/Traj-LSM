@@ -479,7 +479,6 @@ static int RunSegmentMetaCsvStKey(const std::string& csv_path,
 
   int64_t written = 0;
   int64_t logical_segments = 0;
-  uint64_t cross_bucket_replica_extra = 0;
   std::string line;
   while (std::getline(in, line)) {
     if (line.empty()) {
@@ -570,7 +569,6 @@ static int RunSegmentMetaCsvStKey(const std::string& csv_path,
 
   std::cout << "Wrote " << written << " kv rows (" << logical_segments
             << " logical segments"
-            << " cross_bucket_replica_extra=" << cross_bucket_replica_extra
             << ") segment ST keys + V2 value to " << db_path << "\n";
 
   // Spot verification by replaying the same rows.

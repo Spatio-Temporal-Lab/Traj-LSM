@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -69,75 +68,6 @@ inline bool IsStDesignSegmentUserKey(const Slice& user_key) {
   return IsE7SegmentUserKey(user_key) || IsTmanStSegmentUserKey(user_key);
 }
 
-// Logical segment id for cross-bucket dedup (Mind.md); excludes bucket_id.
-struct StSegmentUid {
-  uint64_t vehicle_id = 0;
-  uint32_t segment_seq = 0;
-  uint16_t chunk_seq = 0;
-
-  bool operator==(const StSegmentUid& other) const {
-    return vehicle_id == other.vehicle_id &&
-           segment_seq == other.segment_seq && chunk_seq == other.chunk_seq;
-  }
-};
-
-struct StSegmentUidHash {
-  size_t operator()(const StSegmentUid& u) const {
-    return std::hash<uint64_t>{}(u.vehicle_id) ^
-           (std::hash<uint32_t>{}(u.segment_seq) << 1) ^
-           (std::hash<uint16_t>{}(u.chunk_seq) << 2);
-  }
-};
-
-// Decodes segment_uid from E7 user key bytes [13:27).
-inline bool TryDecodeE7SegmentUid(const Slice& user_key, StSegmentUid* uid) {
-  if (uid == nullptr || !IsE7SegmentUserKey(user_key)) {
-    return false;
-  }
-  const char* p = user_key.data();
-  uint64_t vid = 0;
-  for (int i = 0; i < 8; ++i) {
-    vid = (vid << 8) | static_cast<unsigned char>(p[13 + i]);
-  }
-  const uint32_t seg =
-      (static_cast<uint32_t>(static_cast<unsigned char>(p[21])) << 24) |
-      (static_cast<uint32_t>(static_cast<unsigned char>(p[22])) << 16) |
-      (static_cast<uint32_t>(static_cast<unsigned char>(p[23])) << 8) |
-      static_cast<uint32_t>(static_cast<unsigned char>(p[24]));
-  const uint16_t chunk =
-      static_cast<uint16_t>(
-          (static_cast<unsigned char>(p[25]) << 8) |
-          static_cast<unsigned char>(p[26]));
-  uid->vehicle_id = vid;
-  uid->segment_seq = seg;
-  uid->chunk_seq = chunk;
-  return true;
-}
-
-// Per-query dedup: prefer host-bucket E7 key (floor(t_start/W) from value), else first
-// seen in iteration order (Mind.md P0).
-struct StQuerySegmentUidDedup {
-  struct Entry {
-    uint32_t kept_bucket_id = 0;
-    bool kept_is_host = false;
-  };
-  std::unordered_map<StSegmentUid, Entry, StSegmentUidHash> seen;
-  uint32_t bucket_width_sec = kSpatioTemporalE7DefaultBucketSeconds;
-  uint64_t dedup_skipped = 0;
-
-  // Returns true if the key should be emitted; false if duplicate segment_uid.
-  bool AcceptEmitUserKey(const Slice& user_key, const Slice& value);
-
-  inline bool AcceptEmitUserKey(const Slice& user_key) {
-    return AcceptEmitUserKey(user_key, Slice());
-  }
-
-  void Reset() {
-    seen.clear();
-    dedup_skipped = 0;
-  }
-};
-
 struct SpatioTemporalPoint {
   float x = 0.f;
   float y = 0.f;
@@ -170,14 +100,14 @@ void BuildBitmapFromPoints(const std::vector<SpatioTemporalPoint>& points,
 // E7 host calendar bucket_id from key bytes [1:5) big-endian.
 bool TryDecodeE7HostBucketId(const Slice& user_key, uint32_t* bucket_id);
 
-// Host calendar bucket floor(t_start / bucket_width) from segment value header.
-// bucket_width_sec==0 uses kSpatioTemporalE7DefaultBucketSeconds.
-bool TryDecodeE7HostBucketFromValue(const Slice& value, uint32_t bucket_width_sec,
-                                    uint32_t* host_bucket);
+bool TryDecodeSegmentValueStartTime(const Slice& value, uint32_t* t_start);
+
 
 // Decodes Event Time `t_sec` from a spatio-temporal user key (magic 0xE5).
 // Returns false if the key is too short or not an ST user key.
-bool TryDecodeSpatioTemporalUserKeyTime(const Slice& user_key, uint32_t* t_sec);
+bool TryDecodeSpatioTemporalUserKeyTime(
+    const Slice& user_key, uint32_t* t_sec,
+    uint32_t bucket_width_sec = kSpatioTemporalE7DefaultBucketSeconds);
 
 // True if the key decodes as an ST user key and its (t,x,y) point is
 // axis-disjoint from the prune window (same test as block/file MBR vs window).

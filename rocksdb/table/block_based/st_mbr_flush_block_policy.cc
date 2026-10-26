@@ -88,6 +88,7 @@ class StMbrFlushBlockPolicy : public RetargetableFlushBlockPolicy {
   bool Update(const Slice& key, const Slice& value) override {
     if (data_block_builder_->empty()) {
       tracker_valid_ = false;
+      tracker_entries_ = 0;
       tracker_first_bucket_id_ = 0;
       tracker_last_bucket_id_ = 0;
       tracker_mbr_ = {};
@@ -118,12 +119,14 @@ class StMbrFlushBlockPolicy : public RetargetableFlushBlockPolicy {
         tracker_first_bucket_id_ = pending_first_bucket_id_;
         tracker_last_bucket_id_ = pending_first_bucket_id_;
         tracker_mbr_ = pending_first_mbr_;
+        tracker_entries_ = 1;
         pending_first_valid_ = false;
       } else {
         tracker_valid_ = true;
         tracker_first_bucket_id_ = bucket_id;
         tracker_last_bucket_id_ = bucket_id;
         tracker_mbr_ = incoming;
+        tracker_entries_ = 1;
       }
     }
 
@@ -149,13 +152,19 @@ class StMbrFlushBlockPolicy : public RetargetableFlushBlockPolicy {
     const double new_area = ComputeSpatialArea(merged);
     const double expansion =
         (new_area - old_area) / std::max(old_area, kAreaEps);
-    if (expansion_ratio_ > 0.0 && expansion >= expansion_ratio_) {
+    // Keep at least two trajectories in a block when the ordinary block-size
+    // policy permits it. MBR expansion is a boundary signal after the block
+    // has accumulated data; applying it to the first trajectory would create
+    // one-trajectory fragments for zero-area or very small MBRs.
+    if (expansion_ratio_ > 0.0 && tracker_entries_ >= 2 &&
+        expansion >= expansion_ratio_) {
       pending_first_valid_ = false;
       SeedTrackerFromIncomingMeta(bucket_id, incoming);
       return true;
     }
 
     tracker_mbr_ = merged;
+    ++tracker_entries_;
     return false;
   }
 
@@ -199,6 +208,7 @@ class StMbrFlushBlockPolicy : public RetargetableFlushBlockPolicy {
   void SeedTrackerFromIncomingMeta(uint32_t bucket_id,
                                    const SpatioTemporalBlockMeta& incoming) {
     tracker_valid_ = true;
+    tracker_entries_ = 1;
     tracker_first_bucket_id_ = bucket_id;
     tracker_last_bucket_id_ = bucket_id;
     tracker_mbr_ = incoming;
@@ -207,6 +217,7 @@ class StMbrFlushBlockPolicy : public RetargetableFlushBlockPolicy {
   const double expansion_ratio_;
   std::unique_ptr<FlushBlockPolicy> size_policy_;
   bool tracker_valid_ = false;
+  uint32_t tracker_entries_ = 0;
   uint32_t tracker_first_bucket_id_ = 0;
   uint32_t tracker_last_bucket_id_ = 0;
   SpatioTemporalBlockMeta tracker_mbr_{};

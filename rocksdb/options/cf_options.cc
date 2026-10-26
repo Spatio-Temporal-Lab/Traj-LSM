@@ -745,11 +745,6 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct MutableCFOptions, experimental_st_compaction),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
-        {"experimental_st_compaction_level_trigger_ratio",
-         {offsetof(struct MutableCFOptions,
-                   experimental_st_compaction_level_trigger_ratio),
-          OptionType::kDouble, OptionVerificationType::kNormal,
-          OptionTypeFlags::kMutable}},
         {"experimental_st_compaction_l1_l2_tiered",
          {offsetof(struct MutableCFOptions,
                    experimental_st_compaction_l1_l2_tiered),
@@ -765,14 +760,19 @@ static std::unordered_map<std::string, OptionTypeInfo>
                    experimental_st_compaction_real_tiered_l1_l2),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
+        {"experimental_st_compaction_alpha",
+         {offsetof(struct MutableCFOptions,
+                   experimental_st_compaction_alpha),
+          OptionType::kDouble, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
+        {"experimental_st_compaction_level_trigger_ratio",
+         {offsetof(struct MutableCFOptions,
+                   experimental_st_compaction_level_trigger_ratio),
+          OptionType::kDouble, OptionVerificationType::kNormal,
+          OptionTypeFlags::kMutable}},
         {"experimental_st_compaction_tiered_min_level",
          {offsetof(struct MutableCFOptions,
                    experimental_st_compaction_tiered_min_level),
-          OptionType::kInt, OptionVerificationType::kNormal,
-          OptionTypeFlags::kMutable}},
-        {"experimental_st_compaction_tiered_max_runs_per_level",
-         {offsetof(struct MutableCFOptions,
-                   experimental_st_compaction_tiered_max_runs_per_level),
           OptionType::kInt, OptionVerificationType::kNormal,
           OptionTypeFlags::kMutable}},
         {"experimental_st_compaction_stfp_enable",
@@ -1409,19 +1409,18 @@ void MutableCFOptions::Dump(Logger* log) const {
                  experimental_st_block_compaction_ratio);
   ROCKS_LOG_INFO(log, " experimental_st_compaction: %d",
                  static_cast<int>(experimental_st_compaction));
-  ROCKS_LOG_INFO(log,
-                 " experimental_st_compaction_level_trigger_ratio: %lf",
-                 experimental_st_compaction_level_trigger_ratio);
   ROCKS_LOG_INFO(log, " experimental_st_compaction_l1_l2_tiered: %d",
                  static_cast<int>(experimental_st_compaction_l1_l2_tiered));
   ROCKS_LOG_INFO(log, " experimental_st_compaction_real_tiered_l1_l2: %d",
                  static_cast<int>(experimental_st_compaction_real_tiered_l1_l2));
+  ROCKS_LOG_INFO(log, " experimental_st_compaction_alpha: %f",
+                 experimental_st_compaction_alpha);
+  ROCKS_LOG_INFO(log, " experimental_st_compaction_level_trigger_ratio: %f",
+                 experimental_st_compaction_level_trigger_ratio);
   ROCKS_LOG_INFO(log, " experimental_st_compaction_tiered_max_level: %d",
                  static_cast<int>(experimental_st_compaction_tiered_max_level));
   ROCKS_LOG_INFO(log, " experimental_st_compaction_tiered_min_level: %d",
                  static_cast<int>(experimental_st_compaction_tiered_min_level));
-  ROCKS_LOG_INFO(log, " experimental_st_compaction_tiered_max_runs_per_level: %d",
-                 static_cast<int>(experimental_st_compaction_tiered_max_runs_per_level));
   ROCKS_LOG_INFO(log, "            experimental_st_compaction_stfp_enable: %d",
                  static_cast<int>(experimental_st_compaction_stfp_enable));
   ROCKS_LOG_INFO(log, "         bottommost_file_compaction_delay: %" PRIu32,

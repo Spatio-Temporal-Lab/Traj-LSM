@@ -1,5 +1,7 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -7,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -17,6 +20,7 @@
 #include <rocksdb/metadata.h>
 #include <rocksdb/options.h>
 #include <rocksdb/table.h>
+#include <rocksdb/write_batch.h>
 
 #include "segment_points_store.hpp"
 #include "segment_value_codec.hpp"
@@ -89,9 +93,9 @@ rocksdb::Options MakeDbOptions(bool create_if_missing,
     o.max_bytes_for_level_multiplier = 10;
     o.target_file_size_base = 64ULL << 20;
     o.target_file_size_multiplier = 1;
-    // Large memtable for unified EOF flush (avoid per-bucket micro-SST).
-    o.write_buffer_size = 256 * 1024 * 1024;
-    o.max_write_buffer_number = 4;
+    // Do not drain every flushed memtable immediately.  ST ingest batches
+    // several L0 files before the first L0->L1 compaction.
+    o.level0_file_num_compaction_trigger = 4;
   }
   if (max_level_bytes_mb > 0) {
     o.max_bytes_for_level_base =
@@ -99,6 +103,8 @@ rocksdb::Options MakeDbOptions(bool create_if_missing,
   }
   rocksdb::BlockBasedTableOptions tb;
   tb.experimental_spatio_temporal_meta_in_index_value = true;
+  tb.experimental_st_index_block_enable = true;
+  tb.experimental_st_index_bucket_seconds = bucket_sec;
   if (block_size > 0) {
     tb.block_size = block_size;
   }
@@ -128,13 +134,6 @@ static uint64_t StaticMaxBytesForLevel(const rocksdb::ColumnFamilyOptions& cf,
     prev = MultiplyUint64Cap(prev, add);
   }
   return prev;
-}
-
-static uint64_t ThresholdBytes(uint64_t budget, double ratio) {
-  if (ratio <= 0.0) return UINT64_MAX;
-  long double x = static_cast<long double>(budget) * static_cast<long double>(ratio);
-  if (x >= static_cast<long double>(UINT64_MAX)) return UINT64_MAX;
-  return static_cast<uint64_t>(x);
 }
 
 static void PrintSstCountPerLevel(
@@ -173,7 +172,7 @@ static rocksdb::Status StageDownNewestL0File(
     rocksdb::DB* db, rocksdb::ColumnFamilyHandle* cf,
     uint64_t manifest_host_bucket = std::numeric_limits<uint64_t>::max());
 
-// Mind.md L0: follow RocksDB file-count trigger (not L1+ 90% byte budget).
+// Mind.md L0: follow RocksDB file-count trigger (not L1+ 100% byte budget).
 static rocksdb::Status DrainL0WhenAtCompactionTrigger(
     rocksdb::DB* db, rocksdb::ColumnFamilyHandle* cf,
     const rocksdb::ColumnFamilyOptions& cf_opts, const char* reason,
@@ -227,16 +226,17 @@ static rocksdb::Status DrainL0AllFiles(
 }
 
 // Staged ST compaction (Mind.md):
-// 1) L0 -> L1: stage-down only (per-file), avoid multi-file merge at L0 stage.
-// 2) L>=1: compact whole level to L+1 when level_bytes >= ratio * MaxBytesForLevel(L).
+// L>=1: compact whole level to L+1 when level_bytes >= MaxBytesForLevel(L).
+// Callers drain L0 separately according to its count trigger, or fully at EOF.
 // Uses CompactFiles (manual, synchronous) — no generic background draining.
 static rocksdb::Status RunStCompactionFileLadder(
     rocksdb::DB* db, rocksdb::ColumnFamilyHandle* cf,
-    const rocksdb::Options& opts, double trigger_ratio,
+    const rocksdb::Options& opts,
     uint64_t max_steps = 500000,
     uint64_t manifest_host_bucket = std::numeric_limits<uint64_t>::max()) {
   const rocksdb::ColumnFamilyOptions& cf_opts = opts;
   rocksdb::CompactionOptions copts;
+  copts.output_file_size_limit = cf_opts.target_file_size_base;
   copts.st_manifest_host_bucket = manifest_host_bucket;
   const int max_level_index = static_cast<int>(cf_opts.num_levels) - 1;
   if (max_level_index < 1) {
@@ -248,20 +248,6 @@ static rocksdb::Status RunStCompactionFileLadder(
     rocksdb::ColumnFamilyMetaData cf_meta;
     db->GetColumnFamilyMetaData(cf, &cf_meta);
 
-    const rocksdb::LevelMetaData* l0 = FindLevelMeta(cf_meta, 0);
-    const size_t l0_n = (l0 != nullptr) ? l0->files.size() : 0;
-
-    if (l0_n > 0) {
-      // One newest L0 file per ladder step (flush-only ingest can leave hundreds of L0s;
-      // batching all into one step crashes with manifest-shard route).
-      std::cout << "ST ladder: StageDown newest L0 (live_l0=" << l0_n << ")\n";
-      rocksdb::Status cs = StageDownNewestL0File(db, cf, manifest_host_bucket);
-      if (!cs.ok()) {
-        return cs;
-      }
-      continue;
-    }
-
     bool progressed = false;
     for (int lev = 1; lev < max_level_index; ++lev) {
       const rocksdb::LevelMetaData* lx = FindLevelMeta(cf_meta, lev);
@@ -270,7 +256,7 @@ static rocksdb::Status RunStCompactionFileLadder(
       if (nf == 0) continue;
 
       const uint64_t budget = StaticMaxBytesForLevel(cf_opts, lev);
-      const uint64_t need = ThresholdBytes(budget, trigger_ratio);
+      const uint64_t need = budget;
       if (sz < need) continue;
 
       std::vector<std::string> inputs;
@@ -327,6 +313,8 @@ static rocksdb::Status ForceCompactWholeLevel(
     return rocksdb::Status::Corruption("level has files but no filenames");
   }
   rocksdb::CompactionOptions copts;
+  copts.output_file_size_limit =
+      db->GetOptions(cf).target_file_size_base;
   copts.st_manifest_host_bucket = manifest_host_bucket;
   std::cout << "ST force: CompactFiles L" << from_level << "->" << (from_level + 1)
             << " inputs=" << inputs.size() << " level_bytes=" << lx->size << "\n";
@@ -502,10 +490,9 @@ uint32_t RowMaxHostBucket(const MetaRowFields& row, uint32_t bucket_sec) {
 rocksdb::Status BuildKvsForMetaRow(
     const MetaRowFields& row,
     const std::vector<segval::SegmentPoint>& points, uint32_t bucket_sec,
-    bool cross_bucket_replicate, UserKeySchema user_key_schema,
+    UserKeySchema user_key_schema,
     const st_tman::StKeyBuildConfig* st_key_cfg,
-    const st_tman::TmanLocsKeyTable* tman_locs_keys, std::vector<Kv>* kvs,
-    uint64_t* cross_bucket_replica_extra) {
+    const st_tman::TmanLocsKeyTable* tman_locs_keys, std::vector<Kv>* kvs) {
   if (kvs == nullptr) {
     return rocksdb::Status::InvalidArgument("null kvs");
   }
@@ -543,24 +530,6 @@ rocksdb::Status BuildKvsForMetaRow(
     return rocksdb::Status::Corruption("EncodeSegmentValueV2 failed");
   }
 
-  if (cross_bucket_replicate) {
-    const auto [range_b0, range_b1] =
-        st_cross_bucket::IntersectingBucketRange(row.t_start, row.t_end, bucket_sec);
-    for (uint32_t host_bucket = range_b0; host_bucket <= range_b1; ++host_bucket) {
-      Kv replica;
-      replica.key = st_cross_bucket::SegmentKeyForHostBucket(
-          row.t_start, host_bucket, zorder_start, vehicle_id, segment_seq, chunk_seq,
-          bucket_sec);
-      replica.val = encoded;
-      kvs->push_back(std::move(replica));
-    }
-    if (cross_bucket_replica_extra != nullptr && range_b1 > range_b0) {
-      *cross_bucket_replica_extra +=
-          static_cast<uint64_t>(range_b1 - range_b0);
-    }
-    return rocksdb::Status::OK();
-  }
-
   Kv kv;
   if (user_key_schema == UserKeySchema::kTmanLocs) {
     if (tman_locs_keys == nullptr) {
@@ -587,14 +556,6 @@ rocksdb::Status BuildKvsForMetaRow(
   kv.val = encoded;
   kvs->push_back(std::move(kv));
   return rocksdb::Status::OK();
-}
-
-static double StCompactionTriggerRatio(const rocksdb::Options& opts) {
-  double r = opts.experimental_st_compaction_level_trigger_ratio;
-  if (!(r > 0.0 && r <= 1.0)) {
-    r = 0.9;
-  }
-  return r;
 }
 
 // Stage-down only the newest L0 SST (the one just flushed). Avoids scanning/compacting
@@ -635,9 +596,10 @@ static rocksdb::Status StageDownNewestL0File(
     return rocksdb::Status::OK();
   }
   rocksdb::CompactionOptions stage_opts;
-  // Single MANIFEST mode (no shard): allow trivial move so L0 files stack up
-  // as independent L1 SSTs without merging with existing L1 files.
-  // The L1→L2+ ladder with bucket-span policy will handle proper time-split.
+  stage_opts.output_file_size_limit =
+      db->GetOptions(cf).target_file_size_base;
+  // Permit a metadata-only move when RocksDB's overlap/compression checks
+  // allow it. This flag does not bypass merging with overlapping L1 files.
   stage_opts.allow_trivial_move = true;
   stage_opts.st_manifest_host_bucket = manifest_host_bucket;
   std::cout << "ST incremental: StageDown newest L0 file " << best_fn
@@ -703,8 +665,9 @@ static rocksdb::Status FlushAndMaybeRunStLadder(
     const char* reason, uint64_t ladder_max_steps, bool /*newest_l0_only*/,
     bool flush_only = false, uint64_t manifest_host_bucket =
         std::numeric_limits<uint64_t>::max()) {
+  const auto effective_opts = db->GetOptions(cf);
   rocksdb::FlushOptions fo;
-  fo.wait = true;
+  fo.wait = effective_opts.disable_auto_compactions;
   fo.st_manifest_host_bucket = manifest_host_bucket;
   rocksdb::Status s = db->Flush(fo);
   if (!s.ok()) {
@@ -717,8 +680,11 @@ static rocksdb::Status FlushAndMaybeRunStLadder(
   if (!experimental_st_compaction) {
     return rocksdb::Status::OK();
   }
-  const double ratio = StCompactionTriggerRatio(opts);
-  const auto& cf_opts = static_cast<const rocksdb::ColumnFamilyOptions&>(opts);
+  if (!effective_opts.disable_auto_compactions) {
+    return rocksdb::Status::OK();  // Background picker owns compaction.
+  }
+  const auto& cf_opts =
+      static_cast<const rocksdb::ColumnFamilyOptions&>(effective_opts);
   s = DrainL0WhenAtCompactionTrigger(db, cf, cf_opts, reason,
                                      /*max_rounds=*/32, manifest_host_bucket);
   if (!s.ok()) {
@@ -727,10 +693,10 @@ static rocksdb::Status FlushAndMaybeRunStLadder(
   if (ladder_max_steps == 0) {
     return rocksdb::Status::OK();
   }
-  // L1+: ladder steps (L0 handled one file per step inside RunStCompactionFileLadder).
+  // L1+ capacity work; sub-threshold L0 files remain until a later trigger/EOF.
   std::cout << "ST incremental: after Flush+L0 drain (" << reason
             << ") -> L1+ ladder max_steps=" << ladder_max_steps << "\n";
-  return RunStCompactionFileLadder(db, cf, opts, ratio, ladder_max_steps,
+  return RunStCompactionFileLadder(db, cf, effective_opts, ladder_max_steps,
                                  manifest_host_bucket);
 }
 
@@ -748,17 +714,17 @@ int main(int argc, char** argv) {
   bool stream_ingest = false;
   bool stream_ingest_flush_only = false;
   bool ingest_per_bucket_flush = false;
-  bool cross_bucket_replicate = false;
   bool batch_ingest = false;
   bool st_ladder_drain_only = false;
   bool force_l1_to_l2 = false;
   bool stream_flush_every_n_rows = false;
   bool stream_incremental_compact = false;
   int64_t flush_every_n_rows = 0;
+  int ingest_threads = 4;
   bool st_l1_l2_tiered = false;
   bool st_real_tiered = false;
   int st_tiered_max_level = 0;
-  int st_tiered_max_runs_per_level = 16;
+  double st_level_trigger_ratio = 0.8;
   std::vector<std::pair<std::string, std::string>> st_custom_opts;
   int max_level_bytes_mb = 0;
   uint64_t block_size = 0;
@@ -800,22 +766,20 @@ int main(int argc, char** argv) {
       if (eq != std::string::npos) {
         st_custom_opts.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
       }
-    } else if ((a == "--st-tiered-max-runs-per-level" ||
-                a == "--st-file-count") &&
-               i + 1 < argc) {
-      st_tiered_max_runs_per_level = std::stoi(argv[++i]);
+    } else if (a == "--st-level-trigger-ratio" && i + 1 < argc) {
+      st_level_trigger_ratio = std::stod(argv[++i]);
     } else if (a == "--max-level-bytes-mb" && i + 1 < argc) {
       max_level_bytes_mb = std::stoi(argv[++i]);
     } else if (a == "--block-size" && i + 1 < argc) {
       block_size = std::stoull(argv[++i]);
     } else if (a == "--stream-ingest") {
       stream_ingest = true;
+    } else if (a == "--ingest-threads" && i + 1 < argc) {
+      ingest_threads = std::stoi(argv[++i]);
     } else if (a == "--stream-ingest-flush-only") {
       stream_ingest_flush_only = true;
     } else if (a == "--per-bucket-flush") {
       ingest_per_bucket_flush = true;
-    } else if (a == "--cross-bucket-replicate") {
-      cross_bucket_replicate = true;
     } else if (a == "--batch-ingest") {
       batch_ingest = true;
     } else if (a == "--st-ladder-drain-only") {
@@ -852,12 +816,13 @@ int main(int argc, char** argv) {
              "  [--max-rows -1]\n"
              "  [--reset-out-sst-dir]\n"
              "  [--reset-target-db]\n"
-             "  [--cross-bucket-replicate]  legacy: full value in every intersecting bucket\n"
              "  [--experimental-st-compaction]\n"
+             "  [--st-level-trigger-ratio 0.8]  same-level merge trigger after upper-level SST arrival\n"
              "      ST ladder: synchronous CompactFiles (L0 per-file -> L1; Lx->Lx+1 when\n"
-             "      level_bytes >= ratio*MaxBytesForLevel). Default: one memtable stream/batch,\n"
+             "      level_bytes >= MaxBytesForLevel). Default: one memtable stream/batch,\n"
              "      EOF Flush + final ST L0 drain + L1+ ladder (no per-calendar-bucket SST).\n"
              "  [--stream-ingest]  row-by-row Put; default EOF unified flush (not per bucket)\n"
+             "  [--ingest-threads 4]  bounded parallel trajectory encode/write workers\n"
              "  [--stream-ingest-flush-only]  Flush only at EOF; ST ladder at EOF only\n"
              "  [--per-bucket-flush]  legacy: Flush+ST after each calendar bucket window\n"
              "  [--batch-ingest]   explicit batch mode (default if neither stream flag)\n"
@@ -865,7 +830,7 @@ int main(int argc, char** argv) {
              "  [--tman-st-keys-csv <segments_st_key.csv>]  required for tman_locs (LocSIndex from TMan-tsp)\n"
              "  [--st-ladder-drain-only]  open existing --target-db; L0 drain + L1+ ladder only\n"
              "  [--force-l1-to-l2]  with --st-ladder-drain-only: one L1->L2 CompactFiles first\n"
-             "      L0 drain uses level0_file_num_compaction_trigger (Mind.md; not L1 byte 90%).\n"
+             "      L0 drain uses level0_file_num_compaction_trigger (Mind.md; not L1 byte capacity).\n"
              "      disable_auto_compactions stays true (no generic background drain).\n";
       return 0;
     } else {
@@ -892,6 +857,10 @@ int main(int argc, char** argv) {
     std::cerr << "--bucket-sec must be > 0\n";
     return 1;
   }
+  if (ingest_threads < 1 || ingest_threads > 32) {
+    std::cerr << "--ingest-threads must be between 1 and 32\n";
+    return 1;
+  }
   if (stream_flush_every_n_rows && flush_every_n_rows <= 0) {
     std::cerr << "--flush-every-n-rows must be > 0\n";
     return 1;
@@ -905,13 +874,10 @@ int main(int argc, char** argv) {
     return 1;
   }
   ClearLegacyManifestShardEnv();
-  std::cout << "Manifest: single MANIFEST-* (CURRENT -> MANIFEST, per-SST st_file_meta)\n";
+  std::cout << "Manifest: single MANIFEST-* (CURRENT -> MANIFEST, per-SST st_file_meta)\n"
+            << std::flush;
   if (user_key_schema == UserKeySchema::kTmanSt ||
       user_key_schema == UserKeySchema::kTmanLocs) {
-    if (cross_bucket_replicate) {
-      std::cerr << "tman_st/tman_locs keys incompatible with replicate ingest\n";
-      return 1;
-    }
     if (user_key_schema == UserKeySchema::kTmanLocs) {
       if (tman_st_keys_csv.empty()) {
         std::cerr << "--user-key-schema tman_locs requires --tman-st-keys-csv\n";
@@ -923,10 +889,12 @@ int main(int argc, char** argv) {
         return 1;
       }
       std::cout << "User key: TMan LocSIndex [period][spatial][tid] from "
-                << tman_st_keys_csv << " (n=" << tman_locs_keys.size() << ")\n";
+                << tman_st_keys_csv << " (n=" << tman_locs_keys.size() << ")\n"
+                << std::flush;
     } else {
       std::cout << "User key: ST-RocksDB native [period][spatial][tid] "
-                   "(C++ Morton centroid)\n";
+                   "(C++ Morton centroid)\n"
+                << std::flush;
     }
 #ifdef _WIN32
     _putenv_s("ROCKSDB_ST_USER_KEY_SCHEMA", "tman_st");
@@ -939,10 +907,7 @@ int main(int argc, char** argv) {
 #else
     setenv("ROCKSDB_ST_USER_KEY_SCHEMA", "e7", 1);
 #endif
-    std::cout << "User key: E7 (legacy)\n";
-  }
-  if (cross_bucket_replicate) {
-    std::cout << "WARN: --cross-bucket-replicate (legacy; K>>N write amp)\n";
+    std::cout << "User key: E7 (legacy)\n" << std::flush;
   }
   if (ingest_per_bucket_flush) {
     std::cout << "WARN: --per-bucket-flush (legacy; can leave many L0 SSTs)\n";
@@ -959,8 +924,9 @@ int main(int argc, char** argv) {
   }
 
   rocksdb::Options stage_opts = MakeDbOptions(
-      !st_ladder_drain_only, true, experimental_st_compaction, bucket_sec,
+      !st_ladder_drain_only, false, experimental_st_compaction, bucket_sec,
       max_level_bytes_mb, block_size);
+  stage_opts.max_background_jobs = std::max(4, ingest_threads);
   std::cout << "Opening staging DB (before points preload): " << target_db << "\n"
             << std::flush;
   std::unique_ptr<rocksdb::DB> stage_db;
@@ -971,13 +937,14 @@ int main(int argc, char** argv) {
   }
   rocksdb::ColumnFamilyHandle* const cf = stage_db->DefaultColumnFamily();
   std::cout << "Staging DB open OK\n" << std::flush;
-  // Mind.md ingest: L0 file-count drain, then bounded L1+ ladder (90% byte thresholds)
+  // Mind.md ingest: L0 file-count drain, then bounded L1+ ladder (100% byte thresholds)
   // after each bucket boundary — not only at EOF.
   constexpr uint64_t kIngestPerBucketL1LadderSteps = 64;
-  // Tiered mode: use auto-compaction (background threads run our picker).
-  // Non-tiered / legacy ST: manual ST ladder with disable_auto_compactions.
+  // Native RocksDB and tiered ST use background flush/compaction.
+  // Non-tiered ST uses the synchronous ST ladder.
   const bool use_auto_compaction =
-      experimental_st_compaction && st_l1_l2_tiered && st_real_tiered;
+      !experimental_st_compaction ||
+      (st_l1_l2_tiered && st_real_tiered);
   if (experimental_st_compaction) {
     std::unordered_map<std::string, std::string> st_opts;
     if (use_auto_compaction) {
@@ -988,10 +955,11 @@ int main(int argc, char** argv) {
       st_opts["experimental_st_compaction_real_tiered_l1_l2"] = "true";
       st_opts["experimental_st_compaction_tiered_max_level"] =
           std::to_string(st_tiered_max_level);
-      st_opts["experimental_st_compaction_tiered_max_runs_per_level"] =
-          std::to_string(st_tiered_max_runs_per_level);
+      st_opts["experimental_st_compaction_level_trigger_ratio"] =
+          std::to_string(st_level_trigger_ratio);
       st_opts["disable_auto_compactions"] = "false";
-      st_opts["level0_file_num_compaction_trigger"] = "2";
+      st_opts["level0_file_num_compaction_trigger"] =
+          std::to_string(stage_opts.level0_file_num_compaction_trigger);
     } else {
       st_opts["disable_auto_compactions"] = "true";
       st_opts["experimental_st_compaction"] = "true";
@@ -1002,8 +970,8 @@ int main(int argc, char** argv) {
         }
       }
       if (st_real_tiered) {
-        st_opts["experimental_st_compaction_tiered_max_runs_per_level"] =
-            std::to_string(st_tiered_max_runs_per_level);
+        st_opts["experimental_st_compaction_level_trigger_ratio"] =
+            std::to_string(st_level_trigger_ratio);
       }
     }
     for (const auto& [k, v] : st_custom_opts) {
@@ -1032,19 +1000,34 @@ int main(int argc, char** argv) {
 
   if (experimental_st_compaction) {
     const auto effective_options = stage_db->GetOptions(cf);
+    stage_opts = effective_options;
     std::cout << "ST capacity: base_bytes="
               << effective_options.max_bytes_for_level_base
               << " multiplier=" << effective_options.max_bytes_for_level_multiplier
               << " target_sst_bytes=" << effective_options.target_file_size_base
-              << " file_count_threshold="
-              << effective_options.experimental_st_compaction_tiered_max_runs_per_level
+              << " write_buffer_bytes=" << effective_options.write_buffer_size
+              << " level_trigger_ratio="
+              << effective_options.experimental_st_compaction_level_trigger_ratio
               << " auto_compactions=" << !effective_options.disable_auto_compactions
+              << " block_mbr_flush_enabled="
+              << effective_options.experimental_st_block_mbr_flush_enable
+              << " l0_trigger=" << effective_options.level0_file_num_compaction_trigger
+              << "\n";
+  } else {
+    const auto effective_options = stage_db->GetOptions(cf);
+    std::cout << "Compaction mode: RocksDB native; auto_compactions="
+              << !effective_options.disable_auto_compactions
+              << " write_buffer_bytes=" << effective_options.write_buffer_size
+              << " target_sst_bytes=" << effective_options.target_file_size_base
+              << " l0_trigger="
+              << effective_options.level0_file_num_compaction_trigger
+              << " block_mbr_flush_enabled="
+              << effective_options.experimental_st_block_mbr_flush_enable
               << "\n";
   }
 
   if (st_ladder_drain_only) {
     const uint64_t host_bucket = std::numeric_limits<uint64_t>::max();
-    const double ratio = StCompactionTriggerRatio(stage_opts);
     if (force_l1_to_l2) {
       s = ForceCompactWholeLevel(stage_db.get(), cf, 1, host_bucket);
       if (!s.ok()) {
@@ -1059,7 +1042,7 @@ int main(int argc, char** argv) {
         std::cerr << "DrainL0 failed: " << s.ToString() << "\n";
         return 1;
       }
-      s = RunStCompactionFileLadder(stage_db.get(), cf, stage_opts, ratio,
+      s = RunStCompactionFileLadder(stage_db.get(), cf, stage_opts,
                                     /*max_steps=*/500000, host_bucket);
       if (!s.ok()) {
         std::cerr << "ST ladder failed: " << s.ToString() << "\n";
@@ -1085,6 +1068,10 @@ int main(int argc, char** argv) {
   if (stream_ingest && stream_ingest_flush_only) {
     std::cout << "Stream ingest: --stream-ingest-flush-only (legacy: defer ST to EOF)\n";
   }
+  const bool parallel_stream_ingest = stream_ingest &&
+                                      !ingest_per_bucket_flush &&
+                                      !stream_flush_every_n_rows &&
+                                      !stream_incremental_compact;
   if (stream_ingest) {
     if (ingest_per_bucket_flush) {
       std::cout << "Ingest mode: stream (row-by-row Put; per-bucket Flush+ST; "
@@ -1092,8 +1079,15 @@ int main(int argc, char** argv) {
                 << kIngestPerBucketL1LadderSteps << " per bucket)\n"
                 << std::flush;
     } else {
-      std::cout << "Ingest mode: stream (row-by-row Put; single key/segment; "
-                   "unified EOF Flush+ST; memtable pressure flush+StageDown at 192MiB";
+      std::cout << "Ingest mode: stream ("
+                << (parallel_stream_ingest
+                        ? "parallel encode/write workers=" +
+                              std::to_string(ingest_threads) +
+                              "; WriteBatch=128 segments; "
+                        : "serial encode/write; ")
+                << "unified EOF Flush+ST; "
+                << (use_auto_compaction ? "background flush+compaction"
+                                        : "manual pressure flush at 192MiB");
       if (stream_flush_every_n_rows && flush_every_n_rows > 0) {
         std::cout << "; flush-every-n-rows=" << flush_every_n_rows;
       }
@@ -1181,7 +1175,6 @@ int main(int argc, char** argv) {
   };
 
   int64_t rows = 0;
-  uint64_t cross_bucket_replica_extra = 0;
   uint64_t total_entries = 0;
   size_t bucket_flush_events = 0;
   std::vector<uint32_t> buckets_touched;
@@ -1196,11 +1189,36 @@ int main(int argc, char** argv) {
     return stage_db->SetOptions(cf, cf_opts);
   };
 
+  auto final_auto_drain = [&]() -> rocksdb::Status {
+    rocksdb::WaitForCompactOptions wait;
+    wait.timeout = std::chrono::seconds(120);
+    auto status = stage_db->WaitForCompact(wait);
+    if (!status.ok()) return status;
+    // Automatic L0 compaction starts at a file-count threshold. Drain the
+    // sub-threshold tail explicitly, with no background compaction races.
+    status = stage_db->SetOptions(cf, {{"disable_auto_compactions", "true"}});
+    if (!status.ok()) return status;
+    status = stage_db->WaitForCompact(wait);
+    if (!status.ok()) return status;
+    status = DrainL0AllFiles(stage_db.get(), cf, "eof_tail", 100000);
+    if (!status.ok()) return status;
+    status = stage_db->SetOptions(cf, {{"disable_auto_compactions", "false"}});
+    if (!status.ok()) return status;
+    status = stage_db->WaitForCompact(wait);
+    if (!status.ok()) return status;
+    return VerifyIngestL0Empty(stage_db.get(), cf);
+  };
+
+  auto wait_for_native_compaction = [&]() -> rocksdb::Status {
+    rocksdb::WaitForCompactOptions wait;
+    wait.timeout = std::chrono::minutes(10);
+    return stage_db->WaitForCompact(wait);
+  };
+
   auto final_st_drain = [&](uint64_t manifest_host_bucket) -> rocksdb::Status {
     if (!experimental_st_compaction) {
       return rocksdb::Status::OK();
     }
-    const double ratio = StCompactionTriggerRatio(stage_opts);
     std::cout << "ST incremental: final clear L0 then L1+ ladder\n";
     rocksdb::Status s = DrainL0AllFiles(stage_db.get(), cf, "eof_clear_l0",
                                         /*max_rounds=*/100000,
@@ -1208,7 +1226,7 @@ int main(int argc, char** argv) {
     if (!s.ok()) {
       return s;
     }
-    return RunStCompactionFileLadder(stage_db.get(), cf, stage_opts, ratio,
+    return RunStCompactionFileLadder(stage_db.get(), cf, stage_opts,
                                    /*max_steps=*/500000, manifest_host_bucket);
   };
 
@@ -1220,6 +1238,130 @@ int main(int argc, char** argv) {
                                                              : -1;
     uint32_t last_flush_bucket = UINT32_MAX;
 
+    if (parallel_stream_ingest) {
+      const size_t limit = max_rows >= 0
+                               ? std::min(n, static_cast<size_t>(max_rows))
+                               : n;
+      const size_t worker_count = std::min<size_t>(ingest_threads, limit);
+      std::atomic<size_t> next_index{0};
+      std::atomic<int64_t> completed_rows{0};
+      std::atomic<uint64_t> written_entries{0};
+      std::atomic<bool> stop{false};
+      std::mutex error_mutex;
+      std::mutex progress_mutex;
+      rocksdb::Status worker_error;
+      const auto ingest_started = std::chrono::steady_clock::now();
+      std::vector<std::thread> workers;
+      std::vector<std::unordered_set<uint32_t>> worker_buckets(worker_count);
+      workers.reserve(worker_count);
+      for (size_t worker_id = 0; worker_id < worker_count; ++worker_id) {
+        workers.emplace_back([&, worker_id]() {
+          auto& local_buckets = worker_buckets[worker_id];
+          std::ifstream points_input(points_csv_path, std::ios::binary);
+          if (!points_input) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            if (worker_error.ok()) {
+              worker_error = rocksdb::Status::IOError(
+                  "cannot open points CSV in ingest worker");
+            }
+            stop.store(true, std::memory_order_relaxed);
+            return;
+          }
+          rocksdb::WriteBatch batch;
+          size_t batch_rows = 0;
+          auto flush_batch = [&]() -> bool {
+            if (batch_rows == 0) return true;
+            const rocksdb::Status write_status = stage_db->Write(
+                rocksdb::WriteOptions(), &batch);
+            if (!write_status.ok()) {
+              std::lock_guard<std::mutex> lock(error_mutex);
+              if (worker_error.ok()) worker_error = write_status;
+              stop.store(true, std::memory_order_relaxed);
+              return false;
+            }
+            batch.Clear();
+            batch_rows = 0;
+            return true;
+          };
+          while (!stop.load(std::memory_order_relaxed)) {
+            const size_t i = next_index.fetch_add(1, std::memory_order_relaxed);
+            if (i >= limit) break;
+            MetaRowFields row;
+            if (!TryParseMetaLine(sorted_lines[i].second, &row)) continue;
+            std::vector<segval::SegmentPoint> row_points;
+            const bool found_points =
+                use_points_spill
+                    ? points_spill.Get(row.segment_id, &row_points,
+                                       &points_input)
+                    : lookup_points(row.segment_id, &row_points);
+            if (!found_points) {
+              std::lock_guard<std::mutex> lock(error_mutex);
+              if (worker_error.ok()) {
+                worker_error = rocksdb::Status::Corruption(
+                    "cannot read points for segment_id=" + row.segment_id);
+              }
+              stop.store(true, std::memory_order_relaxed);
+              break;
+            }
+            std::vector<Kv> row_kvs;
+            const rocksdb::Status encode_status = BuildKvsForMetaRow(
+                row, row_points, bucket_sec, user_key_schema, &st_key_cfg,
+                &tman_locs_keys, &row_kvs);
+            if (!encode_status.ok()) {
+              std::lock_guard<std::mutex> lock(error_mutex);
+              if (worker_error.ok()) worker_error = encode_status;
+              stop.store(true, std::memory_order_relaxed);
+              break;
+            }
+            for (const auto& kv : row_kvs) {
+              const rocksdb::Status add_status = batch.Put(kv.key, kv.val);
+              if (!add_status.ok()) {
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (worker_error.ok()) worker_error = add_status;
+                stop.store(true, std::memory_order_relaxed);
+                break;
+              }
+            }
+            if (stop.load(std::memory_order_relaxed)) break;
+            written_entries.fetch_add(row_kvs.size(), std::memory_order_relaxed);
+            ++batch_rows;
+            if (batch_rows >= 128 && !flush_batch()) break;
+            local_buckets.insert(RowMinHostBucket(row, bucket_sec));
+            const int64_t done = completed_rows.fetch_add(
+                                     1, std::memory_order_relaxed) +
+                                 1;
+            if (done % 100000 == 0) {
+              std::lock_guard<std::mutex> lock(progress_mutex);
+              const double elapsed = std::chrono::duration<double>(
+                  std::chrono::steady_clock::now() - ingest_started).count();
+              std::cout << "Stream progress rows=" << done
+                        << " total_entries="
+                        << written_entries.load(std::memory_order_relaxed)
+                        << " rows_per_sec=" << std::fixed
+                        << std::setprecision(1)
+                        << (elapsed > 0 ? done / elapsed : 0.0)
+                        << " bucket_flushes=0\n"
+                        << std::defaultfloat << std::flush;
+            }
+          }
+          if (!stop.load(std::memory_order_relaxed)) flush_batch();
+        });
+      }
+      for (auto& worker : workers) worker.join();
+      if (!worker_error.ok()) {
+        std::cerr << "Parallel stream ingest failed: "
+                  << worker_error.ToString() << "\n";
+        return 1;
+      }
+      rows = completed_rows.load(std::memory_order_relaxed);
+      total_entries = written_entries.load(std::memory_order_relaxed);
+      std::unordered_set<uint32_t> touched_buckets;
+      for (const auto& local_buckets : worker_buckets) {
+        touched_buckets.insert(local_buckets.begin(), local_buckets.end());
+      }
+      buckets_touched.assign(touched_buckets.begin(), touched_buckets.end());
+      std::sort(buckets_touched.begin(), buckets_touched.end());
+    } else {
     for (size_t i = 0; i < n; ++i) {
       if (max_rows >= 0 && rows >= max_rows) {
         break;
@@ -1245,10 +1387,8 @@ int main(int argc, char** argv) {
       }
 
       std::vector<Kv> row_kvs;
-      s = BuildKvsForMetaRow(row, row_points, bucket_sec,
-                             cross_bucket_replicate,
-                             user_key_schema, &st_key_cfg, &tman_locs_keys, &row_kvs,
-                             &cross_bucket_replica_extra);
+      s = BuildKvsForMetaRow(row, row_points, bucket_sec, user_key_schema,
+                             &st_key_cfg, &tman_locs_keys, &row_kvs);
       if (!s.ok()) {
         std::cerr << "BuildKvs failed segment_id=" << row.segment_id << ": "
                   << s.ToString() << "\n";
@@ -1306,8 +1446,9 @@ int main(int argc, char** argv) {
           next_flush_at_row = rows + flush_every_n_rows;
         }
 
-        // Memtable pressure flush (fallback).
-        if (!do_flush) {
+        // Automatic mode relies on RocksDB's write-buffer limit and background
+        // flush. Do not poll and synchronously flush at a smaller hidden limit.
+        if (!do_flush && !use_auto_compaction) {
           const uint64_t mem_before = [&]() {
             uint64_t m = 0;
             stage_db->GetIntProperty(
@@ -1323,7 +1464,7 @@ int main(int argc, char** argv) {
         if (do_flush) {
           auto t_flush_start = std::chrono::steady_clock::now();
           rocksdb::FlushOptions fo;
-          fo.wait = true;
+          fo.wait = !use_auto_compaction;
           fo.st_manifest_host_bucket = static_cast<uint64_t>(row_min_b);
           s = stage_db->Flush(fo);
           if (!s.ok()) {
@@ -1339,47 +1480,27 @@ int main(int argc, char** argv) {
           double compact_ms = 0.0;
           size_t l0_before = CountLiveL0Files(stage_db.get(), cf);
 
-          if (stream_incremental_compact && experimental_st_compaction) {
+          if (stream_incremental_compact && experimental_st_compaction &&
+              !use_auto_compaction) {
             auto t_compact = std::chrono::steady_clock::now();
-            if (use_auto_compaction) {
-              // Tiered auto-compaction: let background threads run our picker.
-              // Wait for pending compactions + L0 drain (poll with timeout).
-              constexpr int kMaxWaitMs = 30000;
-              constexpr int kPollMs = 100;
-              int waited = 0;
-              while (waited < kMaxWaitMs) {
-                uint64_t running = 0;
-                stage_db->GetIntProperty(
-                    cf, rocksdb::DB::Properties::kNumRunningCompactions,
-                    &running);
-                size_t l0_n = CountLiveL0Files(stage_db.get(), cf);
-                if (running == 0 && l0_n <= 1) break;
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(kPollMs));
-                waited += kPollMs;
-              }
-            } else {
+            {
               // ── Incremental compact: stage-down L0 + limited L1+ ladder ──
               const auto& cf_opts =
                   static_cast<const rocksdb::ColumnFamilyOptions&>(stage_opts);
               s = DrainL0WhenAtCompactionTrigger(
                   stage_db.get(), cf, cf_opts, "incr_l0_trigger",
-                  /*max_rounds=*/1, static_cast<uint64_t>(row_min_b));
-              {
-                size_t l0_n = CountLiveL0Files(stage_db.get(), cf);
-                if (l0_n > 0) {
-                  s = StageDownNewestL0File(stage_db.get(), cf,
-                                            static_cast<uint64_t>(row_min_b));
-                  if (!s.ok()) break;
-                }
-              }
+                  /*max_rounds=*/32, static_cast<uint64_t>(row_min_b));
               if (s.ok()) {
-                const double ratio = StCompactionTriggerRatio(stage_opts);
                 constexpr uint64_t kIncrementalLadderSteps = 8;
                 s = RunStCompactionFileLadder(
-                    stage_db.get(), cf, stage_opts, ratio,
+                    stage_db.get(), cf, stage_opts,
                     kIncrementalLadderSteps, static_cast<uint64_t>(row_min_b));
               }
+            }
+            if (!s.ok()) {
+              std::cerr << "Incremental ST compaction failed: " << s.ToString()
+                        << "\n";
+              return 1;
             }
             compact_ms =
                 std::chrono::duration<double, std::milli>(
@@ -1410,6 +1531,7 @@ int main(int argc, char** argv) {
       sorted_lines[i].second.shrink_to_fit();
       ++rows;
     }
+    }
 
     if (rows == 0) {
       std::cerr << "No rows parsed.\n";
@@ -1438,21 +1560,11 @@ int main(int argc, char** argv) {
 
     if (experimental_st_compaction) {
       if (use_auto_compaction) {
-        // Tiered auto-compaction: wait for background compaction to drain L0.
-        std::cout << "EOF auto-compaction: waiting for L0 drain...\n";
-        constexpr int kMaxWaitMs = 120000;
-        constexpr int kPollMs = 500;
-        int waited = 0;
-        while (waited < kMaxWaitMs) {
-          uint64_t running = 0;
-          stage_db->GetIntProperty(
-              cf, rocksdb::DB::Properties::kNumRunningCompactions, &running);
-          size_t l0_n = CountLiveL0Files(stage_db.get(), cf);
-          if (running == 0 && l0_n == 0) break;
-          std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
-          waited += kPollMs;
+        s = final_auto_drain();
+        if (!s.ok()) {
+          std::cerr << "EOF compaction/drain failed: " << s.ToString() << "\n";
+          return 1;
         }
-        std::cout << "EOF auto-compaction: done (waited " << waited << "ms)\n";
       } else {
         // Gather ALL live L0 files and compact them to L1 together.
         rocksdb::ColumnFamilyMetaData cf_meta;
@@ -1468,6 +1580,7 @@ int main(int argc, char** argv) {
           std::cout << "EOF compact-all-L0: " << all_l0.size()
                     << " L0 files -> L1 (time-split enabled)\n";
           rocksdb::CompactionOptions copts;
+          copts.output_file_size_limit = stage_opts.target_file_size_base;
           copts.st_manifest_host_bucket = eof_host_bucket;
           s = stage_db->CompactFiles(copts, cf, all_l0, /*output_level=*/1);
           if (!s.ok()) {
@@ -1476,13 +1589,19 @@ int main(int argc, char** argv) {
           }
         }
         // Now run L1+ ladder (L1→L2 with bucket-span splits).
-        const double ratio = StCompactionTriggerRatio(stage_opts);
-        s = RunStCompactionFileLadder(stage_db.get(), cf, stage_opts, ratio,
+        s = RunStCompactionFileLadder(stage_db.get(), cf, stage_opts,
                                       /*max_steps=*/500000, eof_host_bucket);
         if (!s.ok()) {
           std::cerr << "EOF L1+ ladder failed: " << s.ToString() << "\n";
           return 1;
         }
+      }
+    } else {
+      s = wait_for_native_compaction();
+      if (!s.ok()) {
+        std::cerr << "EOF native compaction wait failed: " << s.ToString()
+                  << "\n";
+        return 1;
       }
     }
   } else {
@@ -1510,28 +1629,16 @@ int main(int argc, char** argv) {
         return 1;
       }
       std::vector<Kv> row_kvs;
-      s = BuildKvsForMetaRow(row, row_points, bucket_sec,
-                             cross_bucket_replicate,
-                             user_key_schema, &st_key_cfg, &tman_locs_keys, &row_kvs,
-                             &cross_bucket_replica_extra);
+      s = BuildKvsForMetaRow(row, row_points, bucket_sec, user_key_schema,
+                             &st_key_cfg, &tman_locs_keys, &row_kvs);
       if (!s.ok()) {
         std::cerr << "BuildKvs failed segment_id=" << row.segment_id << ": "
                   << s.ToString() << "\n";
         return 1;
       }
-      if (cross_bucket_replicate) {
-        const auto [range_b0, range_b1] =
-            st_cross_bucket::IntersectingBucketRange(row.t_start, row.t_end,
-                                                     bucket_sec);
-        size_t ki = 0;
-        for (uint32_t host_b = range_b0; host_b <= range_b1; ++host_b) {
-          bucket_kvs[host_b].push_back(std::move(row_kvs[ki++]));
-        }
-      } else {
-        const uint32_t canonical_b =
-            st_cross_bucket::CanonicalBucketId(row.t_start, bucket_sec);
-        bucket_kvs[canonical_b].push_back(std::move(row_kvs[0]));
-      }
+      const uint32_t canonical_b =
+          st_cross_bucket::CanonicalBucketId(row.t_start, bucket_sec);
+      bucket_kvs[canonical_b].push_back(std::move(row_kvs[0]));
       ++rows;
     }
     meta_in.close();
@@ -1616,21 +1723,11 @@ int main(int argc, char** argv) {
     }
     if (experimental_st_compaction) {
       if (use_auto_compaction) {
-        // Tiered auto-compaction batch mode: wait for L0 drain.
-        std::cout << "Batch EOF: waiting for auto compaction...\n";
-        constexpr int kMaxWaitMs = 120000;
-        constexpr int kPollMs = 500;
-        int waited = 0;
-        while (waited < kMaxWaitMs) {
-          uint64_t running = 0;
-          stage_db->GetIntProperty(
-              cf, rocksdb::DB::Properties::kNumRunningCompactions, &running);
-          size_t l0_n = CountLiveL0Files(stage_db.get(), cf);
-          if (running == 0 && l0_n == 0) break;
-          std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
-          waited += kPollMs;
+        s = final_auto_drain();
+        if (!s.ok()) {
+          std::cerr << "EOF compaction/drain failed: " << s.ToString() << "\n";
+          return 1;
         }
-        std::cout << "Batch auto-compaction: done (waited " << waited << "ms)\n";
       } else {
         const uint64_t eof_host_bucket =
             buckets_touched.empty()
@@ -1641,6 +1738,13 @@ int main(int argc, char** argv) {
           std::cerr << "Final ST drain failed: " << s.ToString() << "\n";
           return 1;
         }
+      }
+    } else {
+      s = wait_for_native_compaction();
+      if (!s.ok()) {
+        std::cerr << "EOF native compaction wait failed: " << s.ToString()
+                  << "\n";
+        return 1;
       }
     }
   }
@@ -1654,7 +1758,7 @@ int main(int argc, char** argv) {
   std::vector<rocksdb::LiveFileMetaData> live;
   stage_db->GetLiveFilesMetaData(&live);
   PrintSstCountPerLevel(live);
-  if (experimental_st_compaction && !use_auto_compaction) {
+  if (experimental_st_compaction) {
     s = VerifyIngestL0Empty(stage_db.get(), cf);
     if (!s.ok()) {
       std::cerr << "Ingest L0 verify failed: " << s.ToString() << "\n";
@@ -1666,8 +1770,7 @@ int main(int argc, char** argv) {
             << " buckets=" << buckets_touched.size()
             << " bucket_flush_events=" << bucket_flush_events << " rows=" << rows
             << " ingested_live_sst=" << live.size()
-            << " total_entries=" << total_entries
-            << " cross_bucket_replica_extra=" << cross_bucket_replica_extra << "\n";
+            << " total_entries=" << total_entries << "\n";
 
   s = stage_db->Close();
   if (!s.ok()) {
@@ -1678,4 +1781,3 @@ int main(int argc, char** argv) {
   stage_db.reset();
   return 0;
 }
-

@@ -33,7 +33,6 @@
 namespace {
 
 using ROCKSDB_NAMESPACE::Hash64;
-using ROCKSDB_NAMESPACE::StQuerySegmentUidDedup;
 using ROCKSDB_NAMESPACE::kSpatioTemporalE7DefaultBucketSeconds;
 
 static uint32_t CfEventTimeBucketWidthSec(rocksdb::DB* db) {
@@ -133,7 +132,14 @@ static bool UserKeyBucketInRange(const rocksdb::Slice& user_key,
     return true;
   }
   const unsigned char magic = static_cast<unsigned char>(user_key.data()[0]);
-  if (magic == kMagicSegmentLegacyKey || magic == kMagicSegmentTzidKey) {
+  if (magic == kMagicSegmentTzidKey) {
+    uint32_t bucket_id = 0;
+    if (!ROCKSDB_NAMESPACE::TryDecodeE7HostBucketId(user_key, &bucket_id)) {
+      return true;
+    }
+    return bucket_id >= bucket_min && bucket_id <= bucket_max;
+  }
+  if (magic == kMagicSegmentLegacyKey) {
     if (user_key.size() < 6) {
       return true;
     }
@@ -437,8 +443,7 @@ static void SummarizeAndPrint(const std::vector<double>& times_ms,
 }
 
 static QueryMetrics RunOneQuery(rocksdb::DB* db, rocksdb::ReadOptions& prune,
-                                StQuerySegmentUidDedup* dedup,
-                                bool iterator_dedup, bool verify,
+                                bool verify,
                                 uint32_t t_min, uint32_t t_max,
                                 uint32_t bucket_min, uint32_t bucket_max,
                                 const SpatialWindow& w) {
@@ -500,9 +505,6 @@ static QueryMetrics RunOneQuery(rocksdb::DB* db, rocksdb::ReadOptions& prune,
   ps.key_level_keys_examined = &key_examined;
   ps.key_level_keys_skipped_disjoint = &key_skipped;
 
-  if (dedup != nullptr) {
-    dedup->Reset();
-  }
   if (auto* pc = rocksdb::get_perf_context(); pc != nullptr) {
     pc->Reset();
   }
@@ -552,18 +554,9 @@ static QueryMetrics RunOneQuery(rocksdb::DB* db, rocksdb::ReadOptions& prune,
       if (!verify) {
         continue;
       }
-      // When key_level is enabled, the iterator already performed point-truth
-      // verification (SegmentValueHasPointInWindow) before yielding each key.
-      // Skip redundant EvalPointTruthInWindow to avoid divergence between the
-      // two code paths. When key_level is off, perform the full check here.
-      if (!prune.experimental_st_prune_scan.key_level_enable) {
-        const PointTruthEval pe = EvalPointTruthInWindow(
-            db, prune, uk, it->value(), t_min, t_max, w.x_min, w.x_max, w.y_min, w.y_max);
-        if (!pe.in_window) {
-          continue;
-        }
-      }
-      if (!iterator_dedup && dedup != nullptr && !dedup->AcceptEmitUserKey(uk)) {
+      const PointTruthEval pe = EvalPointTruthInWindow(
+          db, prune, uk, it->value(), t_min, t_max, w.x_min, w.x_max, w.y_min, w.y_max);
+      if (!pe.in_window) {
         continue;
       }
       ++segment_kv;
@@ -640,13 +633,6 @@ int RunStMetaReadBenchSpatialBatch(rocksdb::DB* db,
   const uint32_t cf_bucket_width_sec = CfEventTimeBucketWidthSec(db);
   prune.experimental_st_prune_scan.event_time_bucket_width_sec =
       cf_bucket_width_sec;
-  StQuerySegmentUidDedup dedup;
-  dedup.bucket_width_sec = cf_bucket_width_sec;
-  const bool iterator_dedup = cfg.query_segment_uid_dedup;
-  if (iterator_dedup) {
-    prune.experimental_st_prune_scan.query_dedup_by_segment_uid_enable = true;
-    prune.experimental_st_prune_scan.query_segment_uid_dedup = &dedup;
-  }
   ApplyPruneMode(prune, cfg);
 
   std::vector<double> times_ms;
@@ -663,7 +649,7 @@ int RunStMetaReadBenchSpatialBatch(rocksdb::DB* db,
     uint32_t bucket_max = UINT32_MAX;
     QueryWindowToBucketRange(t_min, t_max, cf_bucket_width_sec, &bucket_min, &bucket_max);
     const QueryMetrics m =
-        RunOneQuery(db, prune, &dedup, iterator_dedup, cfg.verify_kv_results,
+        RunOneQuery(db, prune, cfg.verify_kv_results,
                     t_min, t_max, bucket_min, bucket_max, windows[i]);
     times_ms.push_back(m.wall_us / 1000.0);
     final_sizes.push_back(m.final_size);

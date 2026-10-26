@@ -107,7 +107,7 @@ namespace {
 
 using ScanOptionsMap = std::unordered_map<size_t, MultiScanArgs>;
 
-bool ExperimentalManifestSetWriteEnabled() {
+[[maybe_unused]] bool ExperimentalManifestSetWriteEnabled() {
   const char* v = std::getenv("ROCKSDB_EXPERIMENTAL_MANIFEST_SET_WRITE");
   if (v == nullptr) {
     return true;
@@ -1100,7 +1100,7 @@ inline bool StFileDisjointFromExperimentalPruneScanWithDiag(
   return time_disjoint || space_disjoint;
 }
 
-inline bool StFileDisjointFromExperimentalPruneScan(const FileMetaData* f,
+[[maybe_unused]] inline bool StFileDisjointFromExperimentalPruneScan(const FileMetaData* f,
                                                     const ReadOptions& ro) {
   return StFileDisjointFromExperimentalPruneScanWithDiag(f, ro);
 }
@@ -3187,7 +3187,7 @@ void Version::AddIterators(const ReadOptions& read_options,
   if (read_options.experimental_st_prune_scan.enable &&
       read_options.experimental_st_prune_scan.file_level_enable &&
       read_options.experimental_st_prune_scan.manifest_sst_filter == nullptr) {
-    manifest_filter.reset(new StManifestSstFilterResult(
+    manifest_filter = std::make_unique<StManifestSstFilterResult>(
         ManifestFilterSstByStFileMeta(
             storage_info_,
             read_options.experimental_st_prune_scan.t_min,
@@ -3195,23 +3195,21 @@ void Version::AddIterators(const ReadOptions& read_options,
             read_options.experimental_st_prune_scan.x_min,
             read_options.experimental_st_prune_scan.x_max,
             read_options.experimental_st_prune_scan.y_min,
-            read_options.experimental_st_prune_scan.y_max)));
-    // Cast away constness; the ReadOptions is effectively mutable for the
-    // iterator's lifetime. The unique_ptr keeps the filter alive.
-    const_cast<ReadOptions&>(read_options)
-        .experimental_st_prune_scan.manifest_sst_filter = manifest_filter.get();
+            read_options.experimental_st_prune_scan.y_max));
+
   }
 
   for (int level = 0; level < storage_info_.num_non_empty_levels(); level++) {
     AddIteratorsForLevel(read_options, soptions, merge_iter_builder, level,
-                         allow_unprepared_value);
+                         allow_unprepared_value, manifest_filter.get());
   }
 }
 
 void Version::AddIteratorsForLevel(const ReadOptions& read_options,
                                    const FileOptions& soptions,
                                    MergeIteratorBuilder* merge_iter_builder,
-                                   int level, bool allow_unprepared_value) {
+                                   int level, bool allow_unprepared_value,
+                                   const StManifestSstFilterResult* file_filter) {
   assert(storage_info_.finalized_);
   if (level >= storage_info_.num_non_empty_levels()) {
     // This is an empty level
@@ -3227,7 +3225,9 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
     std::unique_ptr<TruncatedRangeDelIterator> tombstone_iter = nullptr;
     for (size_t i = 0; i < storage_info_.LevelFilesBrief(0).num_files; i++) {
       const auto& file = storage_info_.LevelFilesBrief(0).files[i];
-      if (StFileDisjointFromExperimentalPruneScanWithDiag(file.file_metadata,
+      if ((file_filter != nullptr &&
+           file_filter->file_numbers.count(file.file_metadata->fd.GetNumber()) == 0) ||
+          StFileDisjointFromExperimentalPruneScanWithDiag(file.file_metadata,
                                                           read_options)) {
         if (read_options.experimental_st_prune_scan.file_level_files_skipped !=
             nullptr) {
@@ -3270,7 +3270,9 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
       for (size_t i = 0; i < storage_info_.LevelFilesBrief(level).num_files;
            i++) {
         const auto& file = storage_info_.LevelFilesBrief(level).files[i];
-        if (StFileDisjointFromExperimentalPruneScanWithDiag(file.file_metadata,
+        if ((file_filter != nullptr &&
+           file_filter->file_numbers.count(file.file_metadata->fd.GetNumber()) == 0) ||
+          StFileDisjointFromExperimentalPruneScanWithDiag(file.file_metadata,
                                                             read_options)) {
           if (read_options.experimental_st_prune_scan
                   .file_level_files_skipped != nullptr) {
@@ -4338,7 +4340,11 @@ void VersionStorageInfo::GenerateStTimeSortedFiles() {
   }
   std::sort(st_time_sorted_files_.begin(), st_time_sorted_files_.end(),
             [](const FileMetaData* a, const FileMetaData* b) {
-              return a->st_file_meta.t_min < b->st_file_meta.t_min;
+              const uint32_t at = (!a->has_st_file_meta || a->num_range_deletions > 0)
+                                      ? 0 : a->st_file_meta.t_min;
+              const uint32_t bt = (!b->has_st_file_meta || b->num_range_deletions > 0)
+                                      ? 0 : b->st_file_meta.t_min;
+              return at < bt;
             });
 }
 
@@ -4872,15 +4878,15 @@ void VersionStorageInfo::ComputeCompactionScore(
         total_downcompact_bytes +=
             static_cast<double>(level_total_bytes - MaxBytesForLevel(level));
       }
-      // ST-compaction (Mind.md): trigger Lx->Lx+1 when layer bytes reach
-      // (ratio * MaxBytesForLevel); scale score so threshold aligns at 1.0.
+      // ST capacity is measured in physical SST bytes, without an early
+      // trigger ratio or RocksDB deletion-compensation estimates.
       if (compaction_style_ == kCompactionStyleLevel &&
           mutable_cf_options.experimental_st_compaction) {
-        const double ratio =
-            mutable_cf_options.experimental_st_compaction_level_trigger_ratio;
-        if (ratio > 0.0 && ratio <= 1.0) {
-          score /= ratio;
+        uint64_t physical_bytes = 0;
+        for (const auto* f : files_[level]) {
+          if (!f->being_compacted) physical_bytes += f->fd.GetFileSize();
         }
+        score = static_cast<double>(physical_bytes) / MaxBytesForLevel(level);
       }
     }
     compaction_level_[level] = level;
@@ -7024,7 +7030,7 @@ bool TryBuildPendingManifestTimeBounds(
   return true;
 }
 
-bool TryBuildPendingManifestSpatialBounds(
+[[maybe_unused]] bool TryBuildPendingManifestSpatialBounds(
     ColumnFamilySet* column_family_set, const autovector<Version*>& versions,
     const autovector<VersionEdit*>& batch_edits, float* out_min_x,
     float* out_max_x, float* out_min_y, float* out_max_y) {
@@ -7092,7 +7098,7 @@ bool TryBuildPendingManifestSpatialBounds(
   return true;
 }
 
-bool TryBuildPendingManifestGlobalCounts(
+[[maybe_unused]] bool TryBuildPendingManifestGlobalCounts(
     ColumnFamilySet* column_family_set, const autovector<VersionEdit*>& batch_edits,
     uint64_t* out_masters, uint64_t* out_ghosts, bool* out_verify_ghost) {
   assert(out_masters != nullptr);
@@ -7184,7 +7190,7 @@ bool TryBuildPendingManifestGlobalCounts(
   return true;
 }
 
-bool TryBuildPendingManifestGlobalCountsFromLiveFiles(
+[[maybe_unused]] bool TryBuildPendingManifestGlobalCountsFromLiveFiles(
     ColumnFamilySet* column_family_set, const autovector<Version*>& versions,
     bool pending_has_time_bounds, uint64_t pending_tmin, uint64_t pending_tmax,
     bool pending_has_mbr_bounds, float pending_xmin, float pending_xmax,
@@ -7263,7 +7269,7 @@ bool TryBuildPendingManifestGlobalCountsFromLiveFiles(
   return true;
 }
 
-void GetCurrentManifestRetainedAndReferencedGlobalCounts(
+[[maybe_unused]] void GetCurrentManifestRetainedAndReferencedGlobalCounts(
     const std::string& dbname, FileSystem* fs, uint64_t* retained_masters,
     uint64_t* retained_ghosts, uint64_t* referenced_masters,
     uint64_t* referenced_ghosts) {

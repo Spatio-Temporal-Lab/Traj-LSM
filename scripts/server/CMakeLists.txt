@@ -21,7 +21,7 @@ set(STLSM_DEMO "${STLSM_ROOT}/rocks-demo")
 foreach(program
     st_bucket_ingest_build st_compaction_throughput_bench
     st_meta_compact_existing st_level_stats st_table_props st_prune_stats
-    st_mixed_workload_bench traj_db_audit)
+    st_mixed_workload_bench traj_db_audit st_design_regression)
   add_executable(${program} "${STLSM_DEMO}/${program}.cpp")
   target_include_directories(${program} PRIVATE "${STLSM_ROOT}/rocksdb" "${STLSM_DEMO}")
   target_link_libraries(${program} PRIVATE rocksdb)
@@ -40,4 +40,4 @@ target_link_libraries(st_meta_read_bench PRIVATE rocksdb)
 add_custom_target(stlsm_tools DEPENDS
   st_bucket_ingest_build st_compaction_throughput_bench st_meta_read_bench
   st_meta_compact_existing st_level_stats st_table_props st_prune_stats
-  st_mixed_workload_bench traj_db_audit)
+  st_mixed_workload_bench traj_db_audit st_design_regression)

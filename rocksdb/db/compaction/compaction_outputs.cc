@@ -11,66 +11,12 @@
 #include "db/compaction/compaction_outputs.h"
 
 #include <algorithm>
-#include <cstdlib>
 
 #include "db/builder.h"
 #include "logging/logging.h"
 #include "db/compaction/st_event_split_policy.h"
-#include "table/st_meta_user_key.h"
 
 namespace ROCKSDB_NAMESPACE {
-
-namespace {
-
-bool ExperimentalStUidMergeEnabled() {
-  const char* v = std::getenv("ROCKSDB_EXPERIMENTAL_ST_UID_MERGE");
-  if (v == nullptr || *v == '\0') {
-    return true;
-  }
-  return std::string(v) == "1";
-}
-
-}  // namespace
-
-bool CompactionOutputs::ShouldDropDuplicateSegmentUid(const Slice& user_key,
-                                                      const Slice& value) {
-  if (!st_uid_merge_enabled_ || !IsE7SegmentUserKey(user_key)) {
-    return false;
-  }
-  StSegmentUid uid;
-  if (!TryDecodeE7SegmentUid(user_key, &uid)) {
-    return false;
-  }
-  uint32_t cur_bucket = 0;
-  if (!TryDecodeE7HostBucketId(user_key, &cur_bucket)) {
-    return false;
-  }
-  const uint32_t bw =
-      compaction_->mutable_cf_options()
-                  .experimental_compaction_event_time_bucket_width > 0
-          ? compaction_->mutable_cf_options()
-                .experimental_compaction_event_time_bucket_width
-          : kSpatioTemporalE7DefaultBucketSeconds;
-  uint32_t host_bucket = 0;
-  bool cur_is_host = false;
-  if (TryDecodeE7HostBucketFromValue(value, bw, &host_bucket)) {
-    cur_is_host = (cur_bucket == host_bucket);
-  }
-  auto it = st_uid_merge_seen_.find(uid);
-  if (it == st_uid_merge_seen_.end()) {
-    st_uid_merge_seen_.emplace(uid, StUidMergeEntry{cur_bucket, cur_is_host});
-    return false;
-  }
-  if (it->second.kept_is_host) {
-    ++st_compaction_uid_dropped_;
-    return true;
-  }
-  if (cur_is_host) {
-    return false;
-  }
-  ++st_compaction_uid_dropped_;
-  return true;
-}
 
 void CompactionOutputs::NewBuilder(const TableBuilderOptions& tboptions) {
   builder_.reset(NewTableBuilder(tboptions, file_writer_.get()));
@@ -319,7 +265,9 @@ bool CompactionOutputs::ShouldStopBeforeEventTime(
     return false;
   }
   uint32_t t = 0;
-  if (!TryDecodeSpatioTemporalUserKeyTime(c_iter.user_key(), &t)) {
+  if (!TryDecodeSpatioTemporalUserKeyTime(
+            c_iter.user_key(), &t,
+            mopt.experimental_compaction_event_time_bucket_width)) {
     return false;
   }
   if (!st_event_out_has_st_key_ || st_event_st_keys_in_output_ == 0) {
@@ -334,14 +282,11 @@ bool CompactionOutputs::ShouldStopBeforeEventTime(
   const auto policy = ComputeStEventSplitLevelPolicy(out_level, max_span);
   const uint32_t max_bucket_span = policy.max_bucket_span;
   const uint32_t effective_max_span = policy.effective_max_time_span;
-  // Level-aware key cap (from policy); global explicit setting can override
-  // downward (minimum wins).
+  // No implicit per-level key caps. This optional legacy override applies
+  // only when explicitly requested; its default of zero disables key cuts.
   const uint32_t global_max_keys =
       mopt.experimental_compaction_event_time_max_point_keys;
-  uint32_t effective_max_keys = policy.effective_max_keys;
-  if (global_max_keys > 0 && global_max_keys < effective_max_keys) {
-    effective_max_keys = global_max_keys;
-  }
+  const uint32_t effective_max_keys = global_max_keys;
 
   if (time_split_enabled && bucket_w > 0) {
     const uint32_t b = t / bucket_w;
@@ -401,8 +346,7 @@ bool CompactionOutputs::ShouldStopBeforeEventTime(
   }
   if (time_split_enabled && effective_max_keys > 0 &&
       st_event_st_keys_in_output_ >= effective_max_keys) {
-    // Hard constraint: bound per-file work. Level-aware: L1=10K, L2=40K,
-    // L3=160K, L4+ unlimited — SST size pyramid.
+    // Explicit nonzero record-count override; disabled by default.
     st_event_last_cut_reason_ = StEventCutReason::kMaxKeys;
     ROCKS_LOG_INFO(compaction_->immutable_options().info_log,
                    "ST_EVENT_SPLIT cut_on_max_keys: st_keys_in_output=%" PRIu32
@@ -445,6 +389,12 @@ bool CompactionOutputs::ShouldStopBefore(const CompactionIterator& c_iter) {
     return false;
   }
 
+  // Same-level ST consolidation is many-to-one. Data-block splitting remains
+  // enabled in the table builder, but SST size/time/key cuts must not undo it.
+  if (compaction_->IsStSameLevelMerge()) {
+    return false;
+  }
+
   if (should_stop_for_ttl) {
     return true;
   }
@@ -456,6 +406,8 @@ bool CompactionOutputs::ShouldStopBefore(const CompactionIterator& c_iter) {
     return true;
   }
 
+  // Apply ST event-time/bucket boundaries to every non-L0 output. This call
+  // was accidentally removed, leaving ST compactions with no event split.
   if (ShouldStopBeforeEventTime(c_iter)) {
     return true;
   }
@@ -645,10 +597,6 @@ Status CompactionOutputs::AddToOutput(
   }
 
   const Slice& value = c_iter.value();
-  if (ShouldDropDuplicateSegmentUid(c_iter.user_key(), value)) {
-    return s;
-  }
-
   assert(builder_ != nullptr);
   s = current_output().validator.Add(key, value);
   if (!s.ok()) {
@@ -682,7 +630,9 @@ Status CompactionOutputs::AddToOutput(
   const auto& mopt = compaction_->mutable_cf_options();
   if (mopt.experimental_compaction_event_time_split) {
     uint32_t t = 0;
-    if (TryDecodeSpatioTemporalUserKeyTime(c_iter.user_key(), &t)) {
+    if (TryDecodeSpatioTemporalUserKeyTime(
+            c_iter.user_key(), &t,
+            mopt.experimental_compaction_event_time_bucket_width)) {
       if (!st_event_diag_logged_first_decode_) {
         const uint32_t b = mopt.experimental_compaction_event_time_bucket_width > 0
                                ? t / mopt.experimental_compaction_event_time_bucket_width
@@ -1102,22 +1052,11 @@ CompactionOutputs::CompactionOutputs(const Compaction* compaction,
 
   level_ptrs_ = std::vector<size_t>(compaction_->number_levels(), 0);
 
-  st_uid_merge_enabled_ =
-      ExperimentalStUidMergeEnabled() &&
-      StEventAllowsCrossBucketMerge(compaction_->output_level());
-  st_uid_merge_seen_.clear();
-  st_compaction_uid_dropped_ = 0;
 }
 
 CompactionOutputs::~CompactionOutputs() {
   if (compaction_ == nullptr) {
     return;
-  }
-  if (st_compaction_uid_dropped_ > 0) {
-    ROCKS_LOG_INFO(
-        compaction_->immutable_options().info_log,
-        "ST_UID_MERGE output_level=%d compaction_uid_dropped=%" PRIu64,
-        compaction_->output_level(), st_compaction_uid_dropped_);
   }
   if (st_event_metric_cross_bucket_cuts_ == 0 &&
       st_event_metric_time_span_cuts_ == 0 && st_event_metric_max_keys_cuts_ == 0 &&

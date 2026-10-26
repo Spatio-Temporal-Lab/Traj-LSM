@@ -21,6 +21,7 @@
 #include "table/block_based/block_builder.h"
 #include "table/block_based/flush_block_policy_impl.h"
 #include "table/format.h"
+#include "table/st_index_block.h"
 #include "util/atomic.h"
 #include "table/st_meta_index_extension.h"
 #include "table/st_meta_user_key.h"
@@ -185,6 +186,11 @@ class IndexBuilder {
   virtual void AccumulateFileSpatioTemporalMetaForManifest(
       SpatioTemporalBlockMeta* /*acc*/, bool* /*acc_valid*/) const {}
 
+  virtual const std::vector<StIndexEntry>& st_index_entries() const {
+    static const std::vector<StIndexEntry> empty;
+    return empty;
+  }
+
  protected:
   // Given the last key in current block and the first key in the next block,
   // return true if internal key should be used as separator, false if user key
@@ -242,7 +248,9 @@ class ShortenedIndexBuilder : public IndexBuilder {
       BlockBasedTableOptions::IndexShorteningMode shortening_mode,
       bool include_first_key, size_t ts_sz,
       const bool persist_user_defined_timestamps, Statistics* statistics,
-      double uniform_cv_threshold, bool attach_st_meta_in_index_value)
+      double uniform_cv_threshold, bool attach_st_meta_in_index_value,
+      bool attach_st_index_block = false,
+      uint32_t st_index_bucket_seconds = kStIndexDefaultBucketSeconds)
       : IndexBuilder(comparator, ts_sz, persist_user_defined_timestamps),
         index_block_builder_(
             index_block_restart_interval, true /*use_delta_encoding*/,
@@ -261,9 +269,14 @@ class ShortenedIndexBuilder : public IndexBuilder {
             false /* use_separated_kv_storage */, statistics,
             uniform_cv_threshold),
         use_value_delta_encoding_(use_value_delta_encoding),
+        attach_st_meta_in_index_value_(attach_st_meta_in_index_value),
+        attach_st_index_block_(attach_st_index_block),
+        st_index_bucket_seconds_(st_index_bucket_seconds == 0
+                                     ? kStIndexDefaultBucketSeconds
+                                     : st_index_bucket_seconds),
         include_first_key_(include_first_key),
         shortening_mode_(shortening_mode),
-        attach_st_meta_in_index_value_(attach_st_meta_in_index_value) {
+        st_index_builder_(st_index_bucket_seconds_) {
     // Making the default true will disable the feature for old versions
     must_use_separator_with_seq_.StoreRelaxed(format_version <= 2);
   }
@@ -332,7 +345,8 @@ class ShortenedIndexBuilder : public IndexBuilder {
                          const BlockHandle& block_handle,
                          bool must_use_separator_with_seq,
                          bool skip_delta_encoding,
-                         const SpatioTemporalBlockMeta& st_meta) {
+                         const SpatioTemporalBlockMeta& st_meta,
+                         uint32_t max_start_bucket) {
     IndexValue entry(block_handle, first_internal_key);
     std::string encoded_entry;
     std::string delta_encoded_entry;
@@ -349,6 +363,13 @@ class ShortenedIndexBuilder : public IndexBuilder {
       // BlockBuilder::Add() below won't use delta-encoded slice.
     }
     last_encoded_handle_ = block_handle;
+    if (attach_st_index_block_) {
+      st_index_builder_.Add(max_start_bucket,
+                            st_meta.t_max / st_index_bucket_seconds_,
+                            st_meta.t_min, st_meta.t_max, st_meta.x_min,
+                            st_meta.y_min, st_meta.x_max, st_meta.y_max,
+                            block_handle);
+    }
     const Slice delta_encoded_entry_slice(delta_encoded_entry);
 
     // TODO(yuzhangyu): fix this when "FindShortInternalKeySuccessor"
@@ -385,12 +406,14 @@ class ShortenedIndexBuilder : public IndexBuilder {
     std::string first_internal_key_buf;
     Slice first_internal_key = GetFirstInternalKey(&first_internal_key_buf);
 
+    uint32_t max_start_bucket = 0;
     SpatioTemporalBlockMeta st_meta = FinalizeBlockStMetaForDataBlock(
-        last_key_in_current_block, first_key_in_next_block);
+        last_key_in_current_block, first_key_in_next_block,
+        &max_start_bucket);
     MergeCompletedBlockIntoFileMeta(st_meta);
     AddIndexEntryImpl(separator_with_seq, first_internal_key, block_handle,
                       must_use_separator_with_seq_.LoadRelaxed(),
-                      skip_delta_encoding, st_meta);
+                      skip_delta_encoding, st_meta, max_start_bucket);
     current_block_first_internal_key_.clear();
     return separator_with_seq;
   }
@@ -400,6 +423,7 @@ class ShortenedIndexBuilder : public IndexBuilder {
     std::string first_internal_key;
     bool must_use_separator_with_seq = false;
     SpatioTemporalBlockMeta st_meta{};
+    uint32_t max_start_bucket = 0;
     void SaveFrom(const Slice& from_separator,
                   const Slice& from_first_internal_key,
                   bool from_must_use_separator_with_seq) {
@@ -441,8 +465,9 @@ class ShortenedIndexBuilder : public IndexBuilder {
     Slice first_internal_key = GetFirstInternalKey(&entry->first_internal_key);
     entry->SaveFrom(separator, first_internal_key,
                     must_use_separator_with_seq_.LoadRelaxed());
-    entry->st_meta = FinalizeBlockStMetaForDataBlock(last_key_in_current_block,
-                                                     first_key_in_next_block);
+    entry->st_meta = FinalizeBlockStMetaForDataBlock(
+        last_key_in_current_block, first_key_in_next_block,
+        &entry->max_start_bucket);
     current_block_first_internal_key_.clear();
   }
 
@@ -454,7 +479,8 @@ class ShortenedIndexBuilder : public IndexBuilder {
     MergeCompletedBlockIntoFileMeta(entry->st_meta);
     AddIndexEntryImpl(entry->separator_with_seq, entry->first_internal_key,
                       block_handle, entry->must_use_separator_with_seq,
-                      skip_delta_encoding, entry->st_meta);
+                      skip_delta_encoding, entry->st_meta,
+                      entry->max_start_bucket);
   }
 
   using IndexBuilder::Finish;
@@ -492,6 +518,10 @@ class ShortenedIndexBuilder : public IndexBuilder {
   void AccumulateFileSpatioTemporalMetaForManifest(
       SpatioTemporalBlockMeta* acc, bool* acc_valid) const override;
 
+  const std::vector<StIndexEntry>& st_index_entries() const override {
+    return st_index_builder_.entries();
+  }
+
   // Prefix-max of block t_end across all preceding index entries in this
   // index builder. Used for query-time forward truncation.
   uint32_t GetRunningPrefixMaxTEnd() const { return running_prefix_max_t_end_; }
@@ -517,7 +547,7 @@ class ShortenedIndexBuilder : public IndexBuilder {
                                        const std::optional<Slice>& value);
   SpatioTemporalBlockMeta FinalizeBlockStMetaForDataBlock(
       const Slice& last_key_in_current_block,
-      const Slice* first_key_in_next_block);
+      const Slice* first_key_in_next_block, uint32_t* max_start_bucket);
   inline void MergeCompletedBlockIntoFileMeta(
       const SpatioTemporalBlockMeta& block) {
     if (!attach_st_meta_in_index_value_) {
@@ -536,6 +566,8 @@ class ShortenedIndexBuilder : public IndexBuilder {
   BlockBuilder index_block_builder_without_seq_;
   const bool use_value_delta_encoding_;
   const bool attach_st_meta_in_index_value_;
+  const bool attach_st_index_block_;
+  uint32_t st_index_bucket_seconds_;
   RelaxedAtomic<bool> must_use_separator_with_seq_;
   const bool include_first_key_;
   BlockBasedTableOptions::IndexShorteningMode shortening_mode_;
@@ -554,6 +586,9 @@ class ShortenedIndexBuilder : public IndexBuilder {
   // Running max of t_end across all finalized blocks, used to set
   // prefix_max_t_end on each outgoing index entry.
   uint32_t running_prefix_max_t_end_ = 0;
+  bool block_max_start_bucket_valid_ = false;
+  uint32_t block_max_start_bucket_ = 0;
+  StIndexBlockBuilder st_index_builder_{kStIndexDefaultBucketSeconds};
 };
 
 // HashIndexBuilder contains a binary-searchable primary index and the
@@ -592,14 +627,19 @@ class HashIndexBuilder : public IndexBuilder {
                    BlockBasedTableOptions::IndexShorteningMode shortening_mode,
                    size_t ts_sz, const bool persist_user_defined_timestamps,
                    double uniform_cv_threshold,
-                   bool attach_st_meta_in_index_value)
+                   bool attach_st_meta_in_index_value,
+                   bool attach_st_index_block = false,
+                   uint32_t st_index_bucket_seconds =
+                       kStIndexDefaultBucketSeconds)
       : IndexBuilder(comparator, ts_sz, persist_user_defined_timestamps),
         primary_index_builder_(comparator, index_block_restart_interval,
                                format_version, use_value_delta_encoding,
                                shortening_mode, /* include_first_key */ false,
                                ts_sz, persist_user_defined_timestamps,
                                nullptr /* statistics */, uniform_cv_threshold,
-                               attach_st_meta_in_index_value),
+                               attach_st_meta_in_index_value,
+                               attach_st_index_block,
+                               st_index_bucket_seconds),
         hash_key_extractor_(hash_key_extractor) {}
 
   Slice AddIndexEntry(const Slice& last_key_in_current_block,
@@ -634,7 +674,8 @@ class HashIndexBuilder : public IndexBuilder {
   }
 
   void OnKeyAdded(const Slice& key,
-                  const std::optional<Slice>& /*value*/) override {
+                  const std::optional<Slice>& value) override {
+    primary_index_builder_.OnKeyAdded(key, value);
     auto key_prefix = hash_key_extractor_->Transform(key);
     bool is_first_entry = pending_block_num_ == 0;
 
@@ -694,6 +735,10 @@ class HashIndexBuilder : public IndexBuilder {
       SpatioTemporalBlockMeta* acc, bool* acc_valid) const override {
     primary_index_builder_.AccumulateFileSpatioTemporalMetaForManifest(
         acc, acc_valid);
+  }
+
+  const std::vector<StIndexEntry>& st_index_entries() const override {
+    return primary_index_builder_.st_index_entries();
   }
 
  private:

@@ -773,6 +773,7 @@ uint64_t Compaction::CalculateTotalInputSize() const {
 
 void Compaction::ReleaseCompactionFiles(const Status& status) {
   MarkFilesBeingCompacted(false);
+  // Dispatch through the picker so level pickers can update ST trigger state.
   cfd_->compaction_picker()->ReleaseCompactionFiles(this, status);
 }
 

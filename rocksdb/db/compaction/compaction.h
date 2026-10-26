@@ -125,6 +125,13 @@ class Compaction {
 
   int start_level() const { return start_level_; }
 
+  bool IsStSameLevelMerge() const { return st_same_level_merge_; }
+  void SetStSameLevelMerge() {
+    assert(start_level_ > 0 && start_level_ == output_level_);
+    st_same_level_merge_ = true;
+    max_subcompactions_ = 1;
+  }
+
   // Outputs will go to this level
   int output_level() const { return output_level_; }
 
@@ -621,6 +628,7 @@ class Compaction {
 
   // Reason for compaction
   CompactionReason compaction_reason_;
+  bool st_same_level_merge_ = false;
 
   // Notify on compaction completion only if listener was notified on compaction
   // begin.

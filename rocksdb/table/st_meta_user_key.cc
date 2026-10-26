@@ -202,65 +202,6 @@ void MergeSpatioTemporalMetaFromSegmentValue(
 
 }  // namespace
 
-namespace {
-
-bool E7HostBucketFromSegmentValue(const Slice& value, uint32_t bucket_width_sec,
-                                   uint32_t* host_bucket) {
-  if (host_bucket == nullptr) {
-    return false;
-  }
-  SegmentValueHeaderForStMeta header{};
-  if (!TryDecodeSegmentValueHeader(value, &header)) {
-    return false;
-  }
-  const uint32_t bw = bucket_width_sec == 0 ? kSpatioTemporalE7DefaultBucketSeconds
-                                            : bucket_width_sec;
-  *host_bucket = header.t_start / bw;
-  return true;
-}
-
-}  // namespace
-
-bool StQuerySegmentUidDedup::AcceptEmitUserKey(const Slice& user_key,
-                                               const Slice& value) {
-  StSegmentUid uid;
-  if (!TryDecodeE7SegmentUid(user_key, &uid)) {
-    return true;
-  }
-  uint32_t cur_bucket = 0;
-  if (!TryDecodeE7HostBucketId(user_key, &cur_bucket)) {
-    return true;
-  }
-  uint32_t host_bucket = 0;
-  bool cur_is_host = false;
-  if (value.size() > 0 &&
-      E7HostBucketFromSegmentValue(value, bucket_width_sec, &host_bucket)) {
-    cur_is_host = (cur_bucket == host_bucket);
-  }
-  auto it = seen.find(uid);
-  if (it == seen.end()) {
-    seen.emplace(uid, Entry{cur_bucket, cur_is_host});
-    return true;
-  }
-  if (it->second.kept_is_host) {
-    ++dedup_skipped;
-    return false;
-  }
-  if (cur_is_host) {
-    it->second.kept_is_host = true;
-    it->second.kept_bucket_id = cur_bucket;
-    return true;
-  }
-  ++dedup_skipped;
-  return false;
-}
-
-bool TryDecodeE7HostBucketFromValue(const Slice& value,
-                                    uint32_t bucket_width_sec,
-                                    uint32_t* host_bucket) {
-  return E7HostBucketFromSegmentValue(value, bucket_width_sec, host_bucket);
-}
-
 bool TryDecodeE7HostBucketId(const Slice& user_key, uint32_t* bucket_id) {
   if (bucket_id == nullptr || user_key.size() < kSpatioTemporalE7KeyBytes ||
       static_cast<unsigned char>(user_key[0]) != kSpatioTemporalSegmentKeyTzidMagic) {
@@ -275,6 +216,18 @@ bool TryDecodeE7HostBucketId(const Slice& user_key, uint32_t* bucket_id) {
                (static_cast<uint32_t>(static_cast<unsigned char>(p[1])) << 16) |
                (static_cast<uint32_t>(static_cast<unsigned char>(p[2])) << 8) |
                static_cast<uint32_t>(static_cast<unsigned char>(p[3]));
+  return true;
+}
+
+bool TryDecodeSegmentValueStartTime(const Slice& value, uint32_t* t_start) {
+  if (t_start == nullptr) {
+    return false;
+  }
+  SegmentValueHeaderForStMeta header{};
+  if (!TryDecodeSegmentValueHeader(value, &header)) {
+    return false;
+  }
+  *t_start = header.t_start;
   return true;
 }
 
@@ -418,7 +371,8 @@ void AppendE7PruneSeekLowerBoundUserKey(uint32_t q_t_min,
 }
 
 bool TryDecodeSpatioTemporalUserKeyTime(const Slice& user_key,
-                                        uint32_t* t_sec) {
+                                        uint32_t* t_sec,
+                                        uint32_t bucket_width_sec) {
   if (t_sec == nullptr || user_key.size() < 5) {
     return false;
   }
@@ -445,7 +399,11 @@ bool TryDecodeSpatioTemporalUserKeyTime(const Slice& user_key,
     if (!TryDecodeE7HostBucketId(user_key, &bucket_id)) {
       return false;
     }
-    *t_sec = bucket_id * kSpatioTemporalE7DefaultBucketSeconds;
+    const uint32_t width = bucket_width_sec == 0
+        ? kSpatioTemporalE7DefaultBucketSeconds : bucket_width_sec;
+    const uint64_t start = static_cast<uint64_t>(bucket_id) * width;
+    if (start > UINT32_MAX) return false;
+    *t_sec = static_cast<uint32_t>(start);
     return true;
   }
   // Legacy E6 segment keys encode t_start big-endian for memcmp ordering.

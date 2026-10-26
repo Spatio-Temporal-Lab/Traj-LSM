@@ -45,10 +45,26 @@ inline std::string EncodeSegmentValueV2(const SegmentValueHeader& head,
   if (points.size() != static_cast<size_t>(head.point_count)) {
     return {};
   }
+  // CSV summaries may be rounded more coarsely than the stored float points.
+  // Derive bounds from the actual payload to prevent false-negative pruning.
+  SegmentValueHeader bounds = head;
+  if (!points.empty()) {
+    bounds.t_start = bounds.t_end = points.front().unix_s;
+    bounds.x_min = bounds.x_max = points.front().lon;
+    bounds.y_min = bounds.y_max = points.front().lat;
+    for (const auto& p : points) {
+      bounds.t_start = std::min(bounds.t_start, p.unix_s);
+      bounds.t_end = std::max(bounds.t_end, p.unix_s);
+      bounds.x_min = std::min(bounds.x_min, p.lon);
+      bounds.x_max = std::max(bounds.x_max, p.lon);
+      bounds.y_min = std::min(bounds.y_min, p.lat);
+      bounds.y_max = std::max(bounds.y_max, p.lat);
+    }
+  }
   std::string out;
   out.resize(4 + sizeof(SegmentValueHeader) + points.size() * 12);
   std::memcpy(out.data(), &kSegmentValueMagicV2, 4);
-  std::memcpy(out.data() + 4, &head, sizeof(head));
+  std::memcpy(out.data() + 4, &bounds, sizeof(bounds));
   size_t off = 4 + sizeof(head);
   for (const auto& p : points) {
     std::memcpy(out.data() + off, &p.unix_s, 4);

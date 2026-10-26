@@ -245,8 +245,6 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
   cf_opts->experimental_compaction_event_time_max_point_keys =
       moptions.experimental_compaction_event_time_max_point_keys;
   cf_opts->experimental_st_compaction = moptions.experimental_st_compaction;
-  cf_opts->experimental_st_compaction_level_trigger_ratio =
-      moptions.experimental_st_compaction_level_trigger_ratio;
   cf_opts->experimental_st_compaction_l1_l2_tiered =
       moptions.experimental_st_compaction_l1_l2_tiered;
   cf_opts->experimental_st_compaction_tiered_max_level =
@@ -255,8 +253,8 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
       moptions.experimental_st_compaction_tiered_min_level;
   cf_opts->experimental_st_compaction_real_tiered_l1_l2 =
       moptions.experimental_st_compaction_real_tiered_l1_l2;
-  cf_opts->experimental_st_compaction_tiered_max_runs_per_level =
-      moptions.experimental_st_compaction_tiered_max_runs_per_level;
+  cf_opts->experimental_st_compaction_level_trigger_ratio =
+      moptions.experimental_st_compaction_level_trigger_ratio;
   cf_opts->experimental_st_compaction_stfp_enable =
       moptions.experimental_st_compaction_stfp_enable;
   cf_opts->experimental_compaction_read_repair_first =

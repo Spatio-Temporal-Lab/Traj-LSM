@@ -15,9 +15,11 @@ if [[ "$mode" == release ]]; then
   cmake --build "$build_dir" --target stlsm_tools --parallel "$jobs"
   printf 'Executables: %s/bin\n' "$build_dir"
 else
-  cmake --build "$build_dir" --target compaction_picker_test db_compaction_test --parallel "$jobs"
+  cmake --build "$build_dir" --target compaction_picker_test db_compaction_test st_design_regression --parallel "$jobs"
   export TEST_TMPDIR="$build_dir/test-data"
   mkdir -p "$TEST_TMPDIR"
-  "$build_dir/bin/compaction_picker_test" '--gtest_filter=*NeedsCompaction*:*STFileCount*'
-  "$build_dir/bin/db_compaction_test" '--gtest_filter=DBCompactionTest.STFileCountSchedulesSameLevelBelowCapacity:DBCompactionTest.ManualCompactionUnknownOutputSize'
+  "$build_dir/bin/compaction_picker_test" '--gtest_filter=*NeedsCompaction*:CompactionPickerTest.ST*'
+  "$build_dir/bin/db_compaction_test" '--gtest_filter=DBCompactionTest.ST*:DBCompactionTest.ManualCompactionUnknownOutputSize'
+  regression_dir="$(mktemp -d "$build_dir/test-data/st-design-XXXXXX")"
+  "$build_dir/bin/st_design_regression" "$regression_dir"
 fi

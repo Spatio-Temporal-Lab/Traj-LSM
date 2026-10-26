@@ -237,14 +237,12 @@ void ReportStCompactionOptions(rocksdb::DB* db, const char* label) {
             << " block_compaction_ratio="
             << o.experimental_st_block_compaction_ratio
             << " st_compaction=" << static_cast<int>(o.experimental_st_compaction)
-            << " st_level_trigger_ratio="
-            << o.experimental_st_compaction_level_trigger_ratio
             << " st_l1_l2_tiered="
             << static_cast<int>(o.experimental_st_compaction_l1_l2_tiered)
             << " st_real_tiered="
             << static_cast<int>(o.experimental_st_compaction_real_tiered_l1_l2)
-            << " st_file_count_threshold="
-            << o.experimental_st_compaction_tiered_max_runs_per_level
+            << " st_level_trigger_ratio="
+            << o.experimental_st_compaction_level_trigger_ratio
             << "\n";
   std::cout
       << label
@@ -265,7 +263,7 @@ int main(int argc, char** argv) {
   bool st_l1_l2_tiered = false;
   bool st_real_tiered = false;
   int st_tiered_max_level = 0;
-  int st_tiered_max_runs_per_level = 16;
+  double st_level_trigger_ratio = 0.8;
   int max_level_bytes_mb = 0;
   bool no_force_bottommost = false;
   uint32_t st_bucket_sec = 0;
@@ -333,16 +331,15 @@ int main(int argc, char** argv) {
       st_tiered_max_level = static_cast<int>(v);
       continue;
     }
-    if ((std::strcmp(argv[i], "--st-tiered-max-runs-per-level") == 0 ||
-         std::strcmp(argv[i], "--st-file-count") == 0) &&
+    if (std::strcmp(argv[i], "--st-level-trigger-ratio") == 0 &&
         i + 1 < argc) {
       char* e = nullptr;
-      const long v = std::strtol(argv[++i], &e, 10);
-      if (e == argv[i] || *e != '\0' || v < 0 || v > 1000) {
-        std::cerr << "Invalid --st-file-count (0=unlimited)\n";
+      const double v = std::strtod(argv[++i], &e);
+      if (e == argv[i] || *e != '\0' || v < 0.0 || v > 1.0) {
+        std::cerr << "Invalid --st-level-trigger-ratio (0.0-1.0)\n";
         return 1;
       }
-      st_tiered_max_runs_per_level = static_cast<int>(v);
+      st_level_trigger_ratio = v;
       continue;
     }
     if (std::strcmp(argv[i], "--max-level-bytes-mb") == 0 && i + 1 < argc) {
@@ -552,7 +549,7 @@ int main(int argc, char** argv) {
              "      NOTE: non-leveled styles rename old OPTIONS-* files so the DB opens with the new style.\n"
              "  --st-time-split      enable ST event-time split during compaction\n"
              "  --st-compaction      enable ST-compaction scheduler (Mind.md: L1+ at "
-             "ratio*MaxBytes, whole-layer Lx->Lx+1, L0 output pinned L1)\n"
+             "MaxBytes, whole-layer Lx->Lx+1, L0 output pinned L1)\n"
              "  --st-l1-l2-tiered    ST-Hybrid: use Tiered semantics for L1→L2, L2→L3\n"
              "                       (subset merge, lower write amp at shallow levels)\n"
              "  --st-bucket-sec W    split when floor(t_sec/W) changes (segment keys use t_start)\n"
@@ -668,9 +665,9 @@ int main(int argc, char** argv) {
     cf_opts["experimental_st_compaction_tiered_max_level"] =
         std::to_string(st_tiered_max_level);
   }
-  if (st_tiered_max_runs_per_level >= 0 && st_real_tiered) {
-    cf_opts["experimental_st_compaction_tiered_max_runs_per_level"] =
-        std::to_string(st_tiered_max_runs_per_level);
+  if (st_real_tiered) {
+    cf_opts["experimental_st_compaction_level_trigger_ratio"] =
+        std::to_string(st_level_trigger_ratio);
   }
   if (max_level_bytes_mb > 0) {
     cf_opts["max_bytes_for_level_base"] =

@@ -10,13 +10,20 @@
 #include "db/compaction/compaction_picker_level.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <deque>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "db/compaction/st_event_split_policy.h"
+#include "db/column_family.h"
 #include "db/version_edit.h"
+#include "db/version_set.h"
 #include "logging/log_buffer.h"
+#include "logging/logging.h"
 #include "table/st_meta_index_extension.h"
 #include "test_util/sync_point.h"
 
@@ -92,7 +99,7 @@ struct GlobalEnvelope {
   bool valid = false;
 };
 
-GlobalEnvelope ComputeLevelEnvelope(
+[[maybe_unused]] GlobalEnvelope ComputeLevelEnvelope(
     const std::vector<FileMetaData*>& files) {
   GlobalEnvelope e;
   double t_min = std::numeric_limits<double>::max();
@@ -126,7 +133,8 @@ GlobalEnvelope ComputeLevelEnvelope(
 // into a scalar S ∈ [0,1] using the global envelope for normalization.
 //   S = 0.50 * t_norm + 0.25 * x_norm + 0.25 * y_norm
 // Returns -1 if the file has no ST meta.
-double ComputeSHybrid(const FileMetaData* f, const GlobalEnvelope& env) {
+double ComputeSHybrid(const FileMetaData* f, const GlobalEnvelope& env,
+                      double alpha) {
   if (!f->has_st_file_meta || !env.valid) return -1.0;
   const auto& m = f->st_file_meta;
   const double t_c = (static_cast<double>(m.t_min) + m.t_max) * 0.5;
@@ -135,7 +143,9 @@ double ComputeSHybrid(const FileMetaData* f, const GlobalEnvelope& env) {
   const double t_n = (t_c - env.t_min) / std::max(env.t_max - env.t_min, 1e-9);
   const double x_n = (x_c - env.x_min) / std::max(env.x_max - env.x_min, 1e-9);
   const double y_n = (y_c - env.y_min) / std::max(env.y_max - env.y_min, 1e-9);
-  return 0.50 * t_n + 0.25 * x_n + 0.25 * y_n;
+  alpha = std::clamp(alpha, 0.0, 1.0);
+  const double spatial = 0.5 * (x_n + y_n);
+  return alpha * t_n + (1.0 - alpha) * spatial;
 }
 
 // Find the best pair of neighboring files to merge by scanning the level's
@@ -144,8 +154,10 @@ double ComputeSHybrid(const FileMetaData* f, const GlobalEnvelope& env) {
 //   ΔS_threshold: below this value, files are "close enough" to merge.
 constexpr double kDeltaSThreshold = 0.01;
 
-void FindBestNeighborPair(const std::vector<FileMetaData*>& files,
+[[maybe_unused]] void FindBestNeighborPair(
+    const std::vector<FileMetaData*>& files,
                            const GlobalEnvelope& env,
+                           double alpha,
                            std::vector<FileMetaData*>* out_pair) {
   out_pair->clear();
   // Collect files with valid S_hybrid.
@@ -157,7 +169,7 @@ void FindBestNeighborPair(const std::vector<FileMetaData*>& files,
   scored.reserve(files.size());
   for (auto* f : files) {
     if (f == nullptr || f->being_compacted) continue;
-    double s = ComputeSHybrid(f, env);
+    double s = ComputeSHybrid(f, env, alpha);
     if (s < 0.0) continue;  // no ST meta, skip
     scored.push_back({f, s});
   }
@@ -195,8 +207,8 @@ double ComputeMbrArea(const SpatioTemporalBlockMeta& m) {
   return w * h;
 }
 
-SpatioTemporalBlockMeta UnionMbr(const SpatioTemporalBlockMeta& a,
-                                const SpatioTemporalBlockMeta& b) {
+[[maybe_unused]] SpatioTemporalBlockMeta UnionMbr(
+    const SpatioTemporalBlockMeta& a, const SpatioTemporalBlockMeta& b) {
   SpatioTemporalBlockMeta out = a;
   out.x_min = std::min(out.x_min, b.x_min);
   out.x_max = std::max(out.x_max, b.x_max);
@@ -268,7 +280,7 @@ double TimeGapNormalized(const SpatioTemporalBlockMeta& a,
 
 double SpatialProximityFineScore(
     const FileMetaData* cand, const FileMetaData* overlap,
-    uint32_t time_norm) {
+    uint32_t time_norm, double alpha) {
   if (cand == nullptr || overlap == nullptr || !cand->has_st_file_meta ||
       !overlap->has_st_file_meta) {
     return std::numeric_limits<double>::infinity();
@@ -276,11 +288,8 @@ double SpatialProximityFineScore(
   const auto& cm = cand->st_file_meta;
   const auto& om = overlap->st_file_meta;
 
-  // Mind.md recommended weights.
-  constexpr double wt = 0.35;
-  constexpr double ws = 0.35;
-  constexpr double we = 0.20;
-  constexpr double wb = 0.10;
+  alpha = std::clamp(alpha, 0.0, 1.0);
+  const double spatial_weight = 1.0 - alpha;
 
   const double d_t = TimeGapNormalized(cm, om, time_norm);
 
@@ -294,19 +303,7 @@ double SpatialProximityFineScore(
     d_s = 1.0 + d_edge / std::max(base, 1e-6);
   }
 
-  const SpatioTemporalBlockMeta merged = UnionMbr(cm, om);
-  const double expansion =
-      (ComputeMbrArea(merged) - ComputeMbrArea(cm)) /
-      std::max(ComputeMbrArea(cm), 1e-12);
-
-  const double cand_size = static_cast<double>(cand->fd.GetFileSize());
-  const double overlap_size =
-      static_cast<double>(overlap->fd.GetFileSize());
-  const double avg = std::max((cand_size + overlap_size) * 0.5, 1.0);
-  const double imbalance = std::abs(cand_size - overlap_size) / avg;
-
-  const double score = wt * d_t + ws * d_s + we * expansion + wb * imbalance;
-  return score;
+  return alpha * d_t + spatial_weight * d_s;
 }
 
 double SpatialProximityCoarseEdgeThreshold(int out_level) {
@@ -341,7 +338,8 @@ double IouTime(const SpatioTemporalBlockMeta& a,
 // Higher score → more beneficial to merge per I/O byte.
 //   efficiency = (alpha * IouTime + beta * IouSpatial) / log2(1 + total_bytes)
 // If both time AND space are disjoint, returns 0 (skip — no pruning benefit).
-double MergePriorityScore(const FileMetaData* a, const FileMetaData* b) {
+double MergePriorityScore(const FileMetaData* a, const FileMetaData* b,
+                          double alpha) {
   if (a == nullptr || b == nullptr ||
       !a->has_st_file_meta || !b->has_st_file_meta) {
     return 0.01;  // no ST meta → low baseline, eligible but deprioritized
@@ -349,8 +347,8 @@ double MergePriorityScore(const FileMetaData* a, const FileMetaData* b) {
   const auto& ma = a->st_file_meta;
   const auto& mb = b->st_file_meta;
 
-  constexpr double alpha = 0.50;  // time overlap
-  constexpr double beta  = 0.50;  // spatial overlap
+  alpha = std::clamp(alpha, 0.0, 1.0);
+  const double spatial_weight = 1.0 - alpha;
 
   const double iou_t = IouTime(ma, mb);
   const double iou_s = MbrIou(ma, mb);
@@ -364,67 +362,109 @@ double MergePriorityScore(const FileMetaData* a, const FileMetaData* b) {
   const double total_mb = (sz_a + sz_b) / (1024.0 * 1024.0);
   const double size_den = std::log2(1.0 + total_mb);
 
-  return (alpha * iou_t + beta * iou_s) / std::max(size_den, 1e-6);
+  return (alpha * iou_t + spatial_weight * iou_s) /
+         std::max(size_den, 1e-6);
 }
 
 // Select a key-contiguous batch of files to merge in-place from a level with
 // too many files. Same-level output must not span over unselected files, so the
 // candidates are adjacent in level order and scored by ST proximity.
+// Proxy for uniformly distributed point-query file accesses, not actual latency.
+// Integer-second intervals include both endpoints.
+long double StEnvelopeVolume(const std::array<double, 6>& b) {
+  return (static_cast<long double>(b[1]) - b[0] + 1) *
+         (static_cast<long double>(b[3]) - b[2]) *
+         (static_cast<long double>(b[5]) - b[4]);
+}
+
 void SelectBestMergeBatch(const std::vector<FileMetaData*>& level_files,
-                          int max_files,
-                          std::vector<FileMetaData*>* out_selected) {
+                         double alpha,
+                         std::vector<FileMetaData*>* out_selected) {
   out_selected->clear();
   const size_t n = level_files.size();
-  if (n < 2) return;
-
-  // Count active (non-compacting) files.
-  int active = 0;
-  for (size_t i = 0; i < n; ++i) {
-    if (level_files[i] != nullptr && !level_files[i]->being_compacted)
-      ++active;
+  size_t active = 0;
+  for (const auto* f : level_files) {
+    if (f != nullptr && !f->being_compacted) ++active;
   }
-  if (active <= max_files) return;  // no merge needed
-
-  const int target_batch = std::max(2, active - max_files + 1);
-  double best_score = -1.0;
-  uint64_t best_bytes = std::numeric_limits<uint64_t>::max();
+  if (active < 2) return;
+  // One arrival token permits one bounded same-level repair.
+  constexpr size_t kMaxStMergeFiles = 4;
+  const size_t max_batch = std::min(kMaxStMergeFiles, active);
   size_t best_begin = n;
-  size_t best_end = n;
+  size_t best_size = 0;
+  long double best_score = -1;
+  long double best_volume_ratio = std::numeric_limits<long double>::infinity();
+  uint64_t best_bytes = UINT64_MAX;
 
-  for (size_t begin = 0; begin < n; ++begin) {
-    if (level_files[begin] == nullptr || level_files[begin]->being_compacted) {
-      continue;
-    }
-    int count = 0;
-    double score = 0.0;
-    uint64_t bytes = 0;
-    FileMetaData* prev = nullptr;
-    size_t end = begin;
-    for (; end < n && count < target_batch; ++end) {
-      FileMetaData* file = level_files[end];
-      if (file == nullptr || file->being_compacted) {
-        break;
+  // A large candidate can fail the envelope test even when a smaller adjacent
+  // batch is beneficial. Try every bounded batch size, largest first.
+  for (size_t k = max_batch; k >= 2; --k) {
+    std::vector<long double> volumes(n + 1, 0), scores(n + 1, 0);
+    std::vector<uint64_t> bytes(n + 1, 0);
+    std::vector<size_t> invalid(n + 1, 0);
+    std::array<std::deque<std::pair<size_t, double>>, 6> bounds;
+    for (size_t i = 0; i < n; ++i) {
+      const auto* f = level_files[i];
+      std::array<double, 6> b{};
+      bool valid = f != nullptr && !f->being_compacted &&
+                   f->has_st_file_meta && f->num_range_deletions == 0;
+      if (valid) {
+        const auto& m = f->st_file_meta;
+        b = {{double(m.t_min), double(m.t_max), m.x_min, m.x_max,
+              m.y_min, m.y_max}};
+        for (double x : b) valid = valid && std::isfinite(x);
+        valid = valid && b[0] <= b[1] && b[2] <= b[3] && b[4] <= b[5];
       }
-      if (prev != nullptr) {
-        score += MergePriorityScore(prev, file);
+      if (!valid) b.fill(0);
+      invalid[i + 1] = invalid[i] + !valid;
+      volumes[i + 1] = volumes[i] + (valid ? StEnvelopeVolume(b) : 0);
+      bytes[i + 1] = bytes[i] + (f != nullptr ? f->fd.GetFileSize() : 0);
+      scores[i + 1] = scores[i] +
+          (i > 0 && valid && invalid[i] == invalid[i - 1]
+               ? MergePriorityScore(level_files[i - 1], f, alpha) : 0);
+      for (size_t d = 0; d < bounds.size(); ++d) {
+        auto& q = bounds[d];
+        while (!q.empty() &&
+               ((d % 2 == 0) ? q.back().second >= b[d]
+                             : q.back().second <= b[d])) q.pop_back();
+        q.emplace_back(i, b[d]);
+        while (!q.empty() && q.front().first + k <= i) q.pop_front();
       }
-      bytes += file->fd.GetFileSize();
-      prev = file;
-      ++count;
+      if (i + 1 < k) continue;
+      const size_t begin = i + 1 - k, end = i + 1;
+      if (invalid[end] != invalid[begin]) continue;
+      std::array<double, 6> merged{};
+      for (size_t d = 0; d < bounds.size(); ++d) {
+        merged[d] = bounds[d].front().second;
+      }
+      const long double input_volume = volumes[end] - volumes[begin];
+      const long double merged_volume = StEnvelopeVolume(merged);
+      const bool has_volume_improvement = merged_volume < input_volume;
+      const long double volume_ratio =
+          input_volume > 0 ? merged_volume / input_volume : 1;
+      const long double score = scores[end] - scores[begin + 1];
+      const uint64_t input_bytes = bytes[end] - bytes[begin];
+
+      // The incoming-file event only triggers candidate evaluation. Do not
+      // rewrite files when merging would not reduce the ST envelope.
+      if (!has_volume_improvement) continue;
+      const bool better = best_begin == n || score > best_score ||
+          (score == best_score &&
+           (volume_ratio < best_volume_ratio ||
+            (volume_ratio == best_volume_ratio && input_bytes < best_bytes)));
+      if (better) {
+        best_begin = begin;
+        best_size = k;
+        best_score = score;
+        best_volume_ratio = volume_ratio;
+        best_bytes = input_bytes;
+      }
     }
-    if (count == target_batch &&
-        (score > best_score ||
-         (score == best_score && bytes < best_bytes))) {
-      best_score = score;
-      best_bytes = bytes;
-      best_begin = begin;
-      best_end = end;
-    }
+    if (k == 2) break;
   }
-  if (best_begin == n) return;
-
-  for (size_t i = best_begin; i < best_end; ++i) {
-    out_selected->push_back(const_cast<FileMetaData*>(level_files[i]));
+  if (best_begin != n) {
+    out_selected->assign(level_files.begin() + best_begin,
+                         level_files.begin() + best_begin + best_size);
   }
 }
 
@@ -433,7 +473,7 @@ double EdgeDistance(const SpatioTemporalBlockMeta& a,
                     const SpatioTemporalBlockMeta& b);
 double SpatialProximityFineScore(
     const FileMetaData* cand, const FileMetaData* overlap,
-    uint32_t time_norm);
+    uint32_t time_norm, double alpha);
 double SpatialProximityCoarseEdgeThreshold(int out_level);
 
 // A class to build a leveled compaction step-by-step.
@@ -540,6 +580,7 @@ class LevelCompactionBuilder {
   CompactionInputFiles output_level_inputs_;
   std::vector<FileMetaData*> grandparents_;
   CompactionReason compaction_reason_ = CompactionReason::kUnknown;
+  bool st_same_level_merge_ = false;
 
   const MutableCFOptions& mutable_cf_options_;
   const ImmutableOptions& ioptions_;
@@ -617,7 +658,11 @@ void LevelCompactionBuilder::PickFileToCompact(
           continue;
         }
         coarse_any = true;
-        best_score = std::min(best_score, SpatialProximityFineScore(f, g, time_norm));
+        best_score = std::min(
+            best_score,
+            SpatialProximityFineScore(
+                f, g, time_norm,
+                mutable_cf_options_.experimental_st_compaction_alpha));
       }
 
       if (coarse_any && best_score < preferred_score) {
@@ -714,13 +759,16 @@ WritePressure ComputeWritePressure(const VersionStorageInfo* vstorage,
   return WritePressure::NORMAL;
 }
 
-int FindSTFileCountLevel(const VersionStorageInfo* vstorage,
-                         const MutableCFOptions& options,
-                         const ImmutableOptions& ioptions) {
-  const int max_files =
-      options.experimental_st_compaction_tiered_max_runs_per_level;
-  if (!options.experimental_st_compaction_l1_l2_tiered ||
-      !options.experimental_st_compaction_real_tiered_l1_l2 || max_files <= 0 ||
+int FindSTIncomingMergeLevel(const VersionStorageInfo* vstorage,
+                             const MutableCFOptions& options,
+                             const ImmutableOptions& ioptions,
+                             const LevelCompactionPicker* picker) {
+  const double trigger_ratio = std::clamp(
+      options.experimental_st_compaction_level_trigger_ratio, 0.0, 1.0);
+  if (!options.experimental_st_compaction ||
+      !options.experimental_st_compaction_l1_l2_tiered ||
+      !options.experimental_st_compaction_real_tiered_l1_l2 ||
+      trigger_ratio <= 0.0 || picker == nullptr ||
       ComputeWritePressure(vstorage,
                            options.level0_file_num_compaction_trigger) ==
           WritePressure::HIGH) {
@@ -728,22 +776,35 @@ int FindSTFileCountLevel(const VersionStorageInfo* vstorage,
   }
   const int min_level =
       std::max(1, options.experimental_st_compaction_tiered_min_level);
-  int max_level = std::min(
-      vstorage->MaxInputLevel(),
-      vstorage->MaxOutputLevel(ioptions.cf_allow_ingest_behind ||
-                              ioptions.allow_ingest_behind) - 1);
+  // Same-level merging needs no lower destination and is valid at the last
+  // writable level as well. Respect a level reserved for ingest-behind.
+  int max_level = vstorage->MaxOutputLevel(
+      ioptions.cf_allow_ingest_behind || ioptions.allow_ingest_behind);
   if (options.experimental_st_compaction_tiered_max_level > 0) {
     max_level = std::min(
         max_level, options.experimental_st_compaction_tiered_max_level);
   }
   for (int level = min_level; level <= max_level; ++level) {
-    int active_files = 0;
-    for (const auto* file : vstorage->LevelFiles(level)) {
-      if (file != nullptr && !file->being_compacted &&
-          ++active_files > max_files) {
-        return level;
-      }
+    const uint64_t level_bytes = vstorage->NumLevelBytes(level);
+    const uint64_t level_capacity = vstorage->MaxBytesForLevel(level);
+    if (!picker->HasPendingSTIncomingFile(level) || level_capacity == 0 ||
+        level_bytes >= level_capacity ||
+        level_bytes < static_cast<uint64_t>(trigger_ratio * level_capacity)) {
+      continue;
     }
+    std::vector<FileMetaData*> candidate;
+    SelectBestMergeBatch(vstorage->LevelFiles(level),
+                         options.experimental_st_compaction_alpha, &candidate);
+    if (!candidate.empty()) return level;
+    const auto& files = vstorage->LevelFiles(level);
+    const size_t available = std::count_if(
+        files.begin(), files.end(), [](const FileMetaData* file) {
+          return file != nullptr && !file->being_compacted;
+        });
+    // Keep the arrival event while another compaction temporarily owns most
+    // files. The picker will retry when that job releases its inputs.
+    if (available < 2) continue;
+    picker->ClearPendingSTIncomingFiles(level);
   }
   return -1;
 }
@@ -779,15 +840,12 @@ void LevelCompactionBuilder::SetupInitialFiles() {
     }
   }
 
-  // Write-pressure adaptive threshold: when idle, proactively compact
-  // at a lower threshold. When under high write pressure, skip non-L0
-  // compaction entirely — let L0 backlog clear first.
+  // Prioritize L0 under write pressure. ST capacity scores use physical bytes
+  // divided by capacity; do not apply an extra idle threshold.
   const WritePressure wp = ComputeWritePressure(
       vstorage_,
       mutable_cf_options_.level0_file_num_compaction_trigger);
-  constexpr double kIdleScoreThreshold = 0.7;
-  const double effective_threshold =
-      (wp == WritePressure::IDLE) ? kIdleScoreThreshold : 1.0;
+  constexpr double effective_threshold = 1.0;
 
   for (int i = 0; i < num_score_slots; i++) {
     start_level_score_ = vstorage_->CompactionScore(i);
@@ -795,7 +853,8 @@ void LevelCompactionBuilder::SetupInitialFiles() {
     assert(i == 0 || start_level_score_ <= vstorage_->CompactionScore(i - 1));
 
     // HIGH write pressure: skip non-L0 compaction (only L0→L1 allowed).
-    if (wp == WritePressure::HIGH && start_level_ > 0) continue;
+    if (mutable_cf_options_.experimental_st_compaction &&
+        wp == WritePressure::HIGH && start_level_ > 0) continue;
 
     if (start_level_score_ >= effective_threshold) {
       const int l0_dest_level =
@@ -863,21 +922,19 @@ void LevelCompactionBuilder::SetupInitialFiles() {
       break;
     }
   }
-  // ST file-count trigger: when an ST-tiered level has more SSTables than
-  // the configured file-count limit, select a key-contiguous batch of
-  // spatio-temporally close SSTables and merge them back into the same level.
-  // This repairs same-level fragmentation without pushing data downward.
+  // Each installed file from an upper level permits one ST same-level merge
+  // after the destination level reaches its configured byte-capacity ratio.
+  // Capacity compaction above has priority; same-level outputs add no token.
   // Skip under HIGH write pressure — write throughput takes priority.
   // This is the only automatic same-level ST merge trigger.
   if (wp != WritePressure::HIGH &&
       start_level_inputs_.empty() &&
       mutable_cf_options_.experimental_st_compaction_l1_l2_tiered &&
       mutable_cf_options_.experimental_st_compaction_real_tiered_l1_l2) {
-    const int max_files =
-        mutable_cf_options_.experimental_st_compaction_tiered_max_runs_per_level;
-    if (max_files > 0) {  // 0 = unlimited, never trigger
-      const int lvl =
-          FindSTFileCountLevel(vstorage_, mutable_cf_options_, ioptions_);
+    {
+      auto* st_picker = static_cast<LevelCompactionPicker*>(compaction_picker_);
+      const int lvl = FindSTIncomingMergeLevel(
+          vstorage_, mutable_cf_options_, ioptions_, st_picker);
       if (lvl >= 0) {
         const auto& files = vstorage_->LevelFiles(lvl);
         // Select a same-level batch of SSTables to merge (one compaction job).
@@ -885,14 +942,28 @@ void LevelCompactionBuilder::SetupInitialFiles() {
         // SST coexistence is by design — st_file_meta time windows
         // guarantee recall regardless of which bucket a segment lives in.
         std::vector<FileMetaData*> merge_batch;
-        SelectBestMergeBatch(files, max_files, &merge_batch);
-        if (merge_batch.size() < 2) return;
+        SelectBestMergeBatch(
+            files, mutable_cf_options_.experimental_st_compaction_alpha,
+            &merge_batch);
+        if (merge_batch.size() < 2) {
+          st_picker->ConsumePendingSTIncomingFile(lvl);
+          return;
+        }
+        ROCKS_LOG_BUFFER(
+            log_buffer_,
+            "ST_SAME_LEVEL_MERGE_PICK level=%d files=%zu ratio=%.3f "
+            "selected_files=%zu",
+            lvl, files.size(),
+            mutable_cf_options_.experimental_st_compaction_level_trigger_ratio,
+            merge_batch.size());
 
-        // Found a level with too many files. Compact the selected batch
-        // back to the same level in one job. No output-level files are
+        // Compact the selected batch back to the same level in one job. No
+        // output-level files are
         // involved; block-level ST splitting still applies to the output.
         start_level_inputs_.level = lvl;
         start_level_inputs_.files = std::move(merge_batch);
+        st_picker->ConsumePendingSTIncomingFile(lvl);
+        st_same_level_merge_ = true;
         output_level_ = lvl;
         start_level_ = lvl;
         compaction_reason_ = CompactionReason::kLevelMaxLevelSize;
@@ -1124,7 +1195,7 @@ bool LevelCompactionBuilder::SetupOtherInputsIfNeeded() {
   // spans of files that do not interact with any pending compactions, so don't
   // need to consider other levels.
   if (output_level_ != 0) {
-    // ST file-count compaction is same-level, so it does not pull extra files
+    // ST arrival-triggered compaction is same-level, so it does not pull extra files
     // from an output level. ST capacity compaction is inter-level and keeps
     // the normal LSM overlap handling for the next level.
     bool skip_output_level_inputs = false;
@@ -1242,6 +1313,8 @@ Compaction* LevelCompactionBuilder::GetCompaction() {
       /* earliest_snapshot */ std::nullopt, /* snapshot_checker */ nullptr,
       compaction_reason_,
       /* trim_ts */ "", start_level_score_, l0_files_might_overlap);
+
+  if (st_same_level_merge_) c->SetStSameLevelMerge();
 
   // If it's level 0 compaction, make sure we don't execute any other level 0
   // compactions in parallel
@@ -1661,24 +1734,35 @@ bool LevelCompactionBuilder::PickSizeBasedIntraL0Compaction() {
 }
 
 
-// ST-aware level-capacity compaction: pick the whole non-L0 level and compact
-// it to the next level. Same-level ST fragmentation is handled separately by
-// the file-count trigger.
+// ST-aware capacity compaction: include every file in the source level, then
+// let SetupOtherInputsIfNeeded add only key-range-overlapping files from the
+// next level. The bottommost level has no next level, so it is rewritten in
+// place. Same-level ST consolidation is selected on upper-level file arrivals
+// after the configured capacity ratio is reached.
 bool LevelCompactionBuilder::TryPickWholeLevelNonL0ST() {
   assert(start_level_ > 0);
   start_level_inputs_.clear();
   start_level_inputs_.level = start_level_;
   const std::vector<FileMetaData*>& level_files =
       vstorage_->LevelFiles(start_level_);
+  constexpr size_t kMaxCapacityBatchFiles = 4;
+  uint64_t batch_bytes = 0;
   for (auto* f : level_files) {
-    if (f == nullptr) {
+    if (f == nullptr || f->being_compacted) {
       continue;
     }
-    if (f->being_compacted) {
-      start_level_inputs_.clear();
-      return false;
+    const uint64_t next_bytes = batch_bytes + f->fd.GetFileSize();
+    if (!start_level_inputs_.files.empty() &&
+        (start_level_inputs_.files.size() >= kMaxCapacityBatchFiles ||
+         next_bytes > mutable_cf_options_.max_compaction_bytes)) {
+      break;
     }
     start_level_inputs_.files.push_back(f);
+    batch_bytes = next_bytes;
+  }
+  if (start_level_inputs_.files.size() < 2) {
+    start_level_inputs_.clear();
+    return false;
   }
   if (start_level_inputs_.files.empty()) {
     return false;
@@ -1717,7 +1801,100 @@ bool LevelCompactionPicker::NeedsCompaction(
     const VersionStorageInfo* vstorage,
     const MutableCFOptions& mutable_cf_options) const {
   return NeedsCompaction(vstorage) ||
-         FindSTFileCountLevel(vstorage, mutable_cf_options, ioptions_) >= 0;
+         FindSTIncomingMergeLevel(vstorage, mutable_cf_options, ioptions_,
+                                  this) >= 0;
+}
+
+bool LevelCompactionPicker::HasPendingSTIncomingFile(int level) const {
+  std::lock_guard<std::mutex> lock(st_incoming_mutex_);
+  return level >= 0 && static_cast<size_t>(level) <
+                           st_pending_incoming_files_.size() &&
+         st_pending_incoming_files_[level] > 0;
+}
+
+void LevelCompactionPicker::ConsumePendingSTIncomingFile(int level) {
+  std::lock_guard<std::mutex> lock(st_incoming_mutex_);
+  if (level >= 0 && static_cast<size_t>(level) <
+                        st_pending_incoming_files_.size() &&
+      st_pending_incoming_files_[level] > 0) {
+    --st_pending_incoming_files_[level];
+  }
+}
+
+void LevelCompactionPicker::ClearPendingSTIncomingFiles(int level) const {
+  std::lock_guard<std::mutex> lock(st_incoming_mutex_);
+  if (level >= 0 && static_cast<size_t>(level) <
+                        st_pending_incoming_files_.size()) {
+    st_pending_incoming_files_[level] = 0;
+  }
+}
+
+void LevelCompactionPicker::RecordSTIncomingFiles(int level, size_t count) {
+  if (level < 0 || count == 0) return;
+  std::lock_guard<std::mutex> lock(st_incoming_mutex_);
+  if (st_pending_incoming_files_.size() <= static_cast<size_t>(level)) {
+    st_pending_incoming_files_.resize(static_cast<size_t>(level) + 1, 0);
+  }
+  st_pending_incoming_files_[level] += count;
+}
+
+void LevelCompactionPicker::ReleaseCompactionFiles(Compaction* c,
+                                                    const Status& status) {
+  CompactionPicker::ReleaseCompactionFiles(c, status);
+  if (c == nullptr) return;
+  const int level = c->IsStSameLevelMerge() ? c->start_level()
+                                            : c->output_level();
+  if (level < 0) return;
+  if (c->IsStSameLevelMerge()) {
+    if (!status.ok()) {
+      RecordSTIncomingFiles(level, 1);
+    } else {
+      auto* cfd = c->column_family_data();
+      Version* current = cfd == nullptr ? nullptr : cfd->current();
+      if (current != nullptr) {
+        const auto* storage = current->storage_info();
+        const uint64_t capacity = storage->MaxBytesForLevel(level);
+        const uint64_t bytes = storage->NumLevelBytes(level);
+        const double ratio = std::clamp(
+            c->mutable_cf_options()
+                .experimental_st_compaction_level_trigger_ratio,
+            0.0, 1.0);
+        if (capacity == 0 ||
+            bytes < static_cast<uint64_t>(ratio * capacity)) {
+          ClearPendingSTIncomingFiles(level);
+        }
+      }
+    }
+    return;
+  }
+  if (!status.ok() || c->output_level() <= c->start_level()) return;
+  // A successful level-down compaction removes the queued arrival context
+  // from its source level. Do not let those old tokens trigger a later merge
+  // after the level has been drained below the threshold.
+  ClearPendingSTIncomingFiles(c->start_level());
+  size_t incoming = 0;
+  for (const auto& output : c->edit()->GetNewFiles()) {
+    if (output.first == level) ++incoming;
+  }
+  if (incoming == 0 && c->IsTrivialMove()) {
+    incoming = c->num_input_files(0);
+  }
+  auto* cfd = c->column_family_data();
+  Version* current = cfd == nullptr ? nullptr : cfd->current();
+  if (incoming == 0 || current == nullptr) return;
+  const auto* storage = current->storage_info();
+  const uint64_t capacity = storage->MaxBytesForLevel(level);
+  const uint64_t bytes = storage->NumLevelBytes(level);
+  const double ratio = std::clamp(
+      c->mutable_cf_options().experimental_st_compaction_level_trigger_ratio,
+      0.0, 1.0);
+  if (c->mutable_cf_options().experimental_st_compaction &&
+      c->mutable_cf_options().experimental_st_compaction_l1_l2_tiered &&
+      c->mutable_cf_options().experimental_st_compaction_real_tiered_l1_l2 &&
+      ratio > 0.0 && capacity > 0 && bytes < capacity &&
+      bytes >= static_cast<uint64_t>(ratio * capacity)) {
+    RecordSTIncomingFiles(level, incoming);
+  }
 }
 
 Compaction* LevelCompactionPicker::PickCompaction(

@@ -46,7 +46,6 @@ namespace {
 
 using ROCKSDB_NAMESPACE::UserKeySpatioTemporalInWindow;
 using ROCKSDB_NAMESPACE::Hash64;
-using ROCKSDB_NAMESPACE::StQuerySegmentUidDedup;
 
 constexpr unsigned char kMagicPointKey = 0xE5;
 constexpr unsigned char kMagicSegmentLegacyKey = 0xE6;
@@ -301,7 +300,6 @@ int main(int argc, char** argv) {
   std::string full_scan_mode = "window";
   bool verify_kv_results = false;
   bool verify_kv_results_strict_exit = false;
-  bool query_segment_uid_dedup = true;
   // External reference from segments_meta (time+MBR) / spatial-only window CSV.
   uint64_t ref_meta_st_segments = 0;
   uint64_t ref_spatial_segments = 0;
@@ -422,10 +420,6 @@ int main(int argc, char** argv) {
     if (std::strcmp(a, "--verify-kv-results-strict-exit") == 0) {
       verify_kv_results = true;
       verify_kv_results_strict_exit = true;
-      continue;
-    }
-    if (std::strcmp(a, "--no-query-segment-uid-dedup") == 0) {
-      query_segment_uid_dedup = false;
       continue;
     }
     if (std::strcmp(a, "--ref-meta-st-segments") == 0 && i + 1 < argc) {
@@ -708,7 +702,6 @@ int main(int argc, char** argv) {
     bcfg.envelope_t_min = prune_t_min;
     bcfg.envelope_t_max = prune_t_max;
     bcfg.prune_mode = prune_mode;
-    bcfg.query_segment_uid_dedup = query_segment_uid_dedup;
     bcfg.verify_kv_results = verify_kv_results;
     bcfg.time_bucket_count = time_bucket_count;
     bcfg.rtree_leaf_size = rtree_leaf_size;
@@ -734,10 +727,6 @@ int main(int argc, char** argv) {
 
   rocksdb::SetPerfLevel(rocksdb::PerfLevel::kEnableTimeExceptForMutex);
 
-  StQuerySegmentUidDedup query_dedup_full;
-  StQuerySegmentUidDedup query_dedup_prune;
-  query_dedup_full.bucket_width_sec = cf_bucket_width_sec;
-  query_dedup_prune.bucket_width_sec = cf_bucket_width_sec;
 
   int64_t count_full = 0;
   int64_t count_full_scanned_total = 0;
@@ -752,7 +741,6 @@ int main(int argc, char** argv) {
   uint64_t verify_full_unsupported_key = 0;
 
   if (run_full) {
-    query_dedup_full.Reset();
     rocksdb::ReadOptions base(rocksdb::Env::IOActivity::kDBIterator);
     base.total_order_seek = true;
     base.fill_cache = false;
@@ -806,10 +794,6 @@ int main(int argc, char** argv) {
             ++verify_full_legacy_segment_value;
           }
           if (pe.in_window) {
-            if (query_segment_uid_dedup &&
-                !query_dedup_full.AcceptEmitUserKey(uk)) {
-              continue;
-            }
             const rocksdb::Slice v = it->value();
             // Use stable Hash64 in two independent seeds to avoid hash collisions.
             constexpr uint64_t kSeed1 = 0x123456789abcdef0ULL;
@@ -908,11 +892,6 @@ int main(int argc, char** argv) {
     prune.fill_cache = false;
     prune.experimental_st_prune_scan.enable = true;
     prune.experimental_st_prune_scan.value_level_point_truth_enable = true;
-    const bool prune_iterator_segment_uid_dedup = query_segment_uid_dedup;
-    if (prune_iterator_segment_uid_dedup) {
-      prune.experimental_st_prune_scan.query_dedup_by_segment_uid_enable = true;
-      prune.experimental_st_prune_scan.query_segment_uid_dedup = &query_dedup_prune;
-    }
     if (event_time_bucket_width_sec_override > 0) {
       prune.experimental_st_prune_scan.event_time_bucket_width_sec =
           event_time_bucket_width_sec_override;
@@ -1145,12 +1124,6 @@ int main(int argc, char** argv) {
           if (!pe.in_window) {
             continue;
           }
-          // Iterator already dedupes by segment_uid when enabled; do not call
-          // AcceptEmitUserKey again or every emitted key is treated as duplicate.
-          if (query_segment_uid_dedup && !prune_iterator_segment_uid_dedup &&
-              !query_dedup_prune.AcceptEmitUserKey(uk)) {
-            continue;
-          }
           constexpr uint64_t kSeed1 = 0x123456789abcdef0ULL;
           constexpr uint64_t kSeed2 = 0x0fedcba987654321ULL;
           uint64_t h1 = Hash64(uk.data(), uk.size(), kSeed1);
@@ -1244,13 +1217,6 @@ int main(int argc, char** argv) {
               << prune_y_max << "]\n";
   }
 
-  if (query_segment_uid_dedup && run_prune) {
-    std::cout << "query_result_dedup_count full_skipped="
-              << query_dedup_full.dedup_skipped
-              << " prune_skipped=" << query_dedup_prune.dedup_skipped
-              << " full_unique_kv=" << full_inwindow_kv
-              << " prune_unique_kv=" << prune_inwindow_kv << "\n";
-  }
 
   if (verify_kv_results && run_prune && !run_full) {
     bool ref_ok = true;

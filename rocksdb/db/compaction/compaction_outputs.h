@@ -11,8 +11,6 @@
 #pragma once
 
 #include <array>
-#include <unordered_map>
-#include <unordered_set>
 
 #include "db/blob/blob_garbage_meter.h"
 #include "table/st_meta_user_key.h"
@@ -256,17 +254,12 @@ class CompactionOutputs {
   // before processing the current key in compaction iterator.
   bool ShouldStopBefore(const CompactionIterator& c_iter);
 
-  // Experimental: cut SST before `c_iter` when ST user-key Event Time rules
-  // trigger (see ColumnFamilyOptions::experimental_compaction_event_time_*).
+  // Retained as an internal no-op compatibility hook; SST event-time
+  // splitting is no longer called by ShouldStopBefore().
   bool ShouldStopBeforeEventTime(const CompactionIterator& c_iter);
   static double ComputeSpatialArea(const SpatioTemporalBlockMeta& m);
   enum class StEventCutReason : uint8_t {
-    kNone = 0,
-    kBucketSpan,
-    kTimeSpan,
-    kMaxKeys,
-    kHardSpatial,
-    kSoftSpatial,
+    kNone = 0, kBucketSpan, kTimeSpan, kMaxKeys, kHardSpatial, kSoftSpatial,
   };
 
   void Cleanup() {
@@ -370,7 +363,7 @@ class CompactionOutputs {
 
   // indicate if this CompactionOutputs obj for proximal_level, should always
   // be false if per_key_placement feature is not enabled.
-  const bool is_proximal_level_;
+  bool is_proximal_level_;
 
   // partitioner information
   std::string last_key_for_partitioner_;
@@ -423,7 +416,6 @@ class CompactionOutputs {
   // increasing key range.
   std::vector<size_t> level_ptrs_;
 
-  // Per-output-file state for experimental_compaction_event_time_split (ST keys).
   bool st_event_out_has_st_key_ = false;
   uint32_t st_event_out_min_t_ = 0;
   uint32_t st_event_out_max_t_ = 0;
@@ -440,21 +432,9 @@ class CompactionOutputs {
   uint64_t st_event_metric_max_keys_cuts_ = 0;
   uint64_t st_event_metric_hard_spatial_cuts_ = 0;
   uint64_t st_event_metric_soft_spatial_cuts_ = 0;
-  // One-shot diagnostics for event-time split debugging.
   bool st_event_diag_logged_first_decode_ = false;
   bool st_event_diag_logged_decode_fail_ = false;
 
-  // L3+ Uid-Merge: drop duplicate segment_uid in this subcompaction stream.
-  bool st_uid_merge_enabled_ = false;
-  struct StUidMergeEntry {
-    uint32_t kept_bucket_id = 0;
-    bool kept_is_host = false;
-  };
-  std::unordered_map<StSegmentUid, StUidMergeEntry, StSegmentUidHash>
-      st_uid_merge_seen_;
-  uint64_t st_compaction_uid_dropped_ = 0;
-
-  bool ShouldDropDuplicateSegmentUid(const Slice& user_key, const Slice& value);
 };
 
 // helper struct to concatenate the last level and proximal level outputs

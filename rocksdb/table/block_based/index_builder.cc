@@ -43,7 +43,9 @@ IndexBuilder* IndexBuilder::CreateIndexBuilder(
           table_opt.index_shortening, /* include_first_key */ false, ts_sz,
           persist_user_defined_timestamps, statistics,
           table_opt.uniform_cv_threshold,
-          table_opt.experimental_spatio_temporal_meta_in_index_value);
+          table_opt.experimental_spatio_temporal_meta_in_index_value,
+          table_opt.experimental_st_index_block_enable,
+          table_opt.experimental_st_index_bucket_seconds);
       break;
     }
     case BlockBasedTableOptions::kHashSearch: {
@@ -55,7 +57,9 @@ IndexBuilder* IndexBuilder::CreateIndexBuilder(
           table_opt.index_block_restart_interval, table_opt.format_version,
           use_value_delta_encoding, table_opt.index_shortening, ts_sz,
           persist_user_defined_timestamps, table_opt.uniform_cv_threshold,
-          table_opt.experimental_spatio_temporal_meta_in_index_value);
+          table_opt.experimental_spatio_temporal_meta_in_index_value,
+          table_opt.experimental_st_index_block_enable,
+          table_opt.experimental_st_index_bucket_seconds);
       break;
     }
     case BlockBasedTableOptions::kTwoLevelIndexSearch: {
@@ -71,7 +75,9 @@ IndexBuilder* IndexBuilder::CreateIndexBuilder(
           table_opt.index_shortening, /* include_first_key */ true, ts_sz,
           persist_user_defined_timestamps, statistics,
           table_opt.uniform_cv_threshold,
-          table_opt.experimental_spatio_temporal_meta_in_index_value);
+          table_opt.experimental_spatio_temporal_meta_in_index_value,
+          table_opt.experimental_st_index_block_enable,
+          table_opt.experimental_st_index_bucket_seconds);
       break;
     }
     default: {
@@ -142,7 +148,7 @@ void ShortenedIndexBuilder::UpdateIndexSizeEstimate() {
 
 void ShortenedIndexBuilder::MergeInternalKeyIntoBlockStMeta(
     const Slice& internal_key, const std::optional<Slice>& value) {
-  if (!attach_st_meta_in_index_value_) {
+  if (!attach_st_meta_in_index_value_ && !attach_st_index_block_) {
     return;
   }
   ParsedInternalKey parsed;
@@ -152,6 +158,20 @@ void ShortenedIndexBuilder::MergeInternalKeyIntoBlockStMeta(
   MergeSpatioTemporalMetaFromKeyValue(parsed.user_key, value,
                                       &block_st_meta_accumulator_,
                                       &block_st_meta_accumulator_valid_);
+  uint32_t start_time = 0;
+  uint32_t start_bucket = 0;
+  if (value.has_value() &&
+      TryDecodeSegmentValueStartTime(*value, &start_time)) {
+    start_bucket = start_time / st_index_bucket_seconds_;
+  } else if (TryDecodeE7HostBucketId(parsed.user_key, &start_bucket)) {
+  } else {
+    return;
+  }
+  if (!block_max_start_bucket_valid_ ||
+      start_bucket > block_max_start_bucket_) {
+    block_max_start_bucket_ = start_bucket;
+    block_max_start_bucket_valid_ = true;
+  }
 }
 
 void ShortenedIndexBuilder::AccumulateFileSpatioTemporalMetaForManifest(
@@ -166,7 +186,7 @@ void ShortenedIndexBuilder::AccumulateFileSpatioTemporalMetaForManifest(
 
 SpatioTemporalBlockMeta ShortenedIndexBuilder::FinalizeBlockStMetaForDataBlock(
     const Slice& last_key_in_current_block,
-    const Slice* first_key_in_next_block) {
+    const Slice* first_key_in_next_block, uint32_t* max_start_bucket) {
   (void)last_key_in_current_block;
   (void)first_key_in_next_block;
   SpatioTemporalBlockMeta out{};
@@ -189,6 +209,13 @@ SpatioTemporalBlockMeta ShortenedIndexBuilder::FinalizeBlockStMetaForDataBlock(
   running_prefix_max_t_end_ = std::max(running_prefix_max_t_end_, out.t_max);
   block_st_meta_accumulator_valid_ = false;
   block_st_meta_accumulator_ = SpatioTemporalBlockMeta{};
+  if (max_start_bucket != nullptr) {
+    *max_start_bucket = block_max_start_bucket_valid_
+                            ? block_max_start_bucket_
+                            : 0;
+  }
+  block_max_start_bucket_valid_ = false;
+  block_max_start_bucket_ = 0;
   return out;
 }
 
@@ -248,7 +275,9 @@ void PartitionedIndexBuilder::MakeNewSubIndexBuilder() {
       table_opt_.index_shortening, /* include_first_key */ false, ts_sz_,
       persist_user_defined_timestamps_, statistics_,
       table_opt_.uniform_cv_threshold,
-      table_opt_.experimental_spatio_temporal_meta_in_index_value);
+      table_opt_.experimental_spatio_temporal_meta_in_index_value,
+      table_opt_.experimental_st_index_block_enable,
+      table_opt_.experimental_st_index_bucket_seconds);
   sub_index_builder_ = new_builder.get();
   sub_index_builder_->SetRunningPrefixMaxTEnd(carry_prefix_max);
   // Start next partition entry, where we will modify the key

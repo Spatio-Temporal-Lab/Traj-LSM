@@ -428,16 +428,6 @@ ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
     result.level_compaction_dynamic_level_bytes = false;
   }
 
-  if (result.experimental_st_compaction) {
-    if (result.experimental_st_compaction_level_trigger_ratio <= 0.0 ||
-        result.experimental_st_compaction_level_trigger_ratio > 1.0) {
-      ROCKS_LOG_WARN(db_options.info_log.get(),
-                     "experimental_st_compaction_level_trigger_ratio invalid; "
-                     "clamping to 0.9");
-      result.experimental_st_compaction_level_trigger_ratio = 0.9;
-    }
-  }
-
   if (result.max_compaction_bytes == 0) {
     // For FIFO with use_kv_ratio_compaction, leave max_compaction_bytes as 0
     // to signal "auto-calculate target from capacity and SST/blob ratio."

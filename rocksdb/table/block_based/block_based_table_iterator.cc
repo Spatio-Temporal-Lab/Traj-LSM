@@ -84,23 +84,20 @@ inline bool IndexBucketPastQueryWindow(const Slice& index_separator_key,
   }
   const unsigned char* p = reinterpret_cast<const unsigned char*>(uk.data());
   const uint32_t max_query_bucket = q.t_max / q.event_time_bucket_width_sec;
-  // E7 segment key: bucket_id at bytes [2:6) big-endian.
-  // When uk.size() >= 6 we have the full bucket_id and can do an exact check.
-  // When uk.size() < 6 the separator was shortened across a bucket_id
+  // E7 segment key: bucket_id at bytes [1:5) big-endian.
+  // Shortened separators are padded with zero to form a lower bound
+  // for keys in subsequent blocks (not the current block).
   // boundary — reconstruct a conservative lower bound: pad missing lower
   // bytes with 0x00. The true next-block bucket_id is >= this lower bound.
   uint32_t bucket_id_lower = 0;
-  for (size_t i = 2; i < 6; ++i) {
+  for (size_t i = 1; i < 5; ++i) {
     bucket_id_lower <<= 8;
     if (i < uk.size()) {
       bucket_id_lower |= static_cast<uint32_t>(p[i]);
     }
     // else: pad with 0x00 (missing lower bytes → conservative lower bound)
   }
-  // Conservative: stop only when the lower bound is strictly past
-  // max_query_bucket+1 (+1 accounts for segments that start near the
-  // query end boundary).
-  return bucket_id_lower > max_query_bucket + 1;
+  return bucket_id_lower > max_query_bucket;
 }
 
 void AdvanceIndexPastPrunedForward(
@@ -110,46 +107,16 @@ void AdvanceIndexPastPrunedForward(
     return;  // ST prune disabled: nothing to advance
   }
   // ── Forward truncation via prefix_max_t_end ──────────────────────
-  // Each index entry carries prefix_max_t_end = max{t_end of all blocks
-  // before this one}. If at the Seek landing position this value is
-  // strictly less than q.t_min, every preceding block ends before the
-  // query and we can safely start from here. Otherwise, a long segment
-  // starting in an earlier bucket may extend into the query window, so
-  // walk backward one entry at a time until we find a safe position.
-  //
-  // IMPORTANT: this backward walk is ONLY correct for initial positioning
-  // (after Seek/SeekToFirst). During forward iteration (FindBlockForward),
-  // the iterator is already past the safe starting point and walking
-  // backward would re-process already-read blocks. Use
-  // skip_prefix_max_backward=true from forward-iteration call sites.
-  if (!skip_prefix_max_backward &&
-      index_iter->Valid() && ro.experimental_st_prune_scan.enable &&
+  // Binary-search the monotone prefix end-time summary on initial positioning,
+  // independently of key schema and bucket lookback. Retain long segments
+  // starting before the query. Never reposition during Next().
+  if (!skip_prefix_max_backward && index_iter->Valid() &&
       ro.experimental_st_prune_scan.block_level_enable &&
       !IsStLocalPruneShortCircuited(ro) && !StDisableForwardTruncation()) {
-    const IndexValue& first = index_iter->value();
-    if (first.has_st_meta &&
-        first.st_meta.prefix_max_t_end >= ro.experimental_st_prune_scan.t_min) {
-      // Binary-search backward to the first entry whose data block can overlap:
-      // prefix_max_t_end is monotonically non-decreasing, so the rightmost entry
-      // with prefix_max_t_end < q.t_min is the safe starting position (all
-      // blocks before it end strictly before the query). The first entry
-      // (prefix_max=0) remains the always-safe fallback.
-      static_cast<IndexBlockIter*>(index_iter)
-          ->SeekToFirstPotentialOverlap(ro.experimental_st_prune_scan.t_min);
-    }
+    static_cast<IndexBlockIter*>(index_iter)->SeekToFirstPotentialOverlap(
+        ro.experimental_st_prune_scan.t_min);
   }
-  // ── Per-entry forward pruning + backward truncation ──────────────
   while (index_iter->Valid()) {
-    // Backward truncation: always active, needs only the index key's
-    // bucket_id ordering (no ST meta). Invalidate on hit so callers
-    // (FindBlockForward / SeekImpl) see !Valid() and stop immediately.
-    if (!StDisableBackwardTruncation() &&
-        IndexBucketPastQueryWindow(index_iter->key(),
-                                   ro.experimental_st_prune_scan)) {
-      auto* ib = static_cast<IndexBlockIter*>(index_iter);
-      ib->Invalidate(Status::OK());
-      return;
-    }
     // ST overlap check: always active in Local index (every index entry
     // must pass time+space overlap before its data block is decompressed).
     // Controlled by block_level_enable, not by ST_DISABLE_FORWARD_TRUNCATION
@@ -186,6 +153,13 @@ void AdvanceIndexPastPrunedForward(
         ++(*q.block_level_index_entries_skipped_st_disjoint);
       }
       record_prune_ns();
+      // The separator bounds subsequent blocks, not this block. Only use
+      // it after independently proving the current block is disjoint.
+      if (!StDisableBackwardTruncation() &&
+          IndexBucketPastQueryWindow(index_iter->key(), q)) {
+        static_cast<IndexBlockIter*>(index_iter)->Invalidate(Status::OK());
+        return;
+      }
       index_iter->Next();
       continue;
     }
@@ -337,6 +311,12 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
       index_iter_->Seek(*target);
     } else {
       SeekStPruneIndexForScan(read_options_, index_iter_.get());
+      // A long segment may overlap the query even when its start bucket
+      // precedes every seek key in this file. Recover before prefix search.
+      if (!index_iter_->Valid() && index_iter_->status().ok() &&
+          read_options_.experimental_st_prune_scan.enable) {
+        index_iter_->SeekToFirst();
+      }
     }
     is_index_at_curr_block_ = true;
     if (!index_iter_->Valid()) {

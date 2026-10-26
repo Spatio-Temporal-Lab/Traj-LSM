@@ -1369,26 +1369,41 @@ TEST_F(DBCompactionTest, ZeroSeqIdCompaction) {
   ASSERT_OK(Put("", ""));
 }
 
-TEST_F(DBCompactionTest, STFileCountSchedulesSameLevelBelowCapacity) {
+TEST_F(DBCompactionTest, STCapacityTriggerDoesNotUseFileCountAlone) {
   Options options = CurrentOptions();
   options.compaction_style = kCompactionStyleLevel;
   options.level_compaction_dynamic_level_bytes = false;
   options.disable_auto_compactions = true;
   options.max_bytes_for_level_base = 1ULL << 30;
   options.max_bytes_for_level_multiplier = 10;
-  options.target_file_size_base = 64ULL << 20;
+  options.target_file_size_base = 1024;
+  options.compression = kNoCompression;
+  BlockBasedTableOptions table;
+  table.experimental_spatio_temporal_meta_in_index_value = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(table));
+  options.experimental_compaction_event_time_split = true;
+  options.experimental_compaction_event_time_max_point_keys = 1;
   options.experimental_st_compaction = true;
   options.experimental_st_compaction_l1_l2_tiered = true;
   options.experimental_st_compaction_stfp_enable = false;
+  auto key = [](int id) {
+    std::string k(27, '\0'); k[0] = static_cast<char>(0xE7);
+    k[24] = static_cast<char>(id); return k;
+  };
+  // Seg2 header with shared, nondegenerate bounds. Large payload forces
+  // ordinary SST size splitting; max_point_keys=1 forces event splitting.
+  std::string value(16384, '\0');
+  auto put32 = [&](size_t offset, auto v) { std::memcpy(&value[offset], &v, 4); };
+  put32(0, uint32_t{0x32676553}); put32(4, uint32_t{1});
+  put32(8, uint32_t{10}); put32(20, 1.0f); put32(24, 1.0f);
   for (int file_count_limit : {4, 8}) {
     DestroyAndReopen(options);
     ASSERT_OK(dbfull()->SetOptions({
         {"experimental_st_compaction_real_tiered_l1_l2", "true"},
-        {"experimental_st_compaction_tiered_max_runs_per_level",
-         std::to_string(file_count_limit)},
+        {"experimental_st_compaction_level_trigger_ratio", "0.8"},
     }));
     for (int file_index = 0; file_index <= file_count_limit; ++file_index) {
-      ASSERT_OK(Put(Key(file_index), "value"));
+      ASSERT_OK(Put(key(file_index), value));
       ASSERT_OK(Flush());
       MoveFilesToLevel(1);
     }
@@ -1398,24 +1413,161 @@ TEST_F(DBCompactionTest, STFileCountSchedulesSameLevelBelowCapacity) {
     ASSERT_TRUE(db_->GetOptions().experimental_st_compaction_real_tiered_l1_l2);
     uint64_t pending = 0;
     ASSERT_TRUE(db_->GetIntProperty("rocksdb.compaction-pending", &pending));
-    ASSERT_EQ(1U, pending);
+    ASSERT_EQ(0U, pending);
     ASSERT_OK(dbfull()->SetOptions(
-        {{"experimental_st_compaction_tiered_max_runs_per_level", "0"}}));
+        {{"experimental_st_compaction_level_trigger_ratio", "0"}}));
     ASSERT_TRUE(db_->GetIntProperty("rocksdb.compaction-pending", &pending));
     ASSERT_EQ(0U, pending);
     ASSERT_TRUE(db_->GetOptions().experimental_st_compaction_real_tiered_l1_l2);
     ASSERT_OK(dbfull()->SetOptions(
-        {{"experimental_st_compaction_tiered_max_runs_per_level",
-          std::to_string(file_count_limit)}}));
+        {{"experimental_st_compaction_level_trigger_ratio", "0.8"}}));
     ASSERT_OK(dbfull()->SetOptions({{"disable_auto_compactions", "false"}}));
     ASSERT_OK(dbfull()->TEST_WaitForCompact());
-    ASSERT_LE(NumTableFilesAtLevel(1), file_count_limit);
+    ASSERT_EQ(NumTableFilesAtLevel(1), file_count_limit + 1);
+    ColumnFamilyMetaData final_meta;
+    db_->GetColumnFamilyMetaData(&final_meta);
+    uint64_t largest = 0;
+    for (const auto& f : final_meta.levels[1].files) largest = std::max(largest, f.size);
+    ASSERT_LT(largest, 2 * value.size());
     ASSERT_EQ(0, NumTableFilesAtLevel(2));
     for (int file_index = 0; file_index <= file_count_limit; ++file_index) {
-      ASSERT_EQ("value", Get(Key(file_index)));
+      ASSERT_EQ(value, Get(key(file_index)));
     }
     ASSERT_TRUE(db_->GetIntProperty("rocksdb.compaction-pending", &pending));
     ASSERT_EQ(0U, pending);
+  }
+}
+
+TEST_F(DBCompactionTest, STOutputHasNoImplicitRecordCountCut) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.experimental_st_compaction = true;
+  options.experimental_compaction_event_time_split = true;
+  options.experimental_compaction_event_time_bucket_width = 3600;
+  options.experimental_compaction_event_time_max_point_keys = 0;
+  options.target_file_size_base = 64ULL << 20;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+  for (uint32_t i = 0; i < 12010; ++i) {
+    std::string key(27, '\0');
+    key[0] = static_cast<char>(0xE7);
+    for (int j = 0; j < 4; ++j)
+      key[21 + j] = static_cast<char>(i >> (24 - j * 8));
+    ASSERT_OK(Put(key, "value"));
+  }
+  ASSERT_OK(Flush());
+  std::vector<LiveFileMetaData> files;
+  db_->GetLiveFilesMetaData(&files);
+  std::vector<std::string> names;
+  for (const auto& f : files) names.push_back(f.relative_filename);
+  CompactionOptions compact;
+  compact.allow_trivial_move = false;
+  ASSERT_OK(db_->CompactFiles(compact, names, 1));
+  ASSERT_EQ(0, NumTableFilesAtLevel(0));
+  ASSERT_EQ(1, NumTableFilesAtLevel(1));
+}
+
+TEST_F(DBCompactionTest, STCompactFilesSplitsOnBucketSpan) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.experimental_st_compaction = true;
+  options.experimental_compaction_event_time_split = true;
+  options.experimental_compaction_event_time_bucket_width = 3600;
+  options.experimental_compaction_event_time_max_span = 64 * 3600;
+  options.experimental_compaction_event_time_max_point_keys = 0;
+  options.target_file_size_base = 64ULL << 20;
+  options.compression = kNoCompression;
+  DestroyAndReopen(options);
+
+  for (uint32_t bucket = 0; bucket < 130; ++bucket) {
+    std::string key(27, '\0');
+    key[0] = static_cast<char>(0xE7);
+    for (int j = 0; j < 4; ++j) {
+      key[1 + j] = static_cast<char>(bucket >> (24 - j * 8));
+    }
+    key[24] = static_cast<char>(bucket);
+    ASSERT_OK(Put(key, "value"));
+  }
+  ASSERT_OK(Flush());
+
+  std::vector<LiveFileMetaData> files;
+  db_->GetLiveFilesMetaData(&files);
+  std::vector<std::string> names;
+  for (const auto& file : files) {
+    names.push_back(file.relative_filename);
+  }
+  ASSERT_FALSE(names.empty());
+
+  CompactionOptions compact;
+  compact.allow_trivial_move = false;
+  ASSERT_OK(db_->CompactFiles(compact, names, 1));
+  ASSERT_EQ(0, NumTableFilesAtLevel(0));
+  ASSERT_GT(NumTableFilesAtLevel(1), 1);
+  for (uint32_t bucket = 0; bucket < 130; ++bucket) {
+    std::string key(27, '\0');
+    key[0] = static_cast<char>(0xE7);
+    for (int j = 0; j < 4; ++j) {
+      key[1 + j] = static_cast<char>(bucket >> (24 - j * 8));
+    }
+    key[24] = static_cast<char>(bucket);
+    ASSERT_EQ("value", Get(key));
+  }
+}
+
+TEST_F(DBCompactionTest, STL0MoveVersusRewrite) {
+  Options options = CurrentOptions();
+  options.level_compaction_dynamic_level_bytes = false;
+  options.disable_auto_compactions = true;
+  options.experimental_st_compaction = true;
+  options.experimental_st_compaction_level_trigger_ratio = 0;
+  options.level0_file_num_compaction_trigger = 4;
+  options.max_bytes_for_level_base = 1ULL << 30;
+  options.compression = kNoCompression;
+  options.statistics = CreateDBStatistics();
+  for (bool overlap : {false, true}) {
+    DestroyAndReopen(options);
+    if (overlap) {
+      ASSERT_OK(Put("000", "anchor"));
+      ASSERT_OK(Put("999", "anchor"));
+      ASSERT_OK(Flush());
+      MoveFilesToLevel(1);
+    }
+    for (int i = 0; i < 3; ++i) {
+      ASSERT_OK(Put(std::to_string(100 + i), std::string(10000, 'v')));
+      ASSERT_OK(Flush());
+    }
+    ASSERT_OK(db_->SetOptions({{"disable_auto_compactions", "false"}}));
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    ASSERT_EQ(3, NumTableFilesAtLevel(0));
+    ASSERT_OK(db_->SetOptions({{"disable_auto_compactions", "true"}}));
+    ASSERT_OK(Put("103", std::string(10000, 'v')));
+    ASSERT_OK(Flush());
+    std::vector<LiveFileMetaData> before;
+    db_->GetLiveFilesMetaData(&before);
+    const auto written_before = options.statistics->getTickerCount(COMPACT_WRITE_BYTES);
+    ASSERT_OK(db_->SetOptions({{"disable_auto_compactions", "false"}}));
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
+    ASSERT_LT(NumTableFilesAtLevel(0), 4);
+    std::vector<LiveFileMetaData> after;
+    db_->GetLiveFilesMetaData(&after);
+    for (const auto& f : before) {
+      if (f.level != 0) continue;
+      const auto retained = std::find_if(after.begin(), after.end(),
+          [&](const LiveFileMetaData& g) {
+            return g.file_number == f.file_number && g.level == 0;
+          });
+      if (retained != after.end()) continue;
+      const auto same = std::find_if(after.begin(), after.end(),
+          [&](const LiveFileMetaData& g) {
+            return g.file_number == f.file_number && g.level == 1;
+          });
+      ASSERT_EQ(!overlap, same != after.end());
+    }
+    const auto written = options.statistics->getTickerCount(COMPACT_WRITE_BYTES) - written_before;
+    if (overlap) ASSERT_GT(written, 0U);
+    else ASSERT_EQ(written, 0U);
+    for (int i = 0; i < 4; ++i)
+      ASSERT_EQ(std::string(10000, 'v'), Get(std::to_string(100 + i)));
   }
 }
 

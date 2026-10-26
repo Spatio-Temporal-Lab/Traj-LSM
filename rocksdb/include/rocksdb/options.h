@@ -39,7 +39,6 @@
 namespace ROCKSDB_NAMESPACE {
 
 // Per-query segment_uid dedup state (Mind.md P0); defined in table/st_meta_user_key.h.
-struct StQuerySegmentUidDedup;
 // Manifest-level SST file filter; defined in db/manifest_ops.h.
 struct StManifestSstFilterResult;
 
@@ -2425,10 +2424,6 @@ struct ReadOptions {
     uint64_t* key_level_keys_examined = nullptr;
     uint64_t* key_level_keys_skipped_disjoint = nullptr;
     uint64_t* key_level_keys_skipped_false_positive = nullptr;
-    // Query result dedup by logical segment_uid (cross-bucket replicas). Caller
-    // owns *query_segment_uid_dedup for the iterator lifetime.
-    bool query_dedup_by_segment_uid_enable = false;
-    StQuerySegmentUidDedup* query_segment_uid_dedup = nullptr;
     // Manifest-level SST filter: pre-computed file numbers that pass per-SST
     // st_file_meta time+spatial intersection. When non-null, iterator
     // construction skips files not in the set. Caller must keep alive.

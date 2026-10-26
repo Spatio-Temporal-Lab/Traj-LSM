@@ -60,10 +60,11 @@ void IndexBlockIter::EnsureSuffixMaxComputed() {
   IndexValue entry;
   const char* p = data_;
   const char* limit = data_ + restarts_;
-  uint32_t count = 0;
+  [[maybe_unused]] uint32_t count = 0;
 
   while (p < limit) {
-    uint64_t shared = 0, non_shared = 0, value_len = 0;
+    [[maybe_unused]] uint64_t shared = 0;
+    uint64_t non_shared = 0, value_len = 0;
     for (int shift = 0; shift < 35; shift += 7) {
       if (p >= limit) break;
       unsigned char c = static_cast<unsigned char>(*p++);

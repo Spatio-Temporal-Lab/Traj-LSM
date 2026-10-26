@@ -14,53 +14,30 @@ inline uint32_t StEnvU32(const char* name, uint32_t def) {
 }
 }  // namespace
 
-// Mind.md (final): Level-aware ST compaction output policy.
+// Level-aware temporal ST compaction output policy.
 //
 // Physical compaction (SST layer) policy recap:
 // - Level-aware relax for two constraint families:
-//   1) Cross-bucket: unrestricted (no bucket-span output cut)
-//   2) Time expansion: max_time_expansion[level]
+//   1) Start-bucket span
+//   2) Start-bucket timestamp span
 //
 // Hard vs soft constraints (enforced in CompactionOutputs):
-// - Hard: time-span, max-keys (must cut)
+// - Hard: time-span (must cut)
 // - Soft: bucket-span (may be gated by min_keys)
 //
 // This header centralizes the level-aware knobs used by both
 // CompactionOutputs (output splitting) and the compaction picker preference
 // logic, to avoid policy drift across call sites.
 struct StEventSplitLevelPolicy {
-  uint32_t max_bucket_span = UINT32_MAX;  // no cross-bucket output cut
+  uint32_t max_bucket_span = UINT32_MAX;
   uint32_t effective_max_time_span = 0;   // seconds; derived from base max span
-  uint32_t effective_max_keys = UINT32_MAX;  // per-file ST key count cap
 };
 
-// Level-aware SST size pyramid: upper levels → many small files (good prune
-// locality); lower levels → few large files (sequential I/O). All dimensions
-// scale together so output files naturally grow ~4× per level.
-//
-// Target example with 284K segments across 7535 daily buckets:
-//   L1:  12000 keys,  64 buckets → ~24 SSTs, ~15.6MB each
-//   L2:  20000 keys, 128 buckets → ~14 SSTs, ~26MB each
-//   L3:  80000 keys, 256 buckets →  ~4 SSTs, ~64MB each (file-size bound)
-//   L4+: no key cap,  512 buckets → ~1-2 SSTs, ~64MB each
+// Level-aware temporal output limits. There are no per-level record-count
+// limits; ordinary file-size policy controls SST size.
 inline StEventSplitLevelPolicy ComputeStEventSplitLevelPolicy(
     int output_level, uint32_t base_max_time_span) {
   StEventSplitLevelPolicy p{};
-
-  // ── Per-file ST key cap (hard constraint, 4× per level) ──
-  // Env overrides: ST_PYRAMID_L1_KEYS, ST_PYRAMID_L2_KEYS, ST_PYRAMID_L3_KEYS
-  uint32_t l1_keys = StEnvU32("ST_PYRAMID_L1_KEYS", 12000);
-  uint32_t l2_keys = StEnvU32("ST_PYRAMID_L2_KEYS", 20000);
-  uint32_t l3_keys = StEnvU32("ST_PYRAMID_L3_KEYS", 80000);
-  if (output_level <= 1) {
-    p.effective_max_keys = l1_keys;
-  } else if (output_level == 2) {
-    p.effective_max_keys = l2_keys;
-  } else if (output_level == 3) {
-    p.effective_max_keys = l3_keys;
-  } else {
-    p.effective_max_keys = UINT32_MAX;  // L4+: no key-count split
-  }
 
   // ── Cross-bucket span (soft constraint, 2× per level) ──
   // Env overrides: ST_PYRAMID_L1_BUCKETS, ST_PYRAMID_L2_BUCKETS, ST_PYRAMID_L3_BUCKETS
@@ -96,11 +73,6 @@ inline StEventSplitLevelPolicy ComputeStEventSplitLevelPolicy(
 inline uint32_t StEventMaxBucketSpanForLevel(int output_level) {
   return ComputeStEventSplitLevelPolicy(output_level, /*base_max_time_span=*/0)
       .max_bucket_span;
-}
-
-// True when compaction may emit cross-bucket output / uid-merge (always on).
-inline bool StEventAllowsCrossBucketMerge(int /*output_level*/) {
-  return true;
 }
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -416,14 +416,11 @@ struct AdvancedColumnFamilyOptions {
   bool experimental_st_block_mbr_flush_enable = true;
   // [experimental]
   // When true with leveled compaction, use ST-compaction scheduling from
-  // Mind.md: L1+ trigger at (ratio * MaxBytesForLevel), whole-layer inputs for
+  // Mind.md: L1+ trigger at MaxBytesForLevel, whole-layer inputs for
   // Lx->Lx+1, L0 output pinned to L1, prefer L0 when L0 still needs work but a
   // deeper level has higher score, and disable intra-L0 compactions so L0
   // drains only through L0->L1. Default: false.
   bool experimental_st_compaction = false;
-  // Fraction of MaxBytesForLevel(Lx) at which Lx->Lx+1 may trigger (L1+ only).
-  // Must be in (0, 1]; default 0.9 per Mind.md.
-  double experimental_st_compaction_level_trigger_ratio = 0.9;
   // When experimental_st_compaction is true, use Tiered/Universal compaction
   // semantics for L1→L2 and L2→L3 (shallow levels: write-heavy). L3+ uses
   // standard Leveled compaction (read-optimized). Default: false.
@@ -443,26 +440,26 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through SetOptions() API
   int experimental_st_compaction_tiered_min_level = 0;
   // When experimental_st_compaction_l1_l2_tiered is true, use real Tiered
-  // (intra-level-only merge) instead of the default soft Tiered (Leveled with
-  // file count capped at 3). Real Tiered compacts all files from L(n) into
+  // (intra-level-only merge) instead of the default soft Tiered. Real Tiered
+  // compacts all files from L(n) into
   // L(n+1) WITHOUT involving L(n+1) files in the merge, dramatically reducing
   // write amplification. Read amplification increases but is alleviated by
   // ST pruning.
   //
   // Dynamically changeable through SetOptions() API
   bool experimental_st_compaction_real_tiered_l1_l2 = false;
-  // Maximum number of SSTable files allowed per non-L0 ST-tiered level
-  // (experimental_st_compaction_l1_l2_tiered) compaction before triggering an
-  // intra-level merge. The merge selects files with the highest time+spatial
-  // overlap (ST-aware) to maximize pruning efficiency. Merged files stay in
-  // the same level (no cross-level read). 0 = unlimited (pure Tiered, never
-  // trigger intra-level merge). Default: 16.
+  // Weight of temporal proximity in ST-aware file selection. Spatial
+  // proximity uses the complementary weight (1 - alpha).
+  // Dynamically changeable through SetOptions(); clamped to [0, 1].
+  double experimental_st_compaction_alpha = 0.5;
+  // Fraction of a level's byte capacity at which incoming files from the
+  // previous level may trigger one ST same-level merge. One trigger is queued
+  // per incoming SST; same-level outputs do not create new triggers. Capacity
+  // compaction has priority. Set to 0 to disable. Default: 0.8.
   //
   // Dynamically changeable through SetOptions() API
-  int experimental_st_compaction_tiered_max_runs_per_level = 16;
-  // Historical STFP gate. Kept for option compatibility; same-level ST
-  // compaction is now controlled by the file-count threshold above, while
-  // level-capacity compaction moves the whole level downward.
+  double experimental_st_compaction_level_trigger_ratio = 0.8;
+  // Historical STFP gate, retained for option compatibility.
   //
   // Dynamically changeable through SetOptions() API
   bool experimental_st_compaction_stfp_enable = false;

@@ -91,7 +91,7 @@ class SmallFileLRUCache {
   std::unordered_map<std::string, Entry> map_;
 };
 
-SmallFileLRUCache& ManifestSmallFileCache() {
+[[maybe_unused]] SmallFileLRUCache& ManifestSmallFileCache() {
   // Default capacity: keep a small batch of recent manifest-related small files.
   // This matches the "keep a small batch in memory" goal without over-allocating.
   static SmallFileLRUCache cache(/*capacity=*/16);
@@ -1032,8 +1032,8 @@ struct ManifestLogReporter : public log::Reader::Reporter {
   }
 };
 
-void AddManifestSstPruneStats(ManifestSstPruneStats* acc,
-                              const ManifestSstPruneStats& delta) {
+[[maybe_unused]] void AddManifestSstPruneStats(
+    ManifestSstPruneStats* acc, const ManifestSstPruneStats& delta) {
   if (acc == nullptr) {
     return;
   }
@@ -1316,7 +1316,9 @@ StManifestSstFilterResult ManifestFilterSstByStFileMeta(
   auto upper = std::upper_bound(
       sorted.begin(), sorted.end(), q_t_max,
       [](uint32_t t, const FileMetaData* f) {
-        return t < f->st_file_meta.t_min;
+        const uint32_t lower = (!f->has_st_file_meta || f->num_range_deletions > 0)
+                                   ? 0 : f->st_file_meta.t_min;
+        return t < lower;
       });
   out.time_disjoint += static_cast<uint64_t>(sorted.end() - upper);
 
@@ -1324,6 +1326,11 @@ StManifestSstFilterResult ManifestFilterSstByStFileMeta(
     const FileMetaData* f = *it;
     if (!f->has_st_file_meta) {
       ++out.missing_meta;
+      out.file_numbers.insert(f->fd.GetNumber());
+      continue;
+    }
+    if (f->num_range_deletions > 0) {
+      ++out.passed;
       out.file_numbers.insert(f->fd.GetNumber());
       continue;
     }

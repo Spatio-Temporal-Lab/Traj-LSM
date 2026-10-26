@@ -188,7 +188,8 @@ CompactionPicker::CompactionPicker(const ImmutableOptions& ioptions,
 
 CompactionPicker::~CompactionPicker() = default;
 
-// Delete this compaction from the list of running compactions.
+// Delete this compaction from the list of running compactions. This virtual
+// hook also lets picker implementations update scheduling state on release.
 void CompactionPicker::ReleaseCompactionFiles(Compaction* c,
                                               const Status& status) {
   UnregisterCompaction(c);

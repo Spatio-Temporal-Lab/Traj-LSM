@@ -51,6 +51,7 @@
 #include "table/index_value_codec.h"
 #include "table/meta_blocks.h"
 #include "table/st_meta_index_extension.h"
+#include "table/st_index_block.h"
 #include "table/table_builder.h"
 #include "util/bit_fields.h"
 #include "util/coding.h"
@@ -2453,6 +2454,53 @@ void BlockBasedTableBuilder::WriteIndexBlock(
   }
 }
 
+void BlockBasedTableBuilder::WriteStIndexBlock(
+    MetaIndexBuilder* meta_index_builder) {
+  if (!rep_->table_options.experimental_st_index_block_enable || !ok()) {
+    return;
+  }
+  const auto& entries = rep_->index_builder->st_index_entries();
+  if (entries.size() != rep_->props.num_data_blocks) {
+    rep_->SetStatus(Status::Corruption(
+        "ST index entry count does not match Data Block count: " +
+        std::to_string(entries.size()) + " vs " +
+        std::to_string(rep_->props.num_data_blocks)));
+    return;
+  }
+  if (entries.empty()) {
+    return;
+  }
+
+  std::string contents;
+  EncodeStIndexHeader(rep_->table_options.experimental_st_index_bucket_seconds,
+                      &contents);
+  BlockBuilder block_builder(1 /* restart interval */);
+  std::string previous_key;
+  for (const StIndexEntry& entry : entries) {
+    std::string key;
+    EncodeStIndexKey(entry.bs, entry.pe, &key);
+    std::string value;
+    EncodeStIndexValue(entry.min_timestamp, entry.max_timestamp, entry.x_min,
+                       entry.y_min, entry.x_max, entry.y_max,
+                       entry.block_handle, &value);
+    if (previous_key.empty()) {
+      block_builder.Add(key, value);
+    } else {
+      block_builder.AddWithLastKey(key, value, previous_key);
+    }
+    previous_key = std::move(key);
+  }
+  const Slice block = block_builder.Finish();
+  contents.append(block.data(), block.size());
+
+  BlockHandle handle;
+  WriteMaybeCompressedBlock(contents, kNoCompression, &handle,
+                            BlockType::kMetaIndex);
+  if (ok()) {
+    meta_index_builder->Add(kStIndexBlockName, handle);
+  }
+}
+
 void BlockBasedTableBuilder::WritePropertiesBlock(
     MetaIndexBuilder* meta_index_builder) {
   BlockHandle properties_block_handle;
@@ -2876,6 +2924,7 @@ Status BlockBasedTableBuilder::Finish() {
   MetaIndexBuilder meta_index_builder;
   WriteFilterBlock(&meta_index_builder);
   WriteIndexBlock(&meta_index_builder, &index_block_handle);
+  WriteStIndexBlock(&meta_index_builder);
   WriteCompressionDictBlock(&meta_index_builder);
   WriteRangeDelBlock(&meta_index_builder);
   WritePropertiesBlock(&meta_index_builder);

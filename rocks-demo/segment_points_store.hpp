@@ -5,9 +5,11 @@
 #pragma once
 
 #include <algorithm>
+#include <filesystem>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -22,6 +24,8 @@ class SegmentPointsStore {
  public:
   bool BuildFromCsv(const std::string& csv_path);
   bool Get(const std::string& segment_id, std::vector<SegmentPoint>* out) const;
+  bool Get(const std::string& segment_id, std::vector<SegmentPoint>* out,
+           std::ifstream* input) const;
 
  private:
   struct CsvPointRun {
@@ -29,7 +33,7 @@ class SegmentPointsStore {
     uint32_t num_points = 0;
   };
 
-  static constexpr char kIndexMagic[6] = {'S', 'T', 'P', 'X', '1', '\0'};
+  static constexpr char kIndexMagic[6] = {'S', 'T', 'P', 'X', '2', '\0'};
 
   std::string csv_path_;
   std::string index_path_;
@@ -41,7 +45,9 @@ class SegmentPointsStore {
       std::vector<std::pair<int, SegmentPoint>>* dst,
       const std::vector<std::pair<int, SegmentPoint>>& src);
   bool ReadRunFromCsv(const CsvPointRun& run, const std::string& expect_segment_id,
-                      std::vector<std::pair<int, SegmentPoint>>* pairs) const;
+                      std::vector<std::pair<int, SegmentPoint>>* pairs,
+                      std::ifstream* input) const;
+  bool LoadIndexFile(uint64_t csv_size, int64_t csv_mtime);
   bool WriteIndexFile() const;
 };
 
@@ -96,22 +102,20 @@ inline void SegmentPointsStore::MergeSortedPointPairs(
 
 inline bool SegmentPointsStore::ReadRunFromCsv(
     const CsvPointRun& run, const std::string& expect_segment_id,
-    std::vector<std::pair<int, SegmentPoint>>* pairs) const {
-  if (pairs == nullptr || run.num_points == 0) {
+    std::vector<std::pair<int, SegmentPoint>>* pairs,
+    std::ifstream* input) const {
+  if (pairs == nullptr || input == nullptr || run.num_points == 0) {
     return false;
   }
-  std::ifstream in(csv_path_);
-  if (!in) {
-    return false;
-  }
-  in.seekg(static_cast<std::streamoff>(run.byte_offset));
-  if (!in) {
+  input->clear();
+  input->seekg(static_cast<std::streamoff>(run.byte_offset));
+  if (!*input) {
     return false;
   }
   pairs->reserve(pairs->size() + run.num_points);
   std::string line;
   for (uint32_t n = 0; n < run.num_points; ++n) {
-    if (!std::getline(in, line)) {
+    if (!std::getline(*input, line)) {
       return false;
     }
     std::string segment_id;
@@ -131,12 +135,60 @@ inline bool SegmentPointsStore::ReadRunFromCsv(
   return true;
 }
 
+inline bool SegmentPointsStore::LoadIndexFile(uint64_t csv_size,
+                                              int64_t csv_mtime) {
+  std::ifstream idx(index_path_, std::ios::binary);
+  if (!idx) return false;
+  char magic[sizeof(kIndexMagic)]{};
+  uint64_t stored_size = 0;
+  int64_t stored_mtime = 0;
+  uint64_t nseg = 0;
+  idx.read(magic, sizeof(magic));
+  idx.read(reinterpret_cast<char*>(&stored_size), sizeof(stored_size));
+  idx.read(reinterpret_cast<char*>(&stored_mtime), sizeof(stored_mtime));
+  idx.read(reinterpret_cast<char*>(&nseg), sizeof(nseg));
+  if (!idx || !std::equal(std::begin(kIndexMagic), std::end(kIndexMagic), magic) ||
+      stored_size != csv_size || stored_mtime != csv_mtime ||
+      nseg > 100000000 || nseg > csv_size / 6) {
+    return false;
+  }
+  std::unordered_map<std::string, std::vector<CsvPointRun>> loaded;
+  loaded.reserve(static_cast<size_t>(nseg));
+  for (uint64_t i = 0; i < nseg; ++i) {
+    uint32_t id_len = 0;
+    uint32_t nruns = 0;
+    idx.read(reinterpret_cast<char*>(&id_len), sizeof(id_len));
+    if (!idx || id_len == 0 || id_len > 4096) return false;
+    std::string id(id_len, '\0');
+    idx.read(id.data(), static_cast<std::streamsize>(id_len));
+    idx.read(reinterpret_cast<char*>(&nruns), sizeof(nruns));
+    if (!idx || nruns == 0 || nruns > 1000000) return false;
+    auto& runs = loaded[id];
+    runs.resize(nruns);
+    for (auto& run : runs) {
+      idx.read(reinterpret_cast<char*>(&run.byte_offset), sizeof(run.byte_offset));
+      idx.read(reinterpret_cast<char*>(&run.num_points), sizeof(run.num_points));
+      if (!idx || run.num_points == 0 || run.byte_offset >= csv_size) return false;
+    }
+  }
+  if (idx.peek() != std::char_traits<char>::eof()) return false;
+  runs_ = std::move(loaded);
+  std::cerr << "  points CSV index cache hit segments=" << runs_.size()
+            << " index=" << index_path_ << "\n";
+  return true;
+}
+
 inline bool SegmentPointsStore::WriteIndexFile() const {
   std::ofstream idx(index_path_, std::ios::binary | std::ios::trunc);
   if (!idx) {
     return false;
   }
   idx.write(kIndexMagic, sizeof(kIndexMagic));
+  const uint64_t csv_size = std::filesystem::file_size(csv_path_);
+  const int64_t csv_mtime = static_cast<int64_t>(
+      std::filesystem::last_write_time(csv_path_).time_since_epoch().count());
+  idx.write(reinterpret_cast<const char*>(&csv_size), sizeof(csv_size));
+  idx.write(reinterpret_cast<const char*>(&csv_mtime), sizeof(csv_mtime));
   const uint64_t nseg = static_cast<uint64_t>(runs_.size());
   idx.write(reinterpret_cast<const char*>(&nseg), sizeof(nseg));
   for (const auto& kv : runs_) {
@@ -159,6 +211,10 @@ inline bool SegmentPointsStore::BuildFromCsv(const std::string& csv_path) {
   runs_.clear();
   csv_path_ = csv_path;
   index_path_ = csv_path + ".spill.idx";
+  const uint64_t csv_size = std::filesystem::file_size(csv_path_);
+  const int64_t csv_mtime = static_cast<int64_t>(
+      std::filesystem::last_write_time(csv_path_).time_since_epoch().count());
+  if (LoadIndexFile(csv_size, csv_mtime)) return true;
 
   std::ifstream in(csv_path_, std::ios::binary);
   if (!in) {
@@ -235,7 +291,15 @@ inline bool SegmentPointsStore::BuildFromCsv(const std::string& csv_path) {
 
 inline bool SegmentPointsStore::Get(const std::string& segment_id,
                                     std::vector<SegmentPoint>* out) const {
-  if (out == nullptr) {
+  std::ifstream input(csv_path_, std::ios::binary);
+  if (!input) return false;
+  return Get(segment_id, out, &input);
+}
+
+inline bool SegmentPointsStore::Get(const std::string& segment_id,
+                                    std::vector<SegmentPoint>* out,
+                                    std::ifstream* input) const {
+  if (out == nullptr || input == nullptr) {
     return false;
   }
   out->clear();
@@ -246,7 +310,7 @@ inline bool SegmentPointsStore::Get(const std::string& segment_id,
   std::vector<std::pair<int, SegmentPoint>> pairs;
   for (const CsvPointRun& run : it->second) {
     std::vector<std::pair<int, SegmentPoint>> chunk;
-    if (!ReadRunFromCsv(run, segment_id, &chunk)) {
+    if (!ReadRunFromCsv(run, segment_id, &chunk, input)) {
       return false;
     }
     MergeSortedPointPairs(&pairs, chunk);

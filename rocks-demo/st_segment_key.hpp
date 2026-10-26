@@ -73,29 +73,12 @@ inline std::string StSegmentKeyTzidRaw(uint32_t bucket_id, uint64_t zorder_start
   return k;
 }
 
-// E7 key for an explicit calendar bucket (legacy --cross-bucket-replicate only).
-inline std::string StSegmentKeyTzidForHostBucket(uint32_t t_start,
-                                                 uint32_t host_bucket_id,
-                                                 uint64_t zorder_start,
-                                                 uint64_t vehicle_id,
-                                                 uint32_t segment_seq,
-                                                 uint16_t chunk_seq,
-                                                 uint32_t bucket_sec) {
-  // t_start_offset is no longer encoded; the key carries only the coarse
-  // calendar bucket, so t_start/bucket_sec are unused here.
-  (void)t_start;
-  (void)bucket_sec;
-  return StSegmentKeyTzidRaw(host_bucket_id, zorder_start, vehicle_id,
-                             segment_seq, chunk_seq);
-}
-
 inline std::string StSegmentKeyTzid(uint32_t t_start, uint64_t zorder_start,
                                     uint64_t vehicle_id, uint32_t segment_seq,
                                     uint16_t chunk_seq,
                                     uint32_t bucket_sec = 3600) {
   const uint32_t safe_bucket_sec = bucket_sec == 0 ? 3600u : bucket_sec;
   const uint32_t bucket_id = t_start / safe_bucket_sec;
-  return StSegmentKeyTzidForHostBucket(t_start, bucket_id, zorder_start, vehicle_id,
-                                       segment_seq, chunk_seq, safe_bucket_sec);
+  return StSegmentKeyTzidRaw(bucket_id, zorder_start, vehicle_id, segment_seq,
+                             chunk_seq);
 }
-

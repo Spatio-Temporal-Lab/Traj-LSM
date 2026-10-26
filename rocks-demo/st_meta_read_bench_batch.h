@@ -16,7 +16,6 @@ struct StMetaReadBenchBatchConfig {
   uint32_t bucket_id_max = 0;
   uint32_t bucket_width_sec = 3600;
   std::string prune_mode = "sst_manifest";
-  bool query_segment_uid_dedup = true;
   bool verify_kv_results = true;
   uint32_t time_bucket_count = 32;
   uint32_t rtree_leaf_size = 8;
